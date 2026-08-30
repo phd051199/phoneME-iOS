@@ -168,6 +168,22 @@ constexpr usize kMaximumNativeInstructions = 256U * 1024U;
 [[nodiscard]] u32 adaptive_device_hot_threshold(u32 configured) noexcept {
     if (!conservative_device_jit_mode()) return configured;
     const auto& coordinator = runtime::shared_work_coordinator();
+    // Once iOS reports real thermal pressure, stop spending package power on
+    // compiling merely warm methods. Existing compiled code stays usable; we
+    // only make admission progressively harder until the device cools. This
+    // mirrors Harrier's interpreter-led steady state without globally
+    // disabling phoneME's JIT when it is actually helping a heavy game.
+    switch (coordinator.thermal_pressure()) {
+    case runtime::ThermalPressure::critical:
+        return kMaximumHotThreshold;
+    case runtime::ThermalPressure::serious:
+        return std::max<u32>(configured, 4'096U);
+    case runtime::ThermalPressure::fair:
+        configured = std::max<u32>(configured, 256U);
+        break;
+    case runtime::ThermalPressure::nominal:
+        break;
+    }
     switch (coordinator.frame_pressure()) {
     case runtime::FramePressure::overloaded:
         return std::min<u32>(configured, 32U);

@@ -21,6 +21,7 @@ namespace phoneme::vm {
 thread_local Scheduler* Scheduler::tls_scheduler_ = nullptr;
 thread_local JavaThreadId Scheduler::tls_thread_id_ = 0;
 thread_local u32 Scheduler::tls_unblocked_quantum_count_ = 0U;
+thread_local u64 Scheduler::tls_unblocked_active_microseconds_ = 0U;
 thread_local u64 Scheduler::tls_host_foreground_generation_ = 0U;
 thread_local std::chrono::steady_clock::time_point
     Scheduler::tls_quantum_resume_time_ {};
@@ -62,6 +63,67 @@ constexpr auto kSustainedMinimumBackoff = std::chrono::microseconds(150);
 constexpr auto kSustainedMaximumBackoff = std::chrono::microseconds(1'500);
 constexpr auto kBusyMinimumBackoff = std::chrono::microseconds(350);
 constexpr auto kBusyMaximumBackoff = std::chrono::milliseconds(4);
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+// A Java worker that keeps consuming CPU without blocking or publishing a
+// frame is almost always a polling/game-logic loop. Harrier naturally limits
+// these loops through its coarser interpreter. phoneME's faster interpreter
+// otherwise lets them pin a performance core even when presentation is capped
+// at 30 FPS. Start conservatively at nominal temperature and tighten the duty
+// cycle only after iOS reports real thermal pressure.
+constexpr auto kNominalNonRenderActivation = std::chrono::milliseconds(50);
+constexpr auto kFairNonRenderActivation = std::chrono::milliseconds(25);
+constexpr auto kSeriousNonRenderActivation = std::chrono::milliseconds(12);
+constexpr auto kCriticalNonRenderActivation = std::chrono::milliseconds(6);
+constexpr auto kMinimumRecentFrameGrace = std::chrono::milliseconds(100);
+
+[[nodiscard]] std::chrono::microseconds non_render_activation(
+    runtime::ThermalPressure pressure) noexcept {
+    switch (pressure) {
+    case runtime::ThermalPressure::critical:
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            kCriticalNonRenderActivation);
+    case runtime::ThermalPressure::serious:
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            kSeriousNonRenderActivation);
+    case runtime::ThermalPressure::fair:
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            kFairNonRenderActivation);
+    case runtime::ThermalPressure::nominal:
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            kNominalNonRenderActivation);
+    }
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        kNominalNonRenderActivation);
+}
+
+[[nodiscard]] std::chrono::microseconds non_render_backoff(
+    runtime::ThermalPressure pressure,
+    std::chrono::microseconds active_cpu_time) noexcept {
+    switch (pressure) {
+    case runtime::ThermalPressure::critical:
+        return std::clamp(
+            active_cpu_time * 4,
+            std::chrono::microseconds(1'000),
+            std::chrono::microseconds(5'000));
+    case runtime::ThermalPressure::serious:
+        return std::clamp(
+            active_cpu_time * 2,
+            std::chrono::microseconds(500),
+            std::chrono::microseconds(3'000));
+    case runtime::ThermalPressure::fair:
+        return std::clamp(
+            active_cpu_time,
+            std::chrono::microseconds(250),
+            std::chrono::microseconds(1500));
+    case runtime::ThermalPressure::nominal:
+        return std::clamp(
+            active_cpu_time / 2,
+            std::chrono::microseconds(100),
+            std::chrono::microseconds(750));
+    }
+    return std::chrono::microseconds(100);
+}
+#endif
 // Hidden MIDlets share one execution gate per VM. This caps aggregate CPU even
 // when a game has several Java threads that would otherwise take turns while
 // each individual thread is sleeping. A blocked socket/timer callback still
@@ -531,6 +593,7 @@ void Scheduler::begin_execution_slice() noexcept {
     // Host-driven main-thread invocations do not own Scheduler TLS, but they
     // execute the same interpreter loop and require identical CPU pacing.
     tls_unblocked_quantum_count_ = 0U;
+    tls_unblocked_active_microseconds_ = 0U;
     // Re-synchronize foreground ownership at the first maintenance boundary
     // of every top-level execution. This also makes an invocation that starts
     // while already backgrounded enter the shared CPU gate immediately.
@@ -552,6 +615,7 @@ void Scheduler::begin_unpaced_execution() noexcept {
         ++tls_unpaced_execution_depth_;
     }
     tls_unblocked_quantum_count_ = 0U;
+    tls_unblocked_active_microseconds_ = 0U;
     tls_quantum_resume_time_ = std::chrono::steady_clock::now();
     tls_quantum_timing_valid_ = true;
 }
@@ -561,6 +625,7 @@ void Scheduler::end_unpaced_execution() noexcept {
         --tls_unpaced_execution_depth_;
     }
     tls_unblocked_quantum_count_ = 0U;
+    tls_unblocked_active_microseconds_ = 0U;
     tls_quantum_resume_time_ = std::chrono::steady_clock::now();
     tls_quantum_timing_valid_ = true;
 }
@@ -753,6 +818,7 @@ void Scheduler::note_current_frame_boundary() noexcept {
     // healthy foreground game gradually receives the same heavy backoff as a
     // non-rendering spin loop after it has run for a while.
     tls_unblocked_quantum_count_ = 0U;
+    tls_unblocked_active_microseconds_ = 0U;
     tls_quantum_resume_time_ = now;
     tls_quantum_timing_valid_ = true;
 
@@ -852,6 +918,17 @@ void Scheduler::cooperative_quantum(Machine& machine) {
         std::numeric_limits<u32>::max()) {
         ++tls_unblocked_quantum_count_;
     }
+    if (!unpaced_execution) {
+        const u64 active_microseconds = static_cast<u64>(
+            std::max<i64>(active_cpu_time.count(), 0));
+        if (tls_unblocked_active_microseconds_ >
+            std::numeric_limits<u64>::max() - active_microseconds) {
+            tls_unblocked_active_microseconds_ =
+                std::numeric_limits<u64>::max();
+        } else {
+            tls_unblocked_active_microseconds_ += active_microseconds;
+        }
+    }
     bool deterministic_mode = false;
     bool foreground_peer_runnable = false;
     std::optional<std::chrono::steady_clock::time_point> background_deadline;
@@ -884,22 +961,43 @@ void Scheduler::cooperative_quantum(Machine& machine) {
         !background_deadline.has_value() &&
         ((tls_unblocked_quantum_count_ & 7U) == 0U);
 #if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
-    // Harrier/JarlyME naturally spends less package power on guest worker
-    // loops because its interpreter has coarser scheduling. Match that
-    // behavior only for threads that have never published a frame and have
-    // run for a long uninterrupted stretch. Normal game/render loops reset
-    // the counter at frame/sleep/blocking boundaries and never reach this
-    // path. Keep the pause sub-millisecond so network/AI workers remain
-    // responsive while pathological polling loops cannot pin a performance
-    // core indefinitely.
+    // A thread may publish an intro frame once and then enter a permanent
+    // polling loop, so "has ever rendered" is not enough to exempt it from
+    // thermal pacing. Treat only a *recent* frame as productive render work.
+    // Blocking/sleep/yield and real frame publication reset the accumulated
+    // active CPU streak immediately.
+    const runtime::ThermalPressure thermal_pressure =
+        runtime::shared_work_coordinator().thermal_pressure();
+    const auto target_frame_interval = std::chrono::nanoseconds(
+        std::max<i64>(
+            frame_interval_nanoseconds_.load(std::memory_order_acquire),
+            1));
+    const auto recent_frame_grace = std::max(
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            kMinimumRecentFrameGrace),
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            target_frame_interval * 4));
+    const bool recent_frame =
+        tls_pressure_frame_boundary_valid_ &&
+        now >= tls_pressure_frame_boundary_time_ &&
+        now - tls_pressure_frame_boundary_time_ <= recent_frame_grace;
+    const auto spin_activation = non_render_activation(thermal_pressure);
+    const bool nominal_cadence_slot =
+        thermal_pressure != runtime::ThermalPressure::nominal ||
+        ((tls_unblocked_quantum_count_ & 1U) == 0U);
     const bool thermal_non_render_spin_backoff =
         !unpaced_execution && !deterministic_mode &&
         !background_deadline.has_value() &&
-        !tls_pressure_frame_boundary_valid_ &&
-        tls_unblocked_quantum_count_ >= 96U &&
-        ((tls_unblocked_quantum_count_ & 15U) == 0U);
+        !recent_frame && nominal_cadence_slot &&
+        tls_unblocked_quantum_count_ >= 8U &&
+        tls_unblocked_active_microseconds_ >=
+            static_cast<u64>(spin_activation.count());
+    const auto thermal_spin_backoff = thermal_non_render_spin_backoff
+        ? non_render_backoff(thermal_pressure, active_cpu_time)
+        : std::chrono::microseconds::zero();
 #else
     const bool thermal_non_render_spin_backoff = false;
+    const auto thermal_spin_backoff = std::chrono::microseconds::zero();
 #endif
     const bool needs_execution_handoff =
         background_deadline.has_value() || unpaced_execution ||
@@ -938,8 +1036,8 @@ void Scheduler::cooperative_quantum(Machine& machine) {
         // dependent.
         std::this_thread::sleep_for(backoff);
     } else if (thermal_non_render_spin_backoff) {
-        std::this_thread::sleep_for(std::min(
-            backoff, std::chrono::microseconds(500)));
+        PerformanceCounters::record_scheduler_sleep();
+        std::this_thread::sleep_for(thermal_spin_backoff);
     } else if (foreground_peer_runnable || periodic_foreground_handoff) {
         // Foreground scheduler fairness must not become a CPU duty-cycle cap.
         // Sustained work here may be class loading, decompression, AI or a
@@ -951,7 +1049,10 @@ void Scheduler::cooperative_quantum(Machine& machine) {
         std::this_thread::yield();
     }
     machine.resume_execution_after_blocking(depth);
-    if (unpaced_execution) tls_unblocked_quantum_count_ = 0U;
+    if (unpaced_execution) {
+        tls_unblocked_quantum_count_ = 0U;
+        tls_unblocked_active_microseconds_ = 0U;
+    }
     tls_quantum_resume_time_ = std::chrono::steady_clock::now();
     tls_quantum_timing_valid_ = true;
     set_current_state(JavaThreadState::running);
@@ -968,6 +1069,7 @@ void Scheduler::cooperative_yield(Machine& machine) {
     // older MIDlets. Giving them a real scheduler-sized pause avoids a tight
     // currentTimeMillis/yield loop monopolizing a core on iOS.
     tls_unblocked_quantum_count_ = 0U;
+    tls_unblocked_active_microseconds_ = 0U;
     std::optional<std::chrono::steady_clock::time_point> background_deadline;
     {
         std::scoped_lock lock(mutex_);
@@ -1374,6 +1476,7 @@ void Scheduler::set_current_state(JavaThreadState state) noexcept {
     if (state != JavaThreadState::runnable &&
         state != JavaThreadState::running) {
         tls_unblocked_quantum_count_ = 0U;
+        tls_unblocked_active_microseconds_ = 0U;
         tls_quantum_timing_valid_ = false;
     } else if (state == JavaThreadState::running &&
                !tls_quantum_timing_valid_) {

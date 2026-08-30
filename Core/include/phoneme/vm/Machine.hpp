@@ -787,6 +787,8 @@ namespace phoneme::vm
         bool category_two_only);
     [[nodiscard]] Result<std::optional<ObjectRef>> acquire_synchronized_monitor(
         const Invocation &invocation);
+    [[nodiscard]] Result<std::optional<ObjectRef>> synchronized_monitor(
+        const Invocation &invocation);
     [[nodiscard]] Status release_synchronized_monitor(
         std::optional<ObjectRef> monitor);
     [[nodiscard]] Status enter_monitor(ObjectRef monitor);

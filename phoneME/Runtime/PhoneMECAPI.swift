@@ -499,6 +499,32 @@ private let phoneMEPixelBufferRelease: CGDataProviderReleaseDataCallback = {
 }
 
 final class PhoneMECAPI: @unchecked Sendable {
+    struct PresentationTelemetrySnapshot: Sendable {
+        let frames: UInt64
+        let stagedFrames: UInt64
+        let fullUploads: UInt64
+        let regionUploads: UInt64
+        let uploadedBytes: UInt64
+        let acquireMilliseconds: Double
+        let stagingMilliseconds: Double
+        let uploadMilliseconds: Double
+    }
+
+    private struct PresentationTelemetry {
+        var frames: UInt64 = 0
+        var stagedFrames: UInt64 = 0
+        var fullUploads: UInt64 = 0
+        var regionUploads: UInt64 = 0
+        var uploadedBytes: UInt64 = 0
+        var acquireNanoseconds: UInt64 = 0
+        var stagingNanoseconds: UInt64 = 0
+        var uploadNanoseconds: UInt64 = 0
+
+        mutating func reset() {
+            self = PresentationTelemetry()
+        }
+    }
+
     struct RuntimeHandle: @unchecked Sendable, Equatable {
         fileprivate let rawValue: UnsafeMutableRawPointer
     }
@@ -521,6 +547,27 @@ final class PhoneMECAPI: @unchecked Sendable {
         case fair = 1
         case serious = 2
         case critical = 3
+    }
+
+    private var presentationTelemetry = PresentationTelemetry()
+
+    func presentationTelemetrySnapshot(
+        reset: Bool
+    ) -> PresentationTelemetrySnapshot {
+        let value = presentationTelemetry
+        if reset {
+            presentationTelemetry.reset()
+        }
+        return PresentationTelemetrySnapshot(
+            frames: value.frames,
+            stagedFrames: value.stagedFrames,
+            fullUploads: value.fullUploads,
+            regionUploads: value.regionUploads,
+            uploadedBytes: value.uploadedBytes,
+            acquireMilliseconds: Double(value.acquireNanoseconds) / 1.0e6,
+            stagingMilliseconds: Double(value.stagingNanoseconds) / 1.0e6,
+            uploadMilliseconds: Double(value.uploadNanoseconds) / 1.0e6
+        )
     }
 
     static var currentThermalPressure: ThermalPressure {
@@ -1393,6 +1440,7 @@ final class PhoneMECAPI: @unchecked Sendable {
         after previousGeneration: UInt64
     ) -> PhoneMEFrame? {
 #if canImport(UIKit) && canImport(Metal)
+        let acquisitionStarted = DispatchTime.now().uptimeNanoseconds
         guard let runtime, let metalFrameTexturePool else {
             if let copied = copyFrame(runtime, after: previousGeneration) {
                 return PhoneMEFrame(
@@ -1450,6 +1498,7 @@ final class PhoneMECAPI: @unchecked Sendable {
         guard let pixels else {
             return nil
         }
+        let acquisitionFinished = DispatchTime.now().uptimeNanoseconds
 
         let frameWidth = Int(width)
         let frameHeight = Int(height)
@@ -1496,7 +1545,9 @@ final class PhoneMECAPI: @unchecked Sendable {
         var stagedPixels: PhoneMEPixelBufferLease?
         var framebufferLeaseReleased = false
         var uploadPixels = UnsafeRawPointer(pixels)
+        var stagingNanoseconds: UInt64 = 0
         if shouldStageBeforeMetalUpload {
+            let stagingStarted = DispatchTime.now().uptimeNanoseconds
             let stage = frameBufferPool.acquire(
                 minimumCapacity: frameWidth * frameHeight * 4
             )
@@ -1526,6 +1577,8 @@ final class PhoneMECAPI: @unchecked Sendable {
             framebufferLeaseReleased = true
             stagedPixels = stage
             uploadPixels = UnsafeRawPointer(stage.pointer)
+            stagingNanoseconds = DispatchTime.now().uptimeNanoseconds
+                &- stagingStarted
         }
         defer {
             _ = stagedPixels
@@ -1534,8 +1587,11 @@ final class PhoneMECAPI: @unchecked Sendable {
             }
         }
 
+        let uploadStarted = DispatchTime.now().uptimeNanoseconds
+        var uploadedBytes: UInt64 = 0
         switch uploadPlan {
         case .full:
+            uploadedBytes = UInt64(frameWidth * frameHeight * 4)
             lease.texture.replace(
                 region: MTLRegionMake2D(0, 0, frameWidth, frameHeight),
                 mipmapLevel: 0,
@@ -1544,6 +1600,7 @@ final class PhoneMECAPI: @unchecked Sendable {
             )
         case .regions(let regions):
             for region in regions {
+                uploadedBytes &+= UInt64(region.width * region.height * 4)
                 let byteOffset = (region.y * frameWidth + region.x) * 4
                 lease.texture.replace(
                     region: MTLRegionMake2D(
@@ -1557,6 +1614,23 @@ final class PhoneMECAPI: @unchecked Sendable {
                     bytesPerRow: bytesPerRow
                 )
             }
+        }
+        let uploadNanoseconds = DispatchTime.now().uptimeNanoseconds
+            &- uploadStarted
+        presentationTelemetry.frames &+= 1
+        presentationTelemetry.acquireNanoseconds &+=
+            acquisitionFinished &- acquisitionStarted
+        presentationTelemetry.stagingNanoseconds &+= stagingNanoseconds
+        presentationTelemetry.uploadNanoseconds &+= uploadNanoseconds
+        presentationTelemetry.uploadedBytes &+= uploadedBytes
+        if shouldStageBeforeMetalUpload {
+            presentationTelemetry.stagedFrames &+= 1
+        }
+        switch uploadPlan {
+        case .full:
+            presentationTelemetry.fullUploads &+= 1
+        case .regions:
+            presentationTelemetry.regionUploads &+= 1
         }
         lease.contentGeneration = generation
         return PhoneMEFrame(

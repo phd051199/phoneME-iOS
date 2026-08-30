@@ -1,167 +1,50 @@
 {
-  "schema_version": 1,
-  "description": "Pinned JAR corpus for repeatable phoneME core performance runs. Hashes must match before a result is accepted.",
+  "schema_version": 2,
+  "description": "Pinned real-game corpus for repeatable phoneME performance and thermal A/B runs.",
   "benchmarks": [
     {
-      "id": "canvas-3d-brick-breaker",
-      "category": "2d-canvas-game",
-      "jar": "jar_test/3dbrickbreaker.jar",
-      "sha256": "2c6dfc1f84a4126d47fbe85847a0f2cc0b6af1fa853c6cceb93e579e8cb1653a",
-      "target_milestone": "first-interactive-frame",
-      "timeout_seconds": 45
-    },
-    {
-      "id": "m3g-4x4-offroad",
-      "category": "3d-m3g-game",
-      "jar": "jar_test/4x4extremeoffroad.jar",
-      "sha256": "8962c78c65669c98f039cd483f7f60ea9d577c9026b8bb6d5edf712dd53f9737",
-      "target_milestone": "first-interactive-frame",
-      "timeout_seconds": 90
-    },
-    {
-      "id": "online-ninja-school",
-      "category": "online-game",
-      "jar": "jar_test/Nicknsonet_E72_x1_graphics.jar",
-      "sha256": "c50eeda8e7fda44088abf8678a65e9ae7f84549a1c196a588d60d129f79596d3",
-      "target_milestone": "login-screen",
-      "timeout_seconds": 90,
-      "observe_ms": 12000,
-      "screen_probe": {
-        "required_milestones": [
-          "observation-begin",
-          "observation-end",
-          "canvas-shown",
-          "frame-nonblank"
-        ],
-        "min_frames_produced": 5,
-        "min_unique_colors": 2000,
-        "min_nonblack_pixels": 20000,
-        "regions": [
-          {
-            "x": 120,
-            "y": 80,
-            "width": 40,
-            "height": 40,
-            "sha256": "407a74f7478452ffd6d072ed6896cc6e37183b2c2576a20ba7d71013503d69da"
-          },
-          {
-            "x": 160,
-            "y": 120,
-            "width": 40,
-            "height": 40,
-            "sha256": "a0261b0b455adec812c44f05aabd9a78d5d46df011eaab137c2fece4636fdbe4"
-          },
-          {
-            "x": 280,
-            "y": 200,
-            "width": 40,
-            "height": 40,
-            "sha256": "400ce069822cf4ce0dbce435b803052715a84d0bbe5d6fccb5e8c731d55fb6e6"
-          }
-        ]
-      }
-    },
-    {
-      "id": "midplay-http-app",
-      "category": "network-application",
-      "jar": "jar_test/MIDPlay.jar",
-      "sha256": "48bead28f61f11ca0a910e33875f3bfd6f5a7be75af1c38a7b4fa8710f6bf699",
-      "target_milestone": "first-displayable",
-      "timeout_seconds": 60
-    },
-    {
-      "id": "opera-mini-socket",
-      "category": "socket-application",
-      "jar": "jar_test/Opera 4.2 mod EN.jar",
-      "sha256": "b3ced4db87a223d8fb02fe47740eee7c65abdff2ebaeeb8ec42884500894e20d",
-      "target_milestone": "connection-screen",
-      "timeout_seconds": 90,
-      "observe_ms": 12000,
-      "screen_probe": {
-        "required_milestones": [
-          "observation-begin",
-          "observation-end",
-          "canvas-shown",
-          "frame-nonblank"
-        ],
-        "min_frames_produced": 10,
-        "min_unique_colors": 190,
-        "min_nonblack_pixels": 76000,
-        "regions": [
-          {
-            "x": 80,
-            "y": 80,
-            "width": 40,
-            "height": 40,
-            "sha256": "3654a9c22f82f6fb71975089ccf93f205a213ff4999db9e95ad6893a129c9bb6"
-          },
-          {
-            "x": 120,
-            "y": 120,
-            "width": 40,
-            "height": 40,
-            "sha256": "c22b80235072e47c1b239c09ef4a55e8af14314aba495475b05f6e085bd24443"
-          },
-          {
-            "x": 0,
-            "y": 200,
-            "width": 40,
-            "height": 40,
-            "sha256": "741a3dc62764896927646ba9f0f1a9597e24ac7249c723183f63a5d59856ce68"
-          }
-        ]
-      }
-    },
-    {
-      "id": "large-obfuscated-clinit",
-      "category": "startup-stress",
-      "jar": "jar_test/148_TrungDucTV_Premium1.jar",
-      "sha256": "5359b580524fc3a1b309e7d02c006e6f77d1b7ed80e5b825cf3dbd9eb45bc3b7",
-      "target_milestone": "first-displayable",
-      "timeout_seconds": 120
-    },
-    {
-      "id": "avatar-rms-online",
-      "category": "rms-network-game",
-      "jar": "jar_test/Avatar_LAPRO_293.jar",
-      "sha256": "f888cc71889679c3e3ec6f29ba0de74b696ab9a12391384ce8d01c5de5438160",
-      "target_milestone": "login-screen",
+      "id": "ninja-school-offline",
+      "category": "2d-offline-rpg",
+      "jar": "jar_test/NinjaSchoolOffline_2.1.7_v1.jar",
+      "sha256": "0de8f92b5a92541298f9e433296196b33526e7c1ae6cf6d87b72db2aab6b7cde",
+      "observe_ms": 10000,
       "timeout_seconds": 120,
-      "observe_ms": 12000,
-      "screen_probe": {
-        "required_milestones": [
-          "observation-begin",
-          "observation-end",
-          "canvas-shown",
-          "frame-nonblank"
-        ],
-        "min_frames_produced": 40,
-        "min_unique_colors": 200,
-        "min_nonblack_pixels": 75000,
-        "regions": [
-          {
-            "x": 120,
-            "y": 80,
-            "width": 40,
-            "height": 40,
-            "sha256": "8551878886834f021ea4a2551c5950a443c32269b1cb3cc4a51f5622d71662ae"
-          },
-          {
-            "x": 160,
-            "y": 120,
-            "width": 40,
-            "height": 40,
-            "sha256": "dfecdb53d85f4a11934b0dbe28a5d1b9fe22ecb5e2e707005faa2019139efa77"
-          },
-          {
-            "x": 80,
-            "y": 120,
-            "width": 40,
-            "height": 40,
-            "sha256": "57484f5f54c0c5e2309a7501f4104d24654222bc361c3d0b715b46d057d7b787"
-          }
-        ]
-      }
+      "autoplay": true,
+      "width": 240,
+      "height": 320
+    },
+    {
+      "id": "army2-offline",
+      "category": "2d-offline-action",
+      "jar": "jar_test/Army2_Offline_1.6.19.jar",
+      "sha256": "2c648faa6b47a7941af40350bff1168ef517711198f106ba0d5eb59157d3d067",
+      "observe_ms": 10000,
+      "timeout_seconds": 120,
+      "autoplay": true,
+      "width": 240,
+      "height": 320
+    },
+    {
+      "id": "majesty-northern-expansion",
+      "category": "large-landscape-strategy",
+      "jar": "jar_test/[1.4.14][640x360]Majesty_The_Northern_Expansion_vi_Full.jar",
+      "sha256": "5c463ed7c5e36b1ca7b884fdcf23b4a9f450c38910df710d374c010e4c3a9e5c",
+      "observe_ms": 10000,
+      "timeout_seconds": 120,
+      "autoplay": true,
+      "width": 640,
+      "height": 360
+    },
+    {
+      "id": "zombie-infection",
+      "category": "2d-gameloft-action",
+      "jar": "jar_test/Zombie Infection VH By Sykeo99 J2ME loader Only 240x320.jar",
+      "sha256": "5d53c3de01059af051c0e32a08085300bd66c28702d94ed35e05873a47e5e853",
+      "observe_ms": 10000,
+      "timeout_seconds": 120,
+      "autoplay": true,
+      "width": 240,
+      "height": 320
     }
   ]
 }

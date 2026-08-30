@@ -217,6 +217,15 @@ final class EmbeddedPhoneMEEngine: NSObject {
     }
 
     private final class PollContext: @unchecked Sendable {
+        struct TelemetrySnapshot: Sendable {
+            let durationSeconds: Double
+            let callbacks: UInt64
+            let activeCallbacks: UInt64
+            let idleCanvasCallbacks: UInt64
+            let idleNativeCallbacks: UInt64
+            let framesProduced: UInt64
+        }
+
         var visibleScreen: VisibleScreen?
         var didReportRuntimeExit = false
 
@@ -236,6 +245,12 @@ final class EmbeddedPhoneMEEngine: NSObject {
         private let frameIntervalRemainder: UInt64
         private var remainderAccumulator: UInt64 = 0
         private var nextActiveDeadlineNanoseconds: UInt64 = 0
+        private var telemetryStartedNanoseconds: UInt64 = 0
+        private var telemetryCallbacks: UInt64 = 0
+        private var telemetryActiveCallbacks: UInt64 = 0
+        private var telemetryIdleCanvasCallbacks: UInt64 = 0
+        private var telemetryIdleNativeCallbacks: UInt64 = 0
+        private var telemetryFramesProduced: UInt64 = 0
 
         init(framesPerSecond: Int) {
             let normalizedFrameRate = GameProfile.resolvedFrameRate(
@@ -291,6 +306,7 @@ final class EmbeddedPhoneMEEngine: NSObject {
         func noteCanvasFrameOutcome(producedFrame: Bool) {
             cadenceLock.lock()
             if producedFrame {
+                telemetryFramesProduced &+= 1
                 consecutiveIdleCanvasPolls = 0
                 usesIdleCanvasCadence = false
                 nextActiveDeadlineNanoseconds = 0
@@ -302,6 +318,41 @@ final class EmbeddedPhoneMEEngine: NSObject {
                 }
             }
             cadenceLock.unlock()
+        }
+
+        func notePollForTelemetry(
+            nowNanoseconds: UInt64
+        ) -> TelemetrySnapshot? {
+            cadenceLock.lock()
+            defer { cadenceLock.unlock() }
+            if telemetryStartedNanoseconds == 0 {
+                telemetryStartedNanoseconds = nowNanoseconds
+            }
+            telemetryCallbacks &+= 1
+            if usesIdleNativeCadence {
+                telemetryIdleNativeCallbacks &+= 1
+            } else if usesIdleCanvasCadence {
+                telemetryIdleCanvasCallbacks &+= 1
+            } else {
+                telemetryActiveCallbacks &+= 1
+            }
+            let elapsed = nowNanoseconds &- telemetryStartedNanoseconds
+            guard elapsed >= 5_000_000_000 else { return nil }
+            let snapshot = TelemetrySnapshot(
+                durationSeconds: Double(elapsed) / 1.0e9,
+                callbacks: telemetryCallbacks,
+                activeCallbacks: telemetryActiveCallbacks,
+                idleCanvasCallbacks: telemetryIdleCanvasCallbacks,
+                idleNativeCallbacks: telemetryIdleNativeCallbacks,
+                framesProduced: telemetryFramesProduced
+            )
+            telemetryStartedNanoseconds = nowNanoseconds
+            telemetryCallbacks = 0
+            telemetryActiveCallbacks = 0
+            telemetryIdleCanvasCallbacks = 0
+            telemetryIdleNativeCallbacks = 0
+            telemetryFramesProduced = 0
+            return snapshot
         }
 
         func noteHostActivity() {
@@ -2040,6 +2091,32 @@ final class EmbeddedPhoneMEEngine: NSObject {
         )
         timer.setEventHandler { [weak self] in
             guard !context.didReportRuntimeExit else { return }
+            let pollNow = DispatchTime.now().uptimeNanoseconds
+            if let pollMetrics = context.notePollForTelemetry(
+                nowNanoseconds: pollNow
+            ) {
+                let presentation = api.presentationTelemetrySnapshot(reset: true)
+                let wakeupsPerSecond = Double(pollMetrics.callbacks)
+                    / max(pollMetrics.durationSeconds, 0.001)
+                NSLog(
+                    "[phoneME-thermal] thermal=%d polls_per_s=%.2f polls=%llu active=%llu idle_canvas=%llu idle_native=%llu frames=%llu uploads=%llu staged=%llu full=%llu regions=%llu uploaded_kb=%.1f acquire_ms=%.2f stage_ms=%.2f upload_ms=%.2f",
+                    PhoneMECAPI.currentThermalPressure.rawValue,
+                    wakeupsPerSecond,
+                    pollMetrics.callbacks,
+                    pollMetrics.activeCallbacks,
+                    pollMetrics.idleCanvasCallbacks,
+                    pollMetrics.idleNativeCallbacks,
+                    pollMetrics.framesProduced,
+                    presentation.frames,
+                    presentation.stagedFrames,
+                    presentation.fullUploads,
+                    presentation.regionUploads,
+                    Double(presentation.uploadedBytes) / 1024.0,
+                    presentation.acquireMilliseconds,
+                    presentation.stagingMilliseconds,
+                    presentation.uploadMilliseconds
+                )
+            }
             var shouldScheduleNextPoll = true
             defer {
                 if shouldScheduleNextPoll {

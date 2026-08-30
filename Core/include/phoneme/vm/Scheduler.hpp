@@ -153,6 +153,7 @@ private:
     static thread_local Scheduler* tls_scheduler_;
     static thread_local JavaThreadId tls_thread_id_;
     static thread_local u32 tls_unblocked_quantum_count_;
+    static thread_local u64 tls_unblocked_active_microseconds_;
     static thread_local u64 tls_host_foreground_generation_;
     static thread_local std::chrono::steady_clock::time_point
         tls_quantum_resume_time_;

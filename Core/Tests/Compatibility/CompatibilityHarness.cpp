@@ -16,6 +16,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(__APPLE__) || defined(__unix__)
+#include <sys/resource.h>
+#endif
+
 #include "phoneme/base/Error.hpp"
 #include "phoneme/base/Types.hpp"
 #include "phoneme/runtime/Runtime.hpp"
@@ -68,6 +72,15 @@ struct HarnessResult final {
     phoneme::usize heartbeat_count {0};
     phoneme::i64 last_progress_ms {0};
     phoneme::i64 longest_idle_ms {0};
+    double process_cpu_ms {0.0};
+    double wall_time_ms {0.0};
+    double cpu_utilization_pct {0.0};
+    double cpu_ms_per_generated_frame {0.0};
+    double frame_interval_p50_ms {0.0};
+    double frame_interval_p95_ms {0.0};
+    double frame_interval_p99_ms {0.0};
+    phoneme::usize frame_hitches_over_50ms {0};
+    phoneme::usize frame_interval_samples {0};
     bool visual_output_observed {false};
     bool stall_suspected {false};
     phoneme::i32 error_code {0};
@@ -81,6 +94,30 @@ struct HarnessResult final {
     std::vector<std::string> network_actions;
     std::vector<std::string> media_actions;
 };
+
+[[nodiscard]] phoneme::u64 process_cpu_nanoseconds() noexcept {
+#if defined(__APPLE__) || defined(__unix__)
+    rusage usage {};
+    if (::getrusage(RUSAGE_SELF, &usage) != 0) return 0U;
+    const auto timeval_ns = [](const timeval& value) noexcept -> phoneme::u64 {
+        return static_cast<phoneme::u64>(value.tv_sec) * 1'000'000'000ULL +
+               static_cast<phoneme::u64>(value.tv_usec) * 1'000ULL;
+    };
+    return timeval_ns(usage.ru_utime) + timeval_ns(usage.ru_stime);
+#else
+    return 0U;
+#endif
+}
+
+[[nodiscard]] double percentile_ms(std::vector<phoneme::u64> samples_ns,
+                                   double percentile) {
+    if (samples_ns.empty()) return 0.0;
+    std::sort(samples_ns.begin(), samples_ns.end());
+    const double clamped = std::clamp(percentile, 0.0, 1.0);
+    const auto last = static_cast<double>(samples_ns.size() - 1U);
+    const auto index = static_cast<phoneme::usize>(clamped * last + 0.5);
+    return static_cast<double>(samples_ns[index]) / 1.0e6;
+}
 
 struct CommandCandidate final {
     phoneme::i32 id {0};
@@ -390,6 +427,22 @@ void emit_string_array(std::ostream& output,
            << "  \"heartbeat_count\": " << result.heartbeat_count << ",\n"
            << "  \"last_progress_ms\": " << result.last_progress_ms << ",\n"
            << "  \"longest_idle_ms\": " << result.longest_idle_ms << ",\n"
+           << "  \"process_cpu_ms\": " << result.process_cpu_ms << ",\n"
+           << "  \"wall_time_ms\": " << result.wall_time_ms << ",\n"
+           << "  \"cpu_utilization_pct\": "
+           << result.cpu_utilization_pct << ",\n"
+           << "  \"cpu_ms_per_generated_frame\": "
+           << result.cpu_ms_per_generated_frame << ",\n"
+           << "  \"frame_interval_p50_ms\": "
+           << result.frame_interval_p50_ms << ",\n"
+           << "  \"frame_interval_p95_ms\": "
+           << result.frame_interval_p95_ms << ",\n"
+           << "  \"frame_interval_p99_ms\": "
+           << result.frame_interval_p99_ms << ",\n"
+           << "  \"frame_hitches_over_50ms\": "
+           << result.frame_hitches_over_50ms << ",\n"
+           << "  \"frame_interval_samples\": "
+           << result.frame_interval_samples << ",\n"
            << "  \"visual_output_observed\": "
            << (result.visual_output_observed ? "true" : "false") << ",\n"
            << "  \"stall_suspected\": "
@@ -860,6 +913,9 @@ void autoplay_tick(phoneme::runtime::Runtime& runtime,
     AutoplayState autoplay;
     parse_pointer_taps(autoplay);
     const auto started_at = Clock::now();
+    const phoneme::u64 started_cpu_ns = process_cpu_nanoseconds();
+    std::vector<phoneme::u64> frame_intervals_ns;
+    std::optional<Clock::time_point> previous_generated_frame_at;
     auto last_progress_at = started_at;
     phoneme::u64 last_frame_hash = 0;
     bool have_frame_hash = false;
@@ -868,6 +924,31 @@ void autoplay_tick(phoneme::runtime::Runtime& runtime,
 
     const auto finish = [&](int code) {
         result.exit_code = static_cast<phoneme::i32>(code);
+        const auto finished_at = Clock::now();
+        const phoneme::u64 finished_cpu_ns = process_cpu_nanoseconds();
+        const auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            finished_at - started_at).count();
+        const phoneme::u64 cpu_ns = finished_cpu_ns >= started_cpu_ns
+            ? finished_cpu_ns - started_cpu_ns
+            : 0U;
+        result.process_cpu_ms = static_cast<double>(cpu_ns) / 1.0e6;
+        result.wall_time_ms = wall_ns > 0
+            ? static_cast<double>(wall_ns) / 1.0e6
+            : 0.0;
+        result.cpu_utilization_pct = wall_ns > 0
+            ? (static_cast<double>(cpu_ns) / static_cast<double>(wall_ns)) * 100.0
+            : 0.0;
+        result.cpu_ms_per_generated_frame = result.frames_produced != 0U
+            ? result.process_cpu_ms /
+                  static_cast<double>(result.frames_produced)
+            : 0.0;
+        result.frame_interval_samples = frame_intervals_ns.size();
+        result.frame_interval_p50_ms = percentile_ms(frame_intervals_ns, 0.50);
+        result.frame_interval_p95_ms = percentile_ms(frame_intervals_ns, 0.95);
+        result.frame_interval_p99_ms = percentile_ms(frame_intervals_ns, 0.99);
+        result.frame_hitches_over_50ms = static_cast<phoneme::usize>(std::count_if(
+            frame_intervals_ns.begin(), frame_intervals_ns.end(),
+            [](phoneme::u64 value) { return value > 50'000'000ULL; }));
         const auto native_counts = runtime.app_native_invocation_counts(kAppId);
         if (!write_native_coverage(options, native_counts)) return 91;
         if (!write_result(options, result)) return 90;
@@ -1028,6 +1109,17 @@ void autoplay_tick(phoneme::runtime::Runtime& runtime,
 
             auto frame = runtime.frame_snapshot();
             if (frame.generation != last_generation) {
+                const auto frame_at = Clock::now();
+                if (previous_generated_frame_at.has_value()) {
+                    const auto interval =
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            frame_at - *previous_generated_frame_at).count();
+                    if (interval > 0) {
+                        frame_intervals_ns.push_back(
+                            static_cast<phoneme::u64>(interval));
+                    }
+                }
+                previous_generated_frame_at = frame_at;
                 last_generation = frame.generation;
                 latest_frame = std::move(frame);
                 ++result.frames_produced;
@@ -1068,6 +1160,17 @@ void autoplay_tick(phoneme::runtime::Runtime& runtime,
         if (final_events != 0U) mark_progress(Clock::now());
         auto final_frame = runtime.frame_snapshot();
         if (final_frame.generation != last_generation) {
+            const auto frame_at = Clock::now();
+            if (previous_generated_frame_at.has_value()) {
+                const auto interval =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        frame_at - *previous_generated_frame_at).count();
+                if (interval > 0) {
+                    frame_intervals_ns.push_back(
+                        static_cast<phoneme::u64>(interval));
+                }
+            }
+            previous_generated_frame_at = frame_at;
             ++result.frames_produced;
             latest_frame = std::move(final_frame);
             (void)observe_frame(latest_frame, result,

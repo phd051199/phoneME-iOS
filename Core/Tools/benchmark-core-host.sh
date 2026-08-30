@@ -7,6 +7,7 @@ REPO_ROOT="$(cd "$CORE_ROOT/.." && pwd)"
 RUN_ID="${PHONEME_BENCHMARK_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUTPUT_ROOT="${PHONEME_BENCHMARK_OUTPUT_ROOT:-$CORE_ROOT/build/performance/$RUN_ID}"
 SYNTHETIC_JSON="$OUTPUT_ROOT/synthetic-vm-performance.json"
+COMPACT_JSON="$OUTPUT_ROOT/compact-storage.json"
 JIT_JSON="$OUTPUT_ROOT/jit-performance.json"
 CORE_PROFILE_JSON="$OUTPUT_ROOT/full-core-profile.json"
 RUN_JSON="$OUTPUT_ROOT/benchmark-run.json"
@@ -38,7 +39,8 @@ for benchmark in manifest.get("benchmarks", []):
 print(f"Verified {len(manifest.get('benchmarks', []))} benchmark JARs")
 PY
 
-bash "$SCRIPT_DIR/test-performance-host.sh" "$SYNTHETIC_JSON"
+PHONEME_COMPACT_STORAGE_JSON="$COMPACT_JSON" \
+  bash "$SCRIPT_DIR/test-performance-host.sh" "$SYNTHETIC_JSON"
 bash "$SCRIPT_DIR/benchmark-jit-host.sh" "$JIT_JSON"
 
 PHONEME_ENABLE_VM_PROFILING=1 \
@@ -63,6 +65,7 @@ cat >"$RUN_JSON" <<JSON
   "corpus_manifest": "$CORPUS_MANIFEST",
   "corpus_verified": true,
   "synthetic_result": "$SYNTHETIC_JSON",
+  "compact_storage_result": "$COMPACT_JSON",
   "jit_result": "$JIT_JSON",
   "full_core_profile": "$CORE_PROFILE_JSON"
 }

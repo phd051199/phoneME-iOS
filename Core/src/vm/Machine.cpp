@@ -9615,7 +9615,7 @@ namespace phoneme::vm
     return *mirror;
   }
 
-  Result<std::optional<ObjectRef>> Machine::acquire_synchronized_monitor(
+  Result<std::optional<ObjectRef>> Machine::synchronized_monitor(
       const Invocation &invocation)
   {
     if (invocation.method.method == nullptr ||
@@ -9659,10 +9659,21 @@ namespace phoneme::vm
       monitor = receiver;
     }
 
-    auto entered = enter_monitor(monitor);
+    return std::optional<ObjectRef>(monitor);
+  }
+
+  Result<std::optional<ObjectRef>> Machine::acquire_synchronized_monitor(
+      const Invocation &invocation)
+  {
+    auto monitor = synchronized_monitor(invocation);
+    if (!monitor)
+      return std::unexpected(monitor.error());
+    if (!monitor->has_value())
+      return std::optional<ObjectRef>{};
+    auto entered = enter_monitor(**monitor);
     if (!entered)
       return std::unexpected(entered.error());
-    return std::optional<ObjectRef>(monitor);
+    return *monitor;
   }
 
   Status Machine::release_synchronized_monitor(
@@ -16177,16 +16188,30 @@ namespace phoneme::vm
         }
         const bool nested_synchronized =
             (nested->method.method->access_flags & kAccSynchronized) != 0U;
-        if (nested_synchronized)
-        {
-          publish_compact_execution_roots(nested->arguments,
-                                          nested->return_override);
-        }
-
-        auto nested_monitor = acquire_synchronized_monitor(*nested);
+        auto nested_monitor = synchronized_monitor(*nested);
         if (!nested_monitor)
         {
           return std::unexpected(nested_monitor.error());
+        }
+        if (nested_monitor->has_value())
+        {
+          auto entered = monitors_.enter(**nested_monitor,
+                                         scheduler_.current_thread_id());
+          if (!entered)
+            return std::unexpected(entered.error());
+          if (*entered == MonitorEnterResult::would_block)
+          {
+            // Uncontended synchronized calls are not safepoints: the VM gate
+            // never leaves this host thread, so publishing/scanning every
+            // active frame is pure cache/memory traffic. Publish only when the
+            // monitor is truly contended and enter_monitor is about to release
+            // the execution gate while blocking.
+            publish_compact_execution_roots(nested->arguments,
+                                            nested->return_override);
+            auto blocked = enter_monitor(**nested_monitor);
+            if (!blocked)
+              return std::unexpected(blocked.error());
+          }
         }
         if (!nested_is_native)
         {
@@ -17668,12 +17693,19 @@ namespace phoneme::vm
         }
         if (opcode == 0xC2)
         {
-          const std::array<Value, 1U> monitor_root {
-              Value::from_reference(*reference)};
-          publish_active_execution_roots(monitor_root);
-          auto entered = enter_monitor(*reference);
+          auto entered = monitors_.enter(*reference,
+                                         scheduler_.current_thread_id());
           if (!entered)
             return std::unexpected(entered.error());
+          if (*entered == MonitorEnterResult::would_block)
+          {
+            const std::array<Value, 1U> monitor_root {
+                Value::from_reference(*reference)};
+            publish_active_execution_roots(monitor_root);
+            auto blocked = enter_monitor(*reference);
+            if (!blocked)
+              return std::unexpected(blocked.error());
+          }
         }
         else
         {
