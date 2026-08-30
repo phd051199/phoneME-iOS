@@ -66,6 +66,10 @@ using namespace builtin;
             field(kPrivate, "destroyed", "Z"),
             field(kPrivate, "keepUpdated", "Z"),
             field(kPrivate, "storeName", "Ljava/lang/String;"),
+            field(kPrivate, "filter", "Ljavax/microedition/rms/RecordFilter;"),
+            field(kPrivate, "comparator", "Ljavax/microedition/rms/RecordComparator;"),
+            field(kPrivate, "store", "Ljavax/microedition/rms/RecordStore;"),
+            field(kPrivate, "observedVersion", "I"),
         }, {
             method(kPublic, "numRecords", "()I"),
             method(kPublic, "hasNextElement", "()Z"),

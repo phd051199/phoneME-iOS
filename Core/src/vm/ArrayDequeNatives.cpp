@@ -1,6 +1,8 @@
 #include "ArrayDequeNatives.hpp"
 
 #include <algorithm>
+#include <array>
+#include <array>
 #include <exception>
 #include <limits>
 #include <span>
@@ -112,6 +114,29 @@ void add(NativeMethodRegistry& registry,
         "[Ljava/lang/Object;", length, Value::from_reference({}));
 }
 
+struct DequeState final {
+    ObjectRef elements {};
+    i32 size {0};
+};
+
+[[nodiscard]] Result<DequeState> deque_state(Machine& machine,
+                                             ObjectRef deque) {
+    constexpr std::array<usize, 2> fields {
+        kElementsField,
+        kSizeField,
+    };
+    std::array<Value, fields.size()> values {};
+    auto read = machine.heap().read_fields(deque, fields, values);
+    if (!read) return std::unexpected(read.error());
+    auto elements = values[0U].as_reference();
+    auto size = values[1U].as_int();
+    if (!elements || elements->is_null() || !size || *size < 0) {
+        return fail(ErrorCode::invalid_state,
+                    "ArrayDeque state is invalid");
+    }
+    return DequeState {.elements = *elements, .size = *size};
+}
+
 [[nodiscard]] Status initialize_deque(Machine& machine,
                                       ObjectRef deque,
                                       i32 requested_capacity) {
@@ -125,9 +150,15 @@ void add(NativeMethodRegistry& registry,
                 : static_cast<usize>(requested_capacity));
     auto elements = allocate_object_array(machine, capacity);
     if (!elements) return std::unexpected(elements.error());
-    auto stored = set_reference_field(machine, deque, kElementsField, *elements);
-    if (!stored) return stored;
-    return set_int_field(machine, deque, kSizeField, 0);
+    constexpr std::array<usize, 2> fields {
+        kElementsField,
+        kSizeField,
+    };
+    const std::array<Value, fields.size()> values {
+        Value::from_reference(*elements),
+        Value::from_int(0),
+    };
+    return machine.heap().write_fields(deque, fields, values);
 }
 
 [[nodiscard]] Result<ObjectRef> deque_elements(Machine& machine,
@@ -153,10 +184,9 @@ void add(NativeMethodRegistry& registry,
 
 [[nodiscard]] Status ensure_capacity(Machine& machine,
                                      ObjectRef deque,
+                                     DequeState& state,
                                      i32 minimum) {
-    auto elements = deque_elements(machine, deque);
-    if (!elements) return std::unexpected(elements.error());
-    auto capacity = machine.heap().array_length(*elements);
+    auto capacity = machine.heap().array_length(state.elements);
     if (!capacity) return std::unexpected(capacity.error());
     if (minimum <= static_cast<i32>(*capacity)) return {};
     if (minimum < 0) {
@@ -171,17 +201,16 @@ void add(NativeMethodRegistry& registry,
     }
     auto replacement = allocate_object_array(machine, grown);
     if (!replacement) return std::unexpected(replacement.error());
-    auto size = deque_size(machine, deque);
-    if (!size) return std::unexpected(size.error());
-    for (i32 index = 0; index < *size; ++index) {
-        auto value = machine.heap().element(*elements,
-                                            static_cast<usize>(index));
-        if (!value) return std::unexpected(value.error());
-        auto stored = machine.heap().set_element(
-            *replacement, static_cast<usize>(index), *value);
-        if (!stored) return stored;
+    if (state.size > 0) {
+        auto copied = machine.heap().copy_array_range(
+            state.elements, 0U, *replacement, 0U,
+            static_cast<usize>(state.size));
+        if (!copied) return copied;
     }
-    return set_reference_field(machine, deque, kElementsField, *replacement);
+    auto stored = set_reference_field(machine, deque, kElementsField, *replacement);
+    if (!stored) return stored;
+    state.elements = *replacement;
+    return {};
 }
 
 [[nodiscard]] Result<ObjectRef> element_reference(Machine& machine,
@@ -199,20 +228,19 @@ void add(NativeMethodRegistry& registry,
         return fail_java("java/lang/NullPointerException",
                          "ArrayDeque does not permit null elements");
     }
-    auto size = deque_size(machine, deque);
-    if (!size) return std::unexpected(size.error());
-    if (*size == std::numeric_limits<i32>::max()) {
+    auto state = deque_state(machine, deque);
+    if (!state) return std::unexpected(state.error());
+    if (state->size == std::numeric_limits<i32>::max()) {
         return fail_java("java/lang/OutOfMemoryError",
                          "ArrayDeque size overflow");
     }
-    auto capacity = ensure_capacity(machine, deque, *size + 1);
+    auto capacity = ensure_capacity(machine, deque, *state, state->size + 1);
     if (!capacity) return capacity;
-    auto elements = deque_elements(machine, deque);
-    if (!elements) return std::unexpected(elements.error());
     auto stored = machine.heap().set_element(
-        *elements, static_cast<usize>(*size), Value::from_reference(value));
+        state->elements, static_cast<usize>(state->size),
+        Value::from_reference(value));
     if (!stored) return stored;
-    return set_int_field(machine, deque, kSizeField, *size + 1);
+    return set_int_field(machine, deque, kSizeField, state->size + 1);
 }
 
 [[nodiscard]] Status prepend(Machine& machine,
@@ -222,56 +250,50 @@ void add(NativeMethodRegistry& registry,
         return fail_java("java/lang/NullPointerException",
                          "ArrayDeque does not permit null elements");
     }
-    auto size = deque_size(machine, deque);
-    if (!size) return std::unexpected(size.error());
-    if (*size == std::numeric_limits<i32>::max()) {
+    auto state = deque_state(machine, deque);
+    if (!state) return std::unexpected(state.error());
+    if (state->size == std::numeric_limits<i32>::max()) {
         return fail_java("java/lang/OutOfMemoryError",
                          "ArrayDeque size overflow");
     }
-    auto capacity = ensure_capacity(machine, deque, *size + 1);
+    auto capacity = ensure_capacity(machine, deque, *state, state->size + 1);
     if (!capacity) return capacity;
-    auto elements = deque_elements(machine, deque);
-    if (!elements) return std::unexpected(elements.error());
-    for (i32 index = *size; index > 0; --index) {
-        auto previous = machine.heap().element(
-            *elements, static_cast<usize>(index - 1));
-        if (!previous) return std::unexpected(previous.error());
-        auto shifted = machine.heap().set_element(
-            *elements, static_cast<usize>(index), *previous);
+    if (state->size > 0) {
+        auto shifted = machine.heap().copy_array_range(
+            state->elements, 0U, state->elements, 1U,
+            static_cast<usize>(state->size));
         if (!shifted) return shifted;
     }
     auto stored = machine.heap().set_element(
-        *elements, 0U, Value::from_reference(value));
+        state->elements, 0U, Value::from_reference(value));
     if (!stored) return stored;
-    return set_int_field(machine, deque, kSizeField, *size + 1);
+    return set_int_field(machine, deque, kSizeField, state->size + 1);
 }
 
 [[nodiscard]] Result<ObjectRef> remove_at(Machine& machine,
                                           ObjectRef deque,
                                           i32 index) {
-    auto size = deque_size(machine, deque);
-    if (!size) return std::unexpected(size.error());
-    if (index < 0 || index >= *size) {
+    auto state = deque_state(machine, deque);
+    if (!state) return std::unexpected(state.error());
+    if (index < 0 || index >= state->size) {
         return fail_java("java/util/NoSuchElementException",
                          "ArrayDeque is empty");
     }
-    auto elements = deque_elements(machine, deque);
-    if (!elements) return std::unexpected(elements.error());
-    auto removed = element_reference(machine, *elements, index);
+    auto removed = element_reference(machine, state->elements, index);
     if (!removed) return std::unexpected(removed.error());
-    for (i32 cursor = index; cursor + 1 < *size; ++cursor) {
-        auto next = machine.heap().element(
-            *elements, static_cast<usize>(cursor + 1));
-        if (!next) return std::unexpected(next.error());
-        auto shifted = machine.heap().set_element(
-            *elements, static_cast<usize>(cursor), *next);
+    const i32 shifted_count = state->size - index - 1;
+    if (shifted_count > 0) {
+        auto shifted = machine.heap().copy_array_range(
+            state->elements, static_cast<usize>(index + 1),
+            state->elements, static_cast<usize>(index),
+            static_cast<usize>(shifted_count));
         if (!shifted) return std::unexpected(shifted.error());
     }
     auto cleared = machine.heap().set_element(
-        *elements, static_cast<usize>(*size - 1),
+        state->elements, static_cast<usize>(state->size - 1),
         Value::from_reference({}));
     if (!cleared) return std::unexpected(cleared.error());
-    auto resized = set_int_field(machine, deque, kSizeField, *size - 1);
+    auto resized = set_int_field(machine, deque, kSizeField, state->size - 1);
     if (!resized) return std::unexpected(resized.error());
     return *removed;
 }
@@ -280,18 +302,17 @@ void add(NativeMethodRegistry& registry,
                                         ObjectRef deque,
                                         bool first,
                                         bool require_value) {
-    auto size = deque_size(machine, deque);
-    if (!size) return std::unexpected(size.error());
-    if (*size == 0) {
+    auto state = deque_state(machine, deque);
+    if (!state) return std::unexpected(state.error());
+    if (state->size == 0) {
         if (require_value) {
             return fail_java("java/util/NoSuchElementException",
                              "ArrayDeque is empty");
         }
         return ObjectRef {};
     }
-    auto elements = deque_elements(machine, deque);
-    if (!elements) return std::unexpected(elements.error());
-    return element_reference(machine, *elements, first ? 0 : *size - 1);
+    return element_reference(machine, state->elements,
+                             first ? 0 : state->size - 1);
 }
 
 [[nodiscard]] Result<bool> values_equal(Machine& machine,
@@ -325,21 +346,19 @@ void add(NativeMethodRegistry& registry,
                                      ObjectRef deque,
                                      ObjectRef target,
                                      bool reverse) {
-    auto size = deque_size(machine, deque);
-    auto elements = deque_elements(machine, deque);
-    if (!size) return std::unexpected(size.error());
-    if (!elements) return std::unexpected(elements.error());
+    auto state = deque_state(machine, deque);
+    if (!state) return std::unexpected(state.error());
     if (!reverse) {
-        for (i32 index = 0; index < *size; ++index) {
-            auto value = element_reference(machine, *elements, index);
+        for (i32 index = 0; index < state->size; ++index) {
+            auto value = element_reference(machine, state->elements, index);
             if (!value) return std::unexpected(value.error());
             auto equal = values_equal(machine, *value, target);
             if (!equal) return std::unexpected(equal.error());
             if (*equal) return index;
         }
     } else {
-        for (i32 index = *size - 1; index >= 0; --index) {
-            auto value = element_reference(machine, *elements, index);
+        for (i32 index = state->size - 1; index >= 0; --index) {
+            auto value = element_reference(machine, state->elements, index);
             if (!value) return std::unexpected(value.error());
             auto equal = values_equal(machine, *value, target);
             if (!equal) return std::unexpected(equal.error());
@@ -352,16 +371,21 @@ void add(NativeMethodRegistry& registry,
 [[nodiscard]] Result<ObjectRef> snapshot(Machine& machine,
                                          ObjectRef deque,
                                          bool reverse) {
-    auto size = deque_size(machine, deque);
-    auto elements = deque_elements(machine, deque);
-    if (!size) return std::unexpected(size.error());
-    if (!elements) return std::unexpected(elements.error());
-    auto result = allocate_object_array(machine, static_cast<usize>(*size));
+    auto state = deque_state(machine, deque);
+    if (!state) return std::unexpected(state.error());
+    auto result = allocate_object_array(machine, static_cast<usize>(state->size));
     if (!result) return std::unexpected(result.error());
-    for (i32 index = 0; index < *size; ++index) {
-        const i32 source = reverse ? *size - 1 - index : index;
+    if (!reverse && state->size > 0) {
+        auto copied = machine.heap().copy_array_range(
+            state->elements, 0U, *result, 0U,
+            static_cast<usize>(state->size));
+        if (!copied) return std::unexpected(copied.error());
+        return *result;
+    }
+    for (i32 index = 0; index < state->size; ++index) {
+        const i32 source = reverse ? state->size - 1 - index : index;
         auto value = machine.heap().element(
-            *elements, static_cast<usize>(source));
+            state->elements, static_cast<usize>(source));
         if (!value) return std::unexpected(value.error());
         auto stored = machine.heap().set_element(
             *result, static_cast<usize>(index), *value);
@@ -380,15 +404,18 @@ void add(NativeMethodRegistry& registry,
     auto iterator = machine.class_states().allocate_instance(
         machine.heap(), "java/util/ArrayDequeIterator");
     if (!iterator) return std::unexpected(iterator.error());
-    auto values_stored = set_reference_field(
-        machine, *iterator, kIteratorValuesField, *values);
-    auto index_stored = set_int_field(
-        machine, *iterator, kIteratorIndexField, 0);
-    auto size_stored = set_int_field(
-        machine, *iterator, kIteratorSizeField, *size);
-    if (!values_stored) return std::unexpected(values_stored.error());
-    if (!index_stored) return std::unexpected(index_stored.error());
-    if (!size_stored) return std::unexpected(size_stored.error());
+    constexpr std::array<usize, 3> fields {
+        kIteratorValuesField,
+        kIteratorIndexField,
+        kIteratorSizeField,
+    };
+    const std::array<Value, fields.size()> state {
+        Value::from_reference(*values),
+        Value::from_int(0),
+        Value::from_int(*size),
+    };
+    auto stored = machine.heap().write_fields(*iterator, fields, state);
+    if (!stored) return std::unexpected(stored.error());
     return *iterator;
 }
 
@@ -450,8 +477,15 @@ void register_iterator_natives(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto index = int_field(machine, *object, kIteratorIndexField);
-            auto size = int_field(machine, *object, kIteratorSizeField);
+            constexpr std::array<usize, 2> fields {
+                kIteratorIndexField,
+                kIteratorSizeField,
+            };
+            std::array<Value, fields.size()> state {};
+            auto read = machine.heap().read_fields(*object, fields, state);
+            if (!read) return std::unexpected(read.error());
+            auto index = state[0U].as_int();
+            auto size = state[1U].as_int();
             if (!index) return std::unexpected(index.error());
             if (!size) return std::unexpected(size.error());
             return std::optional<Value>(Value::from_int(*index < *size ? 1 : 0));
@@ -461,9 +495,17 @@ void register_iterator_natives(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto index = int_field(machine, *object, kIteratorIndexField);
-            auto size = int_field(machine, *object, kIteratorSizeField);
-            auto values = reference_field(machine, *object, kIteratorValuesField);
+            constexpr std::array<usize, 3> fields {
+                kIteratorValuesField,
+                kIteratorIndexField,
+                kIteratorSizeField,
+            };
+            std::array<Value, fields.size()> state {};
+            auto read = machine.heap().read_fields(*object, fields, state);
+            if (!read) return std::unexpected(read.error());
+            auto values = state[0U].as_reference();
+            auto index = state[1U].as_int();
+            auto size = state[2U].as_int();
             if (!index) return std::unexpected(index.error());
             if (!size) return std::unexpected(size.error());
             if (!values) return std::unexpected(values.error());
@@ -716,13 +758,11 @@ void register_array_deque_natives(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto size = deque_size(machine, *object);
-            auto elements = deque_elements(machine, *object);
-            if (!size) return std::unexpected(size.error());
-            if (!elements) return std::unexpected(elements.error());
-            for (i32 index = 0; index < *size; ++index) {
-                auto cleared = machine.heap().set_element(
-                    *elements, static_cast<usize>(index),
+            auto state = deque_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (state->size > 0) {
+                auto cleared = machine.heap().fill_array_range(
+                    state->elements, 0U, static_cast<usize>(state->size),
                     Value::from_reference({}));
                 if (!cleared) return std::unexpected(cleared.error());
             }

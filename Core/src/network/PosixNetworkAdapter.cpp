@@ -88,10 +88,11 @@ constexpr usize kInitialNetworkWorkerCount = 2U;
 constexpr usize kMaximumNetworkWorkerCount = 32U;
 constexpr usize kMaximumReservedNetworkWorkers = 4U;
 #else
-// Start lean on native hosts as well. The pool already grows on demand when
-// queued work exceeds runnable capacity, so eight permanent pthread stacks at
-// startup only increase memory/thread footprint for the common one-socket game.
-constexpr usize kInitialNetworkWorkerCount = 2U;
+// Native iOS games commonly spend long stretches entirely offline. The pool
+// already grows synchronously when the first task is queued, so pre-spawning
+// idle workers only adds pthread stacks and scheduler bookkeeping. Start at
+// zero and create exactly the workers demanded by real socket/DNS activity.
+constexpr usize kInitialNetworkWorkerCount = 0U;
 constexpr usize kMaximumNetworkWorkerCount = 32U;
 constexpr usize kMaximumReservedNetworkWorkers = 4U;
 #endif

@@ -56,33 +56,75 @@ namespace phoneme::vm
                   "field descriptor has an unknown value kind");
     }
 
-    [[nodiscard]] std::string field_resolution_key(
-        std::string_view owner,
-        std::string_view name,
-        std::string_view descriptor,
-        bool require_static)
+    [[nodiscard]] usize combine_hash(usize seed, usize value) noexcept
     {
-      std::string key;
-      key.reserve(owner.size() + name.size() + descriptor.size() + 4U);
-      key.append(owner);
-      key.push_back('\n');
-      key.append(name);
-      key.push_back('\n');
-      key.append(descriptor);
-      key.push_back(require_static ? '\1' : '\0');
-      return key;
+      return seed ^ (value + static_cast<usize>(0x9E3779B9U) +
+                     (seed << 6U) + (seed >> 2U));
     }
 
   } // namespace
 
+  usize ClassStateRegistry::FieldResolutionKeyHash::operator()(
+      const FieldResolutionKey& key) const noexcept
+  {
+    return (*this)(FieldResolutionKeyView {
+        .owner = key.owner,
+        .name = key.name,
+        .descriptor = key.descriptor,
+        .require_static = key.require_static,
+    });
+  }
+
+  usize ClassStateRegistry::FieldResolutionKeyHash::operator()(
+      FieldResolutionKeyView key) const noexcept
+  {
+    usize result = std::hash<std::string_view>{}(key.owner);
+    result = combine_hash(result, std::hash<std::string_view>{}(key.name));
+    result = combine_hash(
+        result, std::hash<std::string_view>{}(key.descriptor));
+    return combine_hash(result, key.require_static ? 1U : 0U);
+  }
+
+  bool ClassStateRegistry::FieldResolutionKeyEqual::operator()(
+      const FieldResolutionKey& left,
+      const FieldResolutionKey& right) const noexcept
+  {
+    return left.owner == right.owner && left.name == right.name &&
+           left.descriptor == right.descriptor &&
+           left.require_static == right.require_static;
+  }
+
+  bool ClassStateRegistry::FieldResolutionKeyEqual::operator()(
+      const FieldResolutionKey& left,
+      FieldResolutionKeyView right) const noexcept
+  {
+    return left.owner == right.owner && left.name == right.name &&
+           left.descriptor == right.descriptor &&
+           left.require_static == right.require_static;
+  }
+
+  bool ClassStateRegistry::FieldResolutionKeyEqual::operator()(
+      FieldResolutionKeyView left,
+      const FieldResolutionKey& right) const noexcept
+  {
+    return (*this)(right, left);
+  }
+
   Result<std::shared_ptr<const ClassLayout>> ClassStateRegistry::layout(
       std::string_view class_name)
   {
-    const std::string normalized = normalize_name(class_name);
-    if (normalized.empty())
+    if (class_name.empty())
     {
       return fail(ErrorCode::invalid_argument,
                   "class layout name must not be empty");
+    }
+
+    std::string normalized_storage;
+    std::string_view normalized = class_name;
+    if (class_name.find('.') != std::string_view::npos)
+    {
+      normalized_storage = normalize_name(class_name);
+      normalized = normalized_storage;
     }
 
     {
@@ -94,14 +136,15 @@ namespace phoneme::vm
       }
     }
 
-    auto built = build_layout(normalized);
+    auto built = build_layout(std::string(normalized));
     if (!built)
     {
       return std::unexpected(built.error());
     }
 
     std::scoped_lock lock(mutex_);
-    const auto [iterator, inserted] = layouts_.emplace(normalized, *built);
+    const auto [iterator, inserted] = layouts_.emplace(
+        std::string(normalized), *built);
     (void)inserted;
     return iterator->second;
   }
@@ -118,10 +161,19 @@ namespace phoneme::vm
                   "field reference is incomplete");
     }
 
-    std::string current = normalize_name(owner);
-    PerformanceCounters::record_metadata_key_construction();
-    const std::string cache_key = field_resolution_key(
-        current, name, descriptor, require_static);
+    std::string normalized_storage;
+    std::string_view normalized_owner = owner;
+    if (owner.find('.') != std::string_view::npos)
+    {
+      normalized_storage = normalize_name(owner);
+      normalized_owner = normalized_storage;
+    }
+    const FieldResolutionKeyView cache_key {
+        .owner = normalized_owner,
+        .name = name,
+        .descriptor = descriptor,
+        .require_static = require_static,
+    };
     {
       std::scoped_lock lock(mutex_);
       if (const auto cached = resolved_fields_.find(cache_key);
@@ -132,11 +184,23 @@ namespace phoneme::vm
       }
     }
     PerformanceCounters::record_field_resolution(false);
-    const auto cache_location = [this, &cache_key](FieldLocation location)
+    std::string current(normalized_owner);
+    const std::string cache_owner = current;
+    const auto cache_location = [this,
+                                 &cache_owner,
+                                 name,
+                                 descriptor,
+                                 require_static](FieldLocation location)
         -> Result<FieldLocation>
     {
       std::scoped_lock lock(mutex_);
-      if (const auto cached = resolved_fields_.find(cache_key);
+      const FieldResolutionKeyView lookup {
+          .owner = cache_owner,
+          .name = name,
+          .descriptor = descriptor,
+          .require_static = require_static,
+      };
+      if (const auto cached = resolved_fields_.find(lookup);
           cached != resolved_fields_.end())
       {
         return cached->second;
@@ -157,8 +221,15 @@ namespace phoneme::vm
         field_ids_.emplace(location.storage_key, location.id);
       }
       const auto [iterator, inserted] = resolved_fields_.emplace(
-          cache_key, std::move(location));
-      (void)inserted;
+          FieldResolutionKey {
+              .owner = cache_owner,
+              .name = std::string(name),
+              .descriptor = std::string(descriptor),
+              .require_static = require_static,
+          },
+          std::move(location));
+      if (inserted)
+        PerformanceCounters::record_metadata_key_construction();
       return iterator->second;
     };
 
@@ -282,40 +353,38 @@ namespace phoneme::vm
       Heap &heap,
       std::string_view class_name)
   {
-    auto loaded = classes_.load(class_name);
-    if (!loaded)
-    {
-      return std::unexpected(loaded.error());
-    }
-    if (((*loaded)->access_flags() & (kAccInterface | kAccAbstract)) != 0U)
-    {
-      return fail(ErrorCode::invalid_argument,
-                  "cannot allocate an interface or abstract class");
-    }
     auto class_layout = layout(class_name);
     if (!class_layout)
     {
       return std::unexpected(class_layout.error());
     }
-    auto reference = heap.allocate_object((*class_layout)->class_name,
-                                          (*class_layout)->instance_field_slots);
-    if (!reference)
+    if (!(*class_layout)->instantiable)
     {
-      return std::unexpected(reference.error());
+      return fail(ErrorCode::invalid_argument,
+                  "cannot allocate an interface or abstract class");
     }
-    for (usize index = 0;
-         index < (*class_layout)->instance_defaults.size();
-         ++index)
+    return heap.allocate_object(
+        (*class_layout)->class_name,
+        std::span<const Value>((*class_layout)->instance_defaults));
+  }
+
+  Result<ObjectRef> ClassStateRegistry::allocate_text_instance(
+      Heap &heap,
+      std::string_view class_name,
+      std::u16string text)
+  {
+    auto class_layout = layout(class_name);
+    if (!class_layout)
+      return std::unexpected(class_layout.error());
+    if (!(*class_layout)->instantiable)
     {
-      auto initialized = heap.set_field(*reference,
-                                        index,
-                                        (*class_layout)->instance_defaults[index]);
-      if (!initialized)
-      {
-        return std::unexpected(initialized.error());
-      }
+      return fail(ErrorCode::invalid_argument,
+                  "cannot allocate an interface or abstract class");
     }
-    return reference;
+    return heap.allocate_text_object(
+        (*class_layout)->class_name,
+        (*class_layout)->instance_defaults,
+        std::move(text));
   }
 
   Result<Value> ClassStateRegistry::static_field(const FieldLocation &field)
@@ -333,11 +402,9 @@ namespace phoneme::vm
 
     {
       std::scoped_lock lock(mutex_);
-      if (const auto iterator = static_fields_.find(field.id);
-          iterator != static_fields_.end())
-      {
-        return iterator->second;
-      }
+      const usize slot = static_cast<usize>(field.id.value);
+      if (slot < static_fields_.size() && static_fields_[slot].has_value())
+        return *static_fields_[slot];
     }
 
     auto initial = default_value(field.descriptor);
@@ -379,9 +446,29 @@ namespace phoneme::vm
     }
 
     std::scoped_lock lock(mutex_);
-    const auto [iterator, inserted] = static_fields_.emplace(field.id, *initial);
-    (void)inserted;
-    return iterator->second;
+    const usize slot = static_cast<usize>(field.id.value);
+    if (static_fields_.size() <= slot)
+      static_fields_.resize(slot + 1U);
+    if (!static_fields_[slot].has_value())
+      static_fields_[slot] = *initial;
+    return *static_fields_[slot];
+  }
+
+  Result<Value> ClassStateRegistry::static_field(FieldId field_id) const
+  {
+    if (!field_id.valid())
+    {
+      return fail(ErrorCode::invalid_argument,
+                  "static field has no runtime field ID");
+    }
+    std::scoped_lock lock(mutex_);
+    const usize slot = static_cast<usize>(field_id.value);
+    if (slot >= static_fields_.size() || !static_fields_[slot].has_value())
+    {
+      return fail(ErrorCode::invalid_state,
+                  "quick static field was not prepared before access");
+    }
+    return *static_fields_[slot];
   }
 
   Status ClassStateRegistry::set_static_field(const FieldLocation &field,
@@ -404,7 +491,32 @@ namespace phoneme::vm
     }
 
     std::scoped_lock lock(mutex_);
-    static_fields_.insert_or_assign(field.id, value);
+    const usize slot = static_cast<usize>(field.id.value);
+    if (static_fields_.size() <= slot)
+      static_fields_.resize(slot + 1U);
+    static_fields_[slot] = value;
+    return {};
+  }
+
+  Status ClassStateRegistry::set_static_field(FieldId field_id,
+                                              ValueKind expected_kind,
+                                              Value value)
+  {
+    if (!field_id.valid())
+    {
+      return fail(ErrorCode::invalid_argument,
+                  "static field has no runtime field ID");
+    }
+    if (value.kind() != expected_kind)
+    {
+      return fail(ErrorCode::invalid_argument,
+                  "static field value does not match its descriptor");
+    }
+    std::scoped_lock lock(mutex_);
+    const usize slot = static_cast<usize>(field_id.value);
+    if (static_fields_.size() <= slot)
+      static_fields_.resize(slot + 1U);
+    static_fields_[slot] = value;
     return {};
   }
 
@@ -412,12 +524,11 @@ namespace phoneme::vm
       std::vector<ObjectRef> &roots) const
   {
     std::scoped_lock lock(mutex_);
-    for (const auto &[key, value] : static_fields_)
+    for (const auto& slot : static_fields_)
     {
-      (void)key;
-      if (value.kind() != ValueKind::reference)
+      if (!slot.has_value() || slot->kind() != ValueKind::reference)
         continue;
-      auto reference = value.as_reference();
+      auto reference = slot->as_reference();
       if (reference && !reference->is_null())
       {
         roots.push_back(*reference);
@@ -447,6 +558,8 @@ namespace phoneme::vm
     ClassLayout result{
         .class_name = class_name,
         .super_name = (*loaded)->super_name(),
+        .instantiable =
+            ((*loaded)->access_flags() & (kAccInterface | kAccAbstract)) == 0U,
         .instance_field_slots = 0,
         .instance_fields = {},
         .instance_defaults = {},

@@ -71,6 +71,16 @@ public:
         return Value(ValueKind::return_address, static_cast<u64>(value));
     }
 
+    // VM-internal reconstruction path for compact slot storage. The verifier
+    // and slot container own the type invariant; avoid repeating conversions
+    // through the checked public accessors when materializing a Value at the
+    // compatibility boundary.
+    [[nodiscard]] static constexpr Value from_raw_unchecked(
+        ValueKind kind,
+        u64 bits) noexcept {
+        return Value(kind, bits);
+    }
+
     [[nodiscard]] constexpr ValueKind kind() const noexcept { return kind_; }
     [[nodiscard]] constexpr bool empty() const noexcept {
         return kind_ == ValueKind::empty;

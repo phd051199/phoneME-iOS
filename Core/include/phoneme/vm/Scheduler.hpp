@@ -100,6 +100,9 @@ public:
     void set_current_state(JavaThreadState state) noexcept;
     void publish_current_roots(u32 invocation_depth,
                                std::span<const ObjectRef> roots);
+    std::span<const ObjectRef> exchange_current_roots(
+        u32 invocation_depth,
+        std::vector<ObjectRef>& roots);
     void clear_current_roots(u32 invocation_depth) noexcept;
     void set_current_pending_exception(
         std::optional<ObjectRef> throwable) noexcept;

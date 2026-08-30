@@ -1,12 +1,15 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "phoneme/vm/MetadataId.hpp"
@@ -44,6 +47,16 @@ struct NativeMethodBinding final {
 
 class NativeMethodRegistry final {
 public:
+    NativeMethodRegistry();
+    ~NativeMethodRegistry();
+
+    // Core registers hundreds of native/HLE entries during bootstrap. Batch
+    // mode defers rebuilding the immutable ID dispatch snapshot until the
+    // outermost batch ends, avoiding O(N^2) startup copies while keeping
+    // ordinary late registration immediately visible to lock-free readers.
+    void begin_registration_batch() noexcept;
+    void end_registration_batch() noexcept;
+
     [[nodiscard]] Status register_method(
         std::string owner,
         std::string name,
@@ -87,21 +100,51 @@ public:
     void clear() noexcept;
 
 private:
+    struct NativeLookupKey final {
+        std::string_view owner;
+        std::string_view name;
+        std::string_view descriptor;
+    };
+
+    struct NativeLookupKeyHash final {
+        [[nodiscard]] usize operator()(NativeLookupKey key) const noexcept;
+    };
+
+    struct NativeLookupKeyEqual final {
+        [[nodiscard]] bool operator()(NativeLookupKey left,
+                                      NativeLookupKey right) const noexcept;
+    };
+
     struct Entry final {
         NativeMethodSignature signature;
         NativeMethod implementation;
         NativeJitPolicy jit_policy {NativeJitPolicy::conservative};
-        std::size_t invocation_count {0};
+        std::atomic<std::size_t> invocation_count {0};
     };
 
-    [[nodiscard]] static std::string key(std::string_view owner,
-                                         std::string_view name,
-                                         std::string_view descriptor);
+    using DispatchTable = std::vector<std::shared_ptr<Entry>>;
+
+    void publish_dispatch_table_locked();
+    void advance_generation_locked() noexcept;
 
     mutable std::mutex mutex_;
-    std::unordered_map<std::string, NativeMethodId> ids_by_key_;
-    mutable std::vector<Entry> entries_;
-    u64 generation_ {1U};
+    // Non-owning keys point into Entry::signature. Entry objects are stable
+    // until clear/destruction, so registration and lookup avoid allocating a
+    // concatenated owner/name/descriptor key on every operation.
+    std::unordered_map<NativeLookupKey,
+                       NativeMethodId,
+                       NativeLookupKeyHash,
+                       NativeLookupKeyEqual> ids_by_key_;
+    std::unordered_set<std::string_view> owners_;
+    DispatchTable entries_;
+    // Readers only need a stable immutable table pointer. Published snapshots
+    // are retained for the registry lifetime so invoke(NativeMethodId) avoids
+    // the atomic shared_ptr reference-count traffic that would otherwise occur
+    // on every native call. Registration/clear are cold writer paths.
+    std::vector<std::unique_ptr<const DispatchTable>> dispatch_snapshots_;
+    std::atomic<const DispatchTable*> dispatch_table_ {nullptr};
+    u32 registration_batch_depth_ {0U};
+    std::atomic<u64> generation_ {1U};
 };
 
 void register_core_natives(NativeMethodRegistry& registry);

@@ -10,10 +10,16 @@
 
 namespace phoneme::runtime {
 
+enum class FramePixelFormat : u8 {
+    rgba8 = 0,
+    bgra8 = 1,
+};
+
 struct FrameMetadata final {
     Dimensions dimensions;
     u64 generation {0};
     usize byte_count {0};
+    FramePixelFormat pixel_format {FramePixelFormat::rgba8};
 };
 
 struct FrameSnapshot final {
@@ -64,38 +70,52 @@ public:
         ReadLease(std::unique_lock<std::mutex> lock,
                   FrameMetadata metadata,
                   std::span<const u8> pixels,
-                  std::span<const FrameDamageRegion> damage_regions) noexcept
+                  std::span<const FrameDamageRegion> damage_regions,
+                  std::vector<u8> owned_pixels = {}) noexcept
             : lock_(std::move(lock)),
               metadata_(metadata),
+              owned_pixels_(std::move(owned_pixels)),
               pixels_(pixels),
-              damage_regions_(damage_regions) {}
+              damage_regions_(damage_regions) {
+            if (!owned_pixels_.empty()) {
+                pixels_ = std::span<const u8>(owned_pixels_.data(),
+                                              owned_pixels_.size());
+            }
+        }
 
         std::unique_lock<std::mutex> lock_;
         FrameMetadata metadata_;
+        std::vector<u8> owned_pixels_;
         std::span<const u8> pixels_;
         std::span<const FrameDamageRegion> damage_regions_;
     };
 
     [[nodiscard]] Status resize(Dimensions dimensions);
     [[nodiscard]] Status replace(Dimensions dimensions,
-                                 std::span<const u8> rgba);
+                                 std::span<const u8> pixels,
+                                 FramePixelFormat format = FramePixelFormat::rgba8);
     [[nodiscard]] Status replace_exchange(Dimensions dimensions,
-                                          std::vector<u8>& rgba);
+                                          std::vector<u8>& pixels,
+                                          FramePixelFormat format = FramePixelFormat::rgba8);
     [[nodiscard]] Status update_region(Dimensions dimensions,
                                        i32 x,
                                        i32 y,
                                        i32 width,
                                        i32 height,
-                                       std::span<const u8> rgba);
+                                       std::span<const u8> pixels,
+                                       FramePixelFormat format = FramePixelFormat::rgba8);
     [[nodiscard]] Status update_regions(
         Dimensions dimensions,
-        std::span<const FrameRegionUpdate> updates);
+        std::span<const FrameRegionUpdate> updates,
+        FramePixelFormat format = FramePixelFormat::rgba8);
     [[nodiscard]] FrameMetadata metadata() const noexcept;
     [[nodiscard]] FrameMetadata copy_rgba(std::span<u8> destination) const noexcept;
     [[nodiscard]] std::optional<FrameMetadata> copy_rgba_since(
         u64 previous_generation,
         std::span<u8> destination) const noexcept;
     [[nodiscard]] std::optional<ReadLease> acquire_rgba_since(
+        u64 previous_generation) const noexcept;
+    [[nodiscard]] std::optional<ReadLease> acquire_native_since(
         u64 previous_generation) const noexcept;
     [[nodiscard]] FrameSnapshot snapshot() const;
     void clear() noexcept;
@@ -105,6 +125,7 @@ private:
     Dimensions dimensions_;
     u64 generation_ {0};
     std::vector<u8> rgba_;
+    FramePixelFormat pixel_format_ {FramePixelFormat::rgba8};
     std::vector<FrameDamageRegion> damage_regions_;
 };
 

@@ -62,6 +62,7 @@ public final class LcduiExtendedOps extends MIDlet
     private static boolean textFieldCharOpsPassed;
     private static boolean displayCapabilitiesPassed;
     private static boolean choiceFontPassed;
+    private static boolean formArrayPassed;
     private static Font customFont;
 
     protected void startApp() {}
@@ -100,6 +101,20 @@ public final class LcduiExtendedOps extends MIDlet
         imageItem = new ImageItem("Image", image, 0, "image-alt", 2);
         spacer = new Spacer(4, 5);
         customItem = new Probe("Custom");
+
+        StringItem arrayFirst = new StringItem("ArrayA", "first");
+        StringItem arraySecond = new StringItem("ArrayB", "second");
+        Form arrayForm = new Form("ArrayForm",
+                new Item[] {arrayFirst, arraySecond});
+        boolean nullItemRejected = false;
+        try {
+            new Form("BadArrayForm", new Item[] {null});
+        } catch (NullPointerException expected) {
+            nullItemRejected = true;
+        }
+        formArrayPassed = arrayForm.size() == 2 &&
+                arrayForm.get(0) == arrayFirst &&
+                arrayForm.get(1) == arraySecond && nullItemRejected;
 
         Command itemCommand = new Command("Use", Command.ITEM, 0);
         customItem.addCommand(itemCommand);
@@ -237,7 +252,8 @@ public final class LcduiExtendedOps extends MIDlet
                 foreverAlert.getImage().getHeight() != 3) return 5;
         if (!textFieldCharOpsPassed || !displayCapabilitiesPassed ||
                 !choiceFontPassed || styledItem.getFont() != customFont ||
-                foreverAlert.getIndicator() != indicator) return 13;
+                foreverAlert.getIndicator() != indicator ||
+                !formArrayPassed) return 13;
         styledItem.setFont(null);
         if (styledItem.getFont() == null) return 14;
         if (!"native-text".equals(textField.getString()) ||

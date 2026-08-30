@@ -31,6 +31,71 @@ constexpr usize kInflaterEndedField = 6U;
 constexpr usize kInitialOutputCapacity = 512U;
 constexpr usize kZlibChunkSize = 8192U;
 
+struct GzipInputState final {
+    ObjectRef data {};
+    i32 position {0};
+    i32 closed {0};
+};
+
+[[nodiscard]] Result<GzipInputState> gzip_input_state(Machine& machine,
+                                                      ObjectRef object) {
+    constexpr std::array<usize, 3> fields {
+        kInputDataField,
+        kInputPositionField,
+        kInputClosedField,
+    };
+    std::array<Value, fields.size()> values {};
+    auto read = machine.heap().read_fields(object, fields, values);
+    if (!read) return std::unexpected(read.error());
+    auto data = values[0U].as_reference();
+    auto position = values[1U].as_int();
+    auto closed = values[2U].as_int();
+    if (!data || data->is_null() || !position || !closed || *position < 0) {
+        return fail(ErrorCode::invalid_state,
+                    "GZIPInputStream state is invalid");
+    }
+    return GzipInputState {
+        .data = *data,
+        .position = *position,
+        .closed = *closed,
+    };
+}
+
+struct GzipOutputState final {
+    ObjectRef delegate {};
+    ObjectRef data {};
+    i32 size {0};
+    i32 closed {0};
+};
+
+[[nodiscard]] Result<GzipOutputState> gzip_output_state(Machine& machine,
+                                                        ObjectRef object) {
+    constexpr std::array<usize, 4> fields {
+        kOutputDelegateField,
+        kOutputDataField,
+        kOutputSizeField,
+        kOutputClosedField,
+    };
+    std::array<Value, fields.size()> values {};
+    auto read = machine.heap().read_fields(object, fields, values);
+    if (!read) return std::unexpected(read.error());
+    auto delegate = values[0U].as_reference();
+    auto data = values[1U].as_reference();
+    auto size = values[2U].as_int();
+    auto closed = values[3U].as_int();
+    if (!delegate || delegate->is_null() || !data || data->is_null() ||
+        !size || !closed || *size < 0) {
+        return fail(ErrorCode::invalid_state,
+                    "GZIPOutputStream state is invalid");
+    }
+    return GzipOutputState {
+        .delegate = *delegate,
+        .data = *data,
+        .size = *size,
+        .closed = *closed,
+    };
+}
+
 [[nodiscard]] Result<ObjectRef> allocate_byte_array(Machine& machine,
                                                      usize length) {
     return machine.heap().allocate_array("[B", length, Value::from_int(0));
@@ -127,19 +192,6 @@ constexpr usize kZlibChunkSize = 8192U;
     return output;
 }
 
-[[nodiscard]] Status require_open(Machine& machine,
-                                  ObjectRef object,
-                                  usize closed_field,
-                                  std::string_view kind) {
-    auto closed = int_field(machine, object, closed_field);
-    if (!closed) return std::unexpected(closed.error());
-    if (*closed != 0) {
-        return fail_java("java/io/IOException",
-                         std::string(kind) + " is closed");
-    }
-    return {};
-}
-
 void register_gzip_input(NativeMethodRegistry& registry) {
     add(registry, "java/util/zip/GZIPInputStream", "<init>",
         "(Ljava/io/InputStream;)V",
@@ -160,19 +212,18 @@ void register_gzip_input(NativeMethodRegistry& registry) {
             auto written = machine.heap().write_byte_array(*data, 0U,
                                                             *decompressed);
             if (!written) return std::unexpected(written.error());
-            auto data_stored = set_reference_field(machine, *object,
-                                                   kInputDataField, *data);
-            auto position_stored = set_int_field(machine, *object,
-                                                 kInputPositionField, 0);
-            auto closed_stored = set_int_field(machine, *object,
-                                               kInputClosedField, 0);
-            if (!data_stored) return std::unexpected(data_stored.error());
-            if (!position_stored) {
-                return std::unexpected(position_stored.error());
-            }
-            if (!closed_stored) {
-                return std::unexpected(closed_stored.error());
-            }
+            constexpr std::array<usize, 3> fields {
+                kInputDataField,
+                kInputPositionField,
+                kInputClosedField,
+            };
+            const std::array<Value, fields.size()> state {
+                Value::from_reference(*data),
+                Value::from_int(0),
+                Value::from_int(0),
+            };
+            auto stored = machine.heap().write_fields(*object, fields, state);
+            if (!stored) return std::unexpected(stored.error());
             return std::optional<Value> {};
         });
     add(registry, "java/util/zip/GZIPInputStream", "read", "()I",
@@ -180,26 +231,25 @@ void register_gzip_input(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto opened = require_open(machine, *object, kInputClosedField,
-                                       "GZIPInputStream");
-            if (!opened) return std::unexpected(opened.error());
-            auto data = reference_field(machine, *object, kInputDataField);
-            auto position = int_field(machine, *object, kInputPositionField);
-            if (!data) return std::unexpected(data.error());
-            if (!position) return std::unexpected(position.error());
-            auto length = machine.heap().array_length(*data);
+            auto state = gzip_input_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (state->closed != 0) {
+                return fail_java("java/io/IOException",
+                                 "GZIPInputStream is closed");
+            }
+            auto length = machine.heap().array_length(state->data);
             if (!length) return std::unexpected(length.error());
-            if (*position < 0 || static_cast<usize>(*position) >= *length) {
+            if (static_cast<usize>(state->position) >= *length) {
                 return std::optional<Value>(Value::from_int(-1));
             }
             auto value = machine.heap().element(
-                *data, static_cast<usize>(*position));
+                state->data, static_cast<usize>(state->position));
             if (!value) return std::unexpected(value.error());
             auto byte = value->as_int();
             if (!byte) return std::unexpected(byte.error());
             auto advanced = set_int_field(machine, *object,
                                           kInputPositionField,
-                                          *position + 1);
+                                          state->position + 1);
             if (!advanced) return std::unexpected(advanced.error());
             return std::optional<Value>(Value::from_int(*byte & 0xFF));
         });
@@ -214,9 +264,12 @@ void register_gzip_input(NativeMethodRegistry& registry) {
             if (!destination) return std::unexpected(destination.error());
             if (!offset) return std::unexpected(offset.error());
             if (!requested) return std::unexpected(requested.error());
-            auto opened = require_open(machine, *object, kInputClosedField,
-                                       "GZIPInputStream");
-            if (!opened) return std::unexpected(opened.error());
+            auto state = gzip_input_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (state->closed != 0) {
+                return fail_java("java/io/IOException",
+                                 "GZIPInputStream is closed");
+            }
             auto destination_length = machine.heap().array_length(*destination);
             if (!destination_length) {
                 return std::unexpected(destination_length.error());
@@ -231,25 +284,21 @@ void register_gzip_input(NativeMethodRegistry& registry) {
             if (*requested == 0) {
                 return std::optional<Value>(Value::from_int(0));
             }
-            auto data = reference_field(machine, *object, kInputDataField);
-            auto position = int_field(machine, *object, kInputPositionField);
-            if (!data) return std::unexpected(data.error());
-            if (!position) return std::unexpected(position.error());
-            auto length = machine.heap().array_length(*data);
+            auto length = machine.heap().array_length(state->data);
             if (!length) return std::unexpected(length.error());
-            if (*position < 0 || static_cast<usize>(*position) >= *length) {
+            if (static_cast<usize>(state->position) >= *length) {
                 return std::optional<Value>(Value::from_int(-1));
             }
-            const usize available = *length - static_cast<usize>(*position);
+            const usize available = *length - static_cast<usize>(state->position);
             const usize count = std::min(
                 available, static_cast<usize>(*requested));
             auto copied = machine.heap().copy_array_range(
-                *data, static_cast<usize>(*position), *destination,
+                state->data, static_cast<usize>(state->position), *destination,
                 static_cast<usize>(*offset), count);
             if (!copied) return std::unexpected(copied.error());
             auto advanced = set_int_field(
                 machine, *object, kInputPositionField,
-                *position + static_cast<i32>(count));
+                state->position + static_cast<i32>(count));
             if (!advanced) return std::unexpected(advanced.error());
             return std::optional<Value>(
                 Value::from_int(static_cast<i32>(count)));
@@ -268,14 +317,9 @@ void register_gzip_input(NativeMethodRegistry& registry) {
 
 [[nodiscard]] Status ensure_output_capacity(Machine& machine,
                                             ObjectRef object,
+                                            GzipOutputState& state,
                                             i32 minimum) {
-    auto data = reference_field(machine, object, kOutputDataField);
-    if (!data) return std::unexpected(data.error());
-    if (data->is_null()) {
-        return fail(ErrorCode::invalid_state,
-                    "GZIPOutputStream buffer is not initialized");
-    }
-    auto capacity = machine.heap().array_length(*data);
+    auto capacity = machine.heap().array_length(state.data);
     if (!capacity) return std::unexpected(capacity.error());
     if (minimum <= static_cast<i32>(*capacity)) return {};
     usize next = *capacity == 0U ? kInitialOutputCapacity : *capacity * 2U;
@@ -288,13 +332,14 @@ void register_gzip_input(NativeMethodRegistry& registry) {
     if (!replacement_root) {
         return std::unexpected(replacement_root.error());
     }
-    auto size = int_field(machine, object, kOutputSizeField);
-    if (!size) return std::unexpected(size.error());
     auto copied = machine.heap().copy_array_range(
-        *data, 0U, *replacement, 0U, static_cast<usize>(*size));
+        state.data, 0U, *replacement, 0U, static_cast<usize>(state.size));
     if (!copied) return std::unexpected(copied.error());
-    return set_reference_field(machine, object, kOutputDataField,
-                               *replacement);
+    auto stored = set_reference_field(machine, object, kOutputDataField,
+                                      *replacement);
+    if (!stored) return stored;
+    state.data = *replacement;
+    return {};
 }
 
 void register_gzip_output(NativeMethodRegistry& registry) {
@@ -308,22 +353,20 @@ void register_gzip_output(NativeMethodRegistry& registry) {
             if (!output) return std::unexpected(output.error());
             auto data = allocate_byte_array(machine, kInitialOutputCapacity);
             if (!data) return std::unexpected(data.error());
-            auto output_stored = set_reference_field(
-                machine, *object, kOutputDelegateField, *output);
-            auto data_stored = set_reference_field(
-                machine, *object, kOutputDataField, *data);
-            auto size_stored = set_int_field(machine, *object,
-                                             kOutputSizeField, 0);
-            auto closed_stored = set_int_field(machine, *object,
-                                               kOutputClosedField, 0);
-            if (!output_stored) {
-                return std::unexpected(output_stored.error());
-            }
-            if (!data_stored) return std::unexpected(data_stored.error());
-            if (!size_stored) return std::unexpected(size_stored.error());
-            if (!closed_stored) {
-                return std::unexpected(closed_stored.error());
-            }
+            constexpr std::array<usize, 4> fields {
+                kOutputDelegateField,
+                kOutputDataField,
+                kOutputSizeField,
+                kOutputClosedField,
+            };
+            const std::array<Value, fields.size()> state {
+                Value::from_reference(*output),
+                Value::from_reference(*data),
+                Value::from_int(0),
+                Value::from_int(0),
+            };
+            auto stored = machine.heap().write_fields(*object, fields, state);
+            if (!stored) return std::unexpected(stored.error());
             return std::optional<Value> {};
         });
     add(registry, "java/util/zip/GZIPOutputStream", "write", "(I)V",
@@ -333,23 +376,22 @@ void register_gzip_output(NativeMethodRegistry& registry) {
             auto value = int_argument(arguments, 1U);
             if (!object) return std::unexpected(object.error());
             if (!value) return std::unexpected(value.error());
-            auto opened = require_open(machine, *object, kOutputClosedField,
-                                       "GZIPOutputStream");
-            if (!opened) return std::unexpected(opened.error());
-            auto size = int_field(machine, *object, kOutputSizeField);
-            if (!size) return std::unexpected(size.error());
-            auto capacity = ensure_output_capacity(machine, *object,
-                                                   *size + 1);
+            auto state = gzip_output_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (state->closed != 0) {
+                return fail_java("java/io/IOException",
+                                 "GZIPOutputStream is closed");
+            }
+            auto capacity = ensure_output_capacity(
+                machine, *object, *state, state->size + 1);
             if (!capacity) return std::unexpected(capacity.error());
-            auto data = reference_field(machine, *object, kOutputDataField);
-            if (!data) return std::unexpected(data.error());
             auto stored = machine.heap().set_element(
-                *data, static_cast<usize>(*size),
+                state->data, static_cast<usize>(state->size),
                 Value::from_int(static_cast<i32>(
                     static_cast<i8>(*value & 0xFF))));
             if (!stored) return std::unexpected(stored.error());
             auto size_stored = set_int_field(machine, *object,
-                                             kOutputSizeField, *size + 1);
+                                             kOutputSizeField, state->size + 1);
             if (!size_stored) {
                 return std::unexpected(size_stored.error());
             }
@@ -366,9 +408,12 @@ void register_gzip_output(NativeMethodRegistry& registry) {
             if (!source) return std::unexpected(source.error());
             if (!offset) return std::unexpected(offset.error());
             if (!requested) return std::unexpected(requested.error());
-            auto opened = require_open(machine, *object, kOutputClosedField,
-                                       "GZIPOutputStream");
-            if (!opened) return std::unexpected(opened.error());
+            auto state = gzip_output_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (state->closed != 0) {
+                return fail_java("java/io/IOException",
+                                 "GZIPOutputStream is closed");
+            }
             auto source_length = machine.heap().array_length(*source);
             if (!source_length) return std::unexpected(source_length.error());
             if (*offset < 0 || *requested < 0 ||
@@ -378,24 +423,21 @@ void register_gzip_output(NativeMethodRegistry& registry) {
                 return fail_java("java/lang/IndexOutOfBoundsException",
                                  "GZIPOutputStream write range is invalid");
             }
-            auto size = int_field(machine, *object, kOutputSizeField);
-            if (!size) return std::unexpected(size.error());
-            if (*requested > std::numeric_limits<i32>::max() - *size) {
+            if (*requested > std::numeric_limits<i32>::max() - state->size) {
                 return fail(ErrorCode::overflow,
                             "GZIPOutputStream size overflow");
             }
             auto capacity = ensure_output_capacity(
-                machine, *object, *size + *requested);
+                machine, *object, *state, state->size + *requested);
             if (!capacity) return std::unexpected(capacity.error());
-            auto data = reference_field(machine, *object, kOutputDataField);
-            if (!data) return std::unexpected(data.error());
             auto copied = machine.heap().copy_array_range(
-                *source, static_cast<usize>(*offset), *data,
-                static_cast<usize>(*size), static_cast<usize>(*requested));
+                *source, static_cast<usize>(*offset), state->data,
+                static_cast<usize>(state->size),
+                static_cast<usize>(*requested));
             if (!copied) return std::unexpected(copied.error());
             auto size_stored = set_int_field(machine, *object,
                                              kOutputSizeField,
-                                             *size + *requested);
+                                             state->size + *requested);
             if (!size_stored) {
                 return std::unexpected(size_stored.error());
             }
@@ -406,18 +448,11 @@ void register_gzip_output(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto closed = int_field(machine, *object, kOutputClosedField);
-            if (!closed) return std::unexpected(closed.error());
-            if (*closed != 0) return std::optional<Value> {};
-            auto data = reference_field(machine, *object, kOutputDataField);
-            auto size = int_field(machine, *object, kOutputSizeField);
-            auto output = reference_field(machine, *object,
-                                          kOutputDelegateField);
-            if (!data) return std::unexpected(data.error());
-            if (!size) return std::unexpected(size.error());
-            if (!output) return std::unexpected(output.error());
+            auto state = gzip_output_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (state->closed != 0) return std::optional<Value> {};
             auto source = machine.heap().read_byte_array(
-                *data, 0U, static_cast<usize>(*size));
+                state->data, 0U, static_cast<usize>(state->size));
             if (!source) return std::unexpected(source.error());
             auto compressed = deflate_gzip(*source);
             if (!compressed) return std::unexpected(compressed.error());
@@ -438,11 +473,11 @@ void register_gzip_output(NativeMethodRegistry& registry) {
                 Value::from_int(static_cast<i32>(compressed->size())),
             };
             auto delegated = invoke_checked(
-                machine, *output, "java/io/OutputStream", "write",
+                machine, state->delegate, "java/io/OutputStream", "write",
                 "([BII)V", write_arguments);
             if (!delegated) return std::unexpected(delegated.error());
             auto delegated_close = invoke_checked(
-                machine, *output, "java/io/OutputStream", "close", "()V");
+                machine, state->delegate, "java/io/OutputStream", "close", "()V");
             if (!delegated_close) {
                 return std::unexpected(delegated_close.error());
             }

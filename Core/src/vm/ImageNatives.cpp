@@ -546,18 +546,21 @@ void register_image_natives(NativeMethodRegistry& registry) {
                 return fail_java("java/lang/ArrayIndexOutOfBoundsException",
                                  "getRGB destination slice exceeds int[]");
             }
+            std::vector<i32> row_pixels(static_cast<usize>(*width));
             for (i32 row = 0; row < *height; ++row) {
                 const i64 destination_row = static_cast<i64>(*offset) +
                     static_cast<i64>(row) * *scan_length;
                 for (i32 column = 0; column < *width; ++column) {
                     auto pixel = (*image)->pixel(*x + column, *y + row);
                     if (!pixel) return graphics_error(pixel.error());
-                    auto stored = machine.heap().set_element(
-                        *destination,
-                        static_cast<usize>(destination_row + column),
-                        Value::from_int(static_cast<i32>(*pixel)));
-                    if (!stored) return std::unexpected(stored.error());
+                    row_pixels[static_cast<usize>(column)] =
+                        static_cast<i32>(*pixel);
                 }
+                auto stored = machine.heap().write_int_array(
+                    *destination,
+                    static_cast<usize>(destination_row),
+                    row_pixels);
+                if (!stored) return std::unexpected(stored.error());
             }
             return std::optional<Value> {};
         });

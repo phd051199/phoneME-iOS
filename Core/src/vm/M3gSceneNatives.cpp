@@ -49,12 +49,10 @@ constexpr usize kPickTextureUnitCount = 8U;
     auto count = int_field(machine, object, kObject3D,
                            "animationTrackCount");
     if (!count) return std::unexpected(count.error());
-    for (i32 index = 0; index < *count; ++index) {
-        auto value = machine.heap().element(*array, static_cast<usize>(index));
-        if (!value) return std::unexpected(value.error());
-        auto stored = machine.heap().set_element(
-            *replacement, static_cast<usize>(index), *value);
-        if (!stored) return stored;
+    if (*count > 0) {
+        auto copied = machine.heap().copy_array_range(
+            *array, 0U, *replacement, 0U, static_cast<usize>(*count));
+        if (!copied) return copied;
     }
     return set_reference_field(machine, object, kObject3D,
         "animationTracks", "[Ljavax/microedition/m3g/AnimationTrack;",
@@ -89,12 +87,10 @@ constexpr usize kPickTextureUnitCount = 8U;
     if (!replacement) return std::unexpected(replacement.error());
     auto count = int_field(machine, object, kGroup, "childCount");
     if (!count) return std::unexpected(count.error());
-    for (i32 index = 0; index < *count; ++index) {
-        auto value = machine.heap().element(*array, static_cast<usize>(index));
-        if (!value) return std::unexpected(value.error());
-        auto stored = machine.heap().set_element(
-            *replacement, static_cast<usize>(index), *value);
-        if (!stored) return stored;
+    if (*count > 0) {
+        auto copied = machine.heap().copy_array_range(
+            *array, 0U, *replacement, 0U, static_cast<usize>(*count));
+        if (!copied) return copied;
     }
     return set_reference_field(machine, object, kGroup, "children",
                                "[Ljavax/microedition/m3g/Node;", *replacement);
@@ -346,21 +342,25 @@ struct PickHit final {
     Vector3 normal {0.0F, 0.0F, 1.0F};
 };
 
+[[nodiscard]] Result<std::vector<ObjectRef>> scene_reference_array(
+    Machine& machine,
+    ObjectRef array,
+    std::string_view operation) {
+    if (array.is_null()) return std::vector<ObjectRef> {};
+    auto values = machine.heap().read_reference_array(array);
+    if (!values && values.error().code == ErrorCode::invalid_argument) {
+        return fail_java("java/lang/IllegalArgumentException",
+                         std::string(operation) + " expects an object array");
+    }
+    if (!values) return std::unexpected(values.error());
+    return values;
+}
+
 [[nodiscard]] Result<std::vector<i32>> pick_int_array(
     Machine& machine,
     ObjectRef array) {
     if (array.is_null()) return std::vector<i32> {};
-    auto length = machine.heap().array_length(array);
-    if (!length) return std::unexpected(length.error());
-    std::vector<i32> values(*length);
-    for (usize index = 0U; index < *length; ++index) {
-        auto value = machine.heap().element(array, index);
-        if (!value) return std::unexpected(value.error());
-        auto number = value->as_int();
-        if (!number) return std::unexpected(number.error());
-        values[index] = *number;
-    }
-    return values;
+    return machine.heap().read_int_array(array);
 }
 
 [[nodiscard]] Result<PickVertexArray> pick_vertex_array(
@@ -370,14 +370,18 @@ struct PickHit final {
         return fail_java("java/lang/NullPointerException",
                          "VertexArray is null");
     }
-    auto vertex_count = int_field(machine, array, kVertexArray,
-                                  "vertexCount");
-    auto component_count = int_field(machine, array, kVertexArray,
-                                     "componentCount");
-    auto component_size = int_field(machine, array, kVertexArray,
-                                    "componentSize");
-    auto data = reference_field(machine, array, kVertexArray,
-                                "data", "Ljava/lang/Object;");
+    static constexpr std::array<ObjectFieldSpec, 4U> kFields {{
+        {"vertexCount", "I"},
+        {"componentCount", "I"},
+        {"componentSize", "I"},
+        {"data", "Ljava/lang/Object;"},
+    }};
+    auto fields = object_fields(machine, array, kVertexArray, kFields);
+    if (!fields) return std::unexpected(fields.error());
+    auto vertex_count = (*fields)[0U].as_int();
+    auto component_count = (*fields)[1U].as_int();
+    auto component_size = (*fields)[2U].as_int();
+    auto data = (*fields)[3U].as_reference();
     if (!vertex_count) return std::unexpected(vertex_count.error());
     if (!component_count) return std::unexpected(component_count.error());
     if (!component_size) return std::unexpected(component_size.error());
@@ -391,26 +395,32 @@ struct PickHit final {
     }
     const usize value_count = static_cast<usize>(*vertex_count) *
                               static_cast<usize>(*component_count);
-    auto length = machine.heap().array_length(*data);
-    if (!length) return std::unexpected(length.error());
-    if (*length < value_count) {
-        return fail(ErrorCode::invalid_state,
-                    "VertexArray storage is truncated");
-    }
     PickVertexArray result {
         .vertex_count = *vertex_count,
         .component_count = *component_count,
         .values = std::vector<float>(value_count),
     };
-    for (usize index = 0U; index < value_count; ++index) {
-        auto value = machine.heap().element(*data, index);
-        if (!value) return std::unexpected(value.error());
-        auto number = value->as_int();
-        if (!number) return std::unexpected(number.error());
-        const i32 decoded = *component_size == 1
-            ? static_cast<i32>(static_cast<i8>(*number & 0xFF))
-            : static_cast<i32>(static_cast<i16>(*number & 0xFFFF));
-        result.values[index] = static_cast<float>(decoded);
+    if (*component_size == 1) {
+        auto values = machine.heap().read_byte_array(*data);
+        if (!values) return std::unexpected(values.error());
+        if (values->size() < value_count) {
+            return fail(ErrorCode::invalid_state,
+                        "VertexArray storage is truncated");
+        }
+        for (usize index = 0U; index < value_count; ++index) {
+            result.values[index] = static_cast<float>(
+                static_cast<i8>((*values)[index]));
+        }
+    } else {
+        auto values = machine.heap().read_short_array(*data);
+        if (!values) return std::unexpected(values.error());
+        if (values->size() < value_count) {
+            return fail(ErrorCode::invalid_state,
+                        "VertexArray storage is truncated");
+        }
+        for (usize index = 0U; index < value_count; ++index) {
+            result.values[index] = static_cast<float>((*values)[index]);
+        }
     }
     return result;
 }
@@ -418,12 +428,17 @@ struct PickHit final {
 [[nodiscard]] Result<std::vector<PickVertex>> pick_vertices(
     Machine& machine,
     ObjectRef vertex_buffer) {
-    auto positions = reference_field(machine, vertex_buffer, kVertexBuffer,
-        "positions", "Ljavax/microedition/m3g/VertexArray;");
-    auto scale = float_field(machine, vertex_buffer, kVertexBuffer,
-                             "positionScale");
-    auto bias = reference_field(machine, vertex_buffer, kVertexBuffer,
-                                "positionBias", "[F");
+    static constexpr std::array<ObjectFieldSpec, 3U> kPositionFields {{
+        {"positions", "Ljavax/microedition/m3g/VertexArray;"},
+        {"positionScale", "F"},
+        {"positionBias", "[F"},
+    }};
+    auto position_fields = object_fields(
+        machine, vertex_buffer, kVertexBuffer, kPositionFields);
+    if (!position_fields) return std::unexpected(position_fields.error());
+    auto positions = (*position_fields)[0U].as_reference();
+    auto scale = (*position_fields)[1U].as_float();
+    auto bias = (*position_fields)[2U].as_reference();
     if (!positions) return std::unexpected(positions.error());
     if (!scale) return std::unexpected(scale.error());
     if (!bias) return std::unexpected(bias.error());
@@ -456,56 +471,58 @@ struct PickHit final {
         };
     }
 
-    auto texcoord_arrays = reference_field(machine, vertex_buffer,
-        kVertexBuffer, "texCoords",
-        "[Ljavax/microedition/m3g/VertexArray;");
-    auto texcoord_scales = reference_field(machine, vertex_buffer,
-                                           kVertexBuffer, "texScales", "[F");
-    auto texcoord_biases = reference_field(machine, vertex_buffer,
-                                           kVertexBuffer, "texBiases", "[[F");
+    static constexpr std::array<ObjectFieldSpec, 3U> kTextureFields {{
+        {"texCoords", "[Ljavax/microedition/m3g/VertexArray;"},
+        {"texScales", "[F"},
+        {"texBiases", "[[F"},
+    }};
+    auto texture_fields = object_fields(
+        machine, vertex_buffer, kVertexBuffer, kTextureFields);
+    if (!texture_fields) return std::unexpected(texture_fields.error());
+    auto texcoord_arrays = (*texture_fields)[0U].as_reference();
+    auto texcoord_scales = (*texture_fields)[1U].as_reference();
+    auto texcoord_biases = (*texture_fields)[2U].as_reference();
     if (!texcoord_arrays) return std::unexpected(texcoord_arrays.error());
     if (!texcoord_scales) return std::unexpected(texcoord_scales.error());
     if (!texcoord_biases) return std::unexpected(texcoord_biases.error());
     if (texcoord_arrays->is_null()) return result;
-    auto unit_count = machine.heap().array_length(*texcoord_arrays);
-    auto scale_count = texcoord_scales->is_null()
-        ? Result<usize>(0U)
-        : machine.heap().array_length(*texcoord_scales);
-    auto bias_count = texcoord_biases->is_null()
-        ? Result<usize>(0U)
-        : machine.heap().array_length(*texcoord_biases);
-    if (!unit_count) return std::unexpected(unit_count.error());
-    if (!scale_count) return std::unexpected(scale_count.error());
-    if (!bias_count) return std::unexpected(bias_count.error());
-    const usize active_units = std::min(*unit_count, kPickTextureUnitCount);
+    auto texture_arrays = scene_reference_array(
+        machine, *texcoord_arrays, "VertexBuffer texture coordinates");
+    if (!texture_arrays) return std::unexpected(texture_arrays.error());
+    std::vector<float> texture_scales;
+    if (!texcoord_scales->is_null()) {
+        auto loaded = read_float_array(
+            machine, *texcoord_scales, "VertexBuffer texture scales");
+        if (!loaded) return std::unexpected(loaded.error());
+        texture_scales = std::move(*loaded);
+    }
+    std::vector<ObjectRef> texture_biases;
+    if (!texcoord_biases->is_null()) {
+        auto loaded = scene_reference_array(
+            machine, *texcoord_biases, "VertexBuffer texture biases");
+        if (!loaded) return std::unexpected(loaded.error());
+        texture_biases = std::move(*loaded);
+    }
+    const usize active_units = std::min(
+        texture_arrays->size(), kPickTextureUnitCount);
     for (usize unit = 0U; unit < active_units; ++unit) {
-        auto texcoord_value = machine.heap().element(*texcoord_arrays, unit);
-        if (!texcoord_value) return std::unexpected(texcoord_value.error());
-        auto texcoord = texcoord_value->as_reference();
-        if (!texcoord) return std::unexpected(texcoord.error());
-        if (texcoord->is_null()) continue;
-        auto texture_source = pick_vertex_array(machine, *texcoord);
+        const ObjectRef texcoord = (*texture_arrays)[unit];
+        if (texcoord.is_null()) continue;
+        auto texture_source = pick_vertex_array(machine, texcoord);
         if (!texture_source) return std::unexpected(texture_source.error());
         if (texture_source->vertex_count != source->vertex_count) {
             return fail(ErrorCode::invalid_state,
                         "texture coordinates do not match positions");
         }
         float texture_scale = 1.0F;
-        if (unit < *scale_count) {
-            auto scale_value = machine.heap().element(*texcoord_scales, unit);
-            if (!scale_value) return std::unexpected(scale_value.error());
-            auto parsed = scale_value->as_float();
-            if (!parsed) return std::unexpected(parsed.error());
-            texture_scale = *parsed;
+        if (unit < texture_scales.size()) {
+            texture_scale = texture_scales[unit];
         }
         std::vector<float> texture_bias;
-        if (unit < *bias_count) {
-            auto bias_value = machine.heap().element(*texcoord_biases, unit);
-            if (!bias_value) return std::unexpected(bias_value.error());
-            auto bias_array = bias_value->as_reference();
-            if (!bias_array) return std::unexpected(bias_array.error());
-            if (!bias_array->is_null()) {
-                auto loaded = read_float_array(machine, *bias_array,
+        if (unit < texture_biases.size()) {
+            const ObjectRef bias_array = texture_biases[unit];
+            if (!bias_array.is_null()) {
+                auto loaded = read_float_array(machine, bias_array,
                                                "VertexBuffer texture bias");
                 if (!loaded) return std::unexpected(loaded.error());
                 texture_bias = std::move(*loaded);
@@ -551,34 +568,31 @@ struct PickHit final {
     if (!targets) return std::unexpected(targets.error());
     if (!weights) return std::unexpected(weights.error());
     if (targets->is_null() || weights->is_null()) return *base;
-    auto target_count = machine.heap().array_length(*targets);
+    auto target_buffers = scene_reference_array(
+        machine, *targets, "MorphingMesh pick targets");
     auto weight_values = read_float_array(machine, *weights,
                                           "MorphingMesh pick weights");
-    if (!target_count) return std::unexpected(target_count.error());
+    if (!target_buffers) return std::unexpected(target_buffers.error());
     if (!weight_values) return std::unexpected(weight_values.error());
-    if (*target_count != weight_values->size()) {
+    const usize target_count = target_buffers->size();
+    if (target_count != weight_values->size()) {
         return fail(ErrorCode::invalid_state,
                     "MorphingMesh target and weight counts differ");
     }
-    std::vector<ObjectRef> target_buffers(*target_count);
     usize position_target_count = 0U;
-    for (usize index = 0U; index < *target_count; ++index) {
-        auto value = machine.heap().element(*targets, index);
-        if (!value) return std::unexpected(value.error());
-        auto target = value->as_reference();
-        if (!target) return std::unexpected(target.error());
-        if (target->is_null()) {
+    for (usize index = 0U; index < target_count; ++index) {
+        const ObjectRef target = (*target_buffers)[index];
+        if (target.is_null()) {
             return fail_java("java/lang/IllegalStateException",
                              "MorphingMesh target is null");
         }
-        target_buffers[index] = *target;
         auto present = pick_has_vertex_attribute(
-            machine, *target, "positions");
+            machine, target, "positions");
         if (!present) return std::unexpected(present.error());
         position_target_count += *present ? 1U : 0U;
     }
     if (position_target_count == 0U) return *base;
-    if (position_target_count != *target_count) {
+    if (position_target_count != target_count) {
         return fail_java(
             "java/lang/IllegalStateException",
             "MorphingMesh target positions are incompatible");
@@ -598,10 +612,10 @@ struct PickHit final {
         result[vertex].position[1U] *= base_weight;
         result[vertex].position[2U] *= base_weight;
     }
-    for (usize target_index = 0U; target_index < *target_count;
+    for (usize target_index = 0U; target_index < target_count;
          ++target_index) {
         auto target_vertices = pick_vertices(
-            machine, target_buffers[target_index]);
+            machine, (*target_buffers)[target_index]);
         if (!target_vertices) {
             return std::unexpected(target_vertices.error());
         }
@@ -650,21 +664,24 @@ struct PickHit final {
     if (!weights) return std::unexpected(weights.error());
     if (!rest_transforms) return std::unexpected(rest_transforms.error());
     if (bones->is_null()) return *base;
-    auto bone_count = machine.heap().array_length(*bones);
-    if (!bone_count) return std::unexpected(bone_count.error());
-    if (*bone_count == 0U) return *base;
+    auto bone_values = scene_reference_array(
+        machine, *bones, "SkinnedMesh pick bones");
+    auto rest_values = scene_reference_array(
+        machine, *rest_transforms, "SkinnedMesh pick transforms");
+    if (!bone_values) return std::unexpected(bone_values.error());
+    if (!rest_values) return std::unexpected(rest_values.error());
+    const usize bone_count = bone_values->size();
+    if (bone_count == 0U) return *base;
     auto first_values = pick_int_array(machine, *first_vertices);
     auto count_values = pick_int_array(machine, *vertex_counts);
     auto weight_values = pick_int_array(machine, *weights);
-    auto transform_count = machine.heap().array_length(*rest_transforms);
     if (!first_values) return std::unexpected(first_values.error());
     if (!count_values) return std::unexpected(count_values.error());
     if (!weight_values) return std::unexpected(weight_values.error());
-    if (!transform_count) return std::unexpected(transform_count.error());
-    if (first_values->size() != *bone_count ||
-        count_values->size() != *bone_count ||
-        weight_values->size() != *bone_count ||
-        *transform_count != *bone_count) {
+    if (first_values->size() != bone_count ||
+        count_values->size() != bone_count ||
+        weight_values->size() != bone_count ||
+        rest_values->size() != bone_count) {
         return fail(ErrorCode::invalid_state,
                     "SkinnedMesh influence arrays differ in length");
     }
@@ -674,17 +691,11 @@ struct PickHit final {
     if (!inverse_mesh) return std::unexpected(inverse_mesh.error());
     std::vector<Vector3> accumulated(base->size());
     std::vector<float> accumulated_weights(base->size(), 0.0F);
-    for (usize influence = 0U; influence < *bone_count; ++influence) {
-        auto bone_value = machine.heap().element(*bones, influence);
-        auto rest_value = machine.heap().element(*rest_transforms, influence);
-        if (!bone_value) return std::unexpected(bone_value.error());
-        if (!rest_value) return std::unexpected(rest_value.error());
-        auto bone = bone_value->as_reference();
-        auto rest_array = rest_value->as_reference();
-        if (!bone) return std::unexpected(bone.error());
-        if (!rest_array) return std::unexpected(rest_array.error());
-        if (bone->is_null() || rest_array->is_null()) continue;
-        auto values = read_float_array(machine, *rest_array,
+    for (usize influence = 0U; influence < bone_count; ++influence) {
+        const ObjectRef bone = (*bone_values)[influence];
+        const ObjectRef rest_array = (*rest_values)[influence];
+        if (bone.is_null() || rest_array.is_null()) continue;
+        auto values = read_float_array(machine, rest_array,
                                        "SkinnedMesh rest transform");
         if (!values) return std::unexpected(values.error());
         if (values->size() != 16U) {
@@ -693,7 +704,7 @@ struct PickHit final {
         }
         Matrix rest {};
         std::copy(values->begin(), values->end(), rest.begin());
-        auto bone_world = composite_matrix(machine, *bone);
+        auto bone_world = composite_matrix(machine, bone);
         if (!bone_world) return std::unexpected(bone_world.error());
         const Matrix deformation = multiply(
             multiply(*inverse_mesh, *bone_world), rest);
@@ -793,17 +804,15 @@ struct PickHit final {
         transformed[index] = transform_vector3(
             transform, (*vertices)[index].position, 1.0F);
     }
-    auto submesh_count = machine.heap().array_length(*index_buffers);
-    if (!submesh_count) return std::unexpected(submesh_count.error());
-    for (usize submesh = 0U; submesh < *submesh_count; ++submesh) {
-        auto value = machine.heap().element(*index_buffers, submesh);
-        if (!value) return std::unexpected(value.error());
-        auto index_buffer = value->as_reference();
-        if (!index_buffer) return std::unexpected(index_buffer.error());
-        if (index_buffer->is_null()) continue;
-        auto index_array = reference_field(machine, *index_buffer,
+    auto submeshes = scene_reference_array(
+        machine, *index_buffers, "Mesh index buffers");
+    if (!submeshes) return std::unexpected(submeshes.error());
+    for (usize submesh = 0U; submesh < submeshes->size(); ++submesh) {
+        const ObjectRef index_buffer = (*submeshes)[submesh];
+        if (index_buffer.is_null()) continue;
+        auto index_array = reference_field(machine, index_buffer,
                                            kIndexBuffer, "indices", "[I");
-        auto strip_array = reference_field(machine, *index_buffer,
+        auto strip_array = reference_field(machine, index_buffer,
                                            kIndexBuffer, "stripLengths", "[I");
         if (!index_array) return std::unexpected(index_array.error());
         if (!strip_array) return std::unexpected(strip_array.error());
@@ -936,15 +945,16 @@ struct PickHit final {
         if (!children) return std::unexpected(children.error());
         if (!child_count) return std::unexpected(child_count.error());
         if (children->is_null()) return {};
-        for (i32 index = 0; index < *child_count; ++index) {
-            auto child_value = machine.heap().element(
-                *children, static_cast<usize>(index));
-            if (!child_value) return std::unexpected(child_value.error());
-            auto child = child_value->as_reference();
-            if (!child) return std::unexpected(child.error());
-            if (child->is_null()) continue;
+        auto child_values = scene_reference_array(
+            machine, *children, "Group children");
+        if (!child_values) return std::unexpected(child_values.error());
+        const usize count = std::min(
+            child_values->size(), static_cast<usize>(std::max(*child_count, 0)));
+        for (usize index = 0U; index < count; ++index) {
+            const ObjectRef child = (*child_values)[index];
+            if (child.is_null()) continue;
             auto picked = pick_subtree(
-                machine, *child, transform, mask,
+                machine, child, transform, mask,
                 origin, direction, path_pickable, nearest);
             if (!picked) return picked;
         }
@@ -1168,15 +1178,16 @@ struct PickHit final {
     if (!child_count) return std::unexpected(child_count.error());
     PickHit nearest;
     if (!children->is_null()) {
-        for (i32 index = 0; index < *child_count; ++index) {
-            auto value = machine.heap().element(
-                *children, static_cast<usize>(index));
-            if (!value) return std::unexpected(value.error());
-            auto child = value->as_reference();
-            if (!child) return std::unexpected(child.error());
-            if (child->is_null()) continue;
+        auto child_values = scene_reference_array(
+            machine, *children, "Group children");
+        if (!child_values) return std::unexpected(child_values.error());
+        const usize count = std::min(
+            child_values->size(), static_cast<usize>(std::max(*child_count, 0)));
+        for (usize index = 0U; index < count; ++index) {
+            const ObjectRef child = (*child_values)[index];
+            if (child.is_null()) continue;
             auto picked = pick_subtree(
-                machine, *child, identity_matrix(), mask,
+                machine, child, identity_matrix(), mask,
                 origin, *normalized_direction, true, nearest);
             if (!picked) return std::unexpected(picked.error());
         }
@@ -1221,15 +1232,11 @@ void append_unique_reference(std::vector<ObjectRef>& references,
     auto array = reference_field(machine, object, owner, name, descriptor);
     if (!array) return std::unexpected(array.error());
     if (array->is_null()) return {};
-    auto length = machine.heap().array_length(*array);
-    if (!length) return std::unexpected(length.error());
-    const usize count = std::min(*length, maximum);
+    auto values = scene_reference_array(machine, *array, name);
+    if (!values) return std::unexpected(values.error());
+    const usize count = std::min(values->size(), maximum);
     for (usize index = 0U; index < count; ++index) {
-        auto value = machine.heap().element(*array, index);
-        if (!value) return std::unexpected(value.error());
-        auto reference = value->as_reference();
-        if (!reference) return std::unexpected(reference.error());
-        append_unique_reference(references, *reference);
+        append_unique_reference(references, (*values)[index]);
     }
     return {};
 }
@@ -1702,10 +1709,9 @@ void register_keyframe_sequence(NativeMethodRegistry& registry) {
                 return fail_java("java/lang/IndexOutOfBoundsException",
                                  "keyframe index or time is invalid");
             }
-            auto source_values = read_float_array(
-                machine, *source, "KeyframeSequence.setKeyframe");
-            if (!source_values) return std::unexpected(source_values.error());
-            if (source_values->size() < static_cast<usize>(*components)) {
+            auto source_length = machine.heap().array_length(*source);
+            if (!source_length) return std::unexpected(source_length.error());
+            if (*source_length < static_cast<usize>(*components)) {
                 return fail_java("java/lang/IllegalArgumentException",
                                  "keyframe value array is too short");
             }
@@ -1714,13 +1720,9 @@ void register_keyframe_sequence(NativeMethodRegistry& registry) {
             if (!time_stored) return std::unexpected(time_stored.error());
             const usize base = static_cast<usize>(*index) *
                                static_cast<usize>(*components);
-            for (i32 component = 0; component < *components; ++component) {
-                auto stored = machine.heap().set_element(
-                    *values, base + static_cast<usize>(component),
-                    Value::from_float((*source_values)[
-                        static_cast<usize>(component)]));
-                if (!stored) return std::unexpected(stored.error());
-            }
+            auto copied = machine.heap().copy_array_range(
+                *source, 0U, *values, base, static_cast<usize>(*components));
+            if (!copied) return std::unexpected(copied.error());
             return std::optional<Value> {};
         });
     add(registry, kKeyframeSequence, "getKeyframe", "(I[F)I",
@@ -1759,14 +1761,10 @@ void register_keyframe_sequence(NativeMethodRegistry& registry) {
                 }
                 const usize base = static_cast<usize>(*index) *
                                    static_cast<usize>(*components);
-                for (i32 component = 0; component < *components; ++component) {
-                    auto value = machine.heap().element(
-                        *values, base + static_cast<usize>(component));
-                    if (!value) return std::unexpected(value.error());
-                    auto stored = machine.heap().set_element(
-                        *destination, static_cast<usize>(component), *value);
-                    if (!stored) return std::unexpected(stored.error());
-                }
+                auto copied = machine.heap().copy_array_range(
+                    *values, base, *destination, 0U,
+                    static_cast<usize>(*components));
+                if (!copied) return std::unexpected(copied.error());
             }
             auto time = machine.heap().element(
                 *times, static_cast<usize>(*index));
@@ -1925,25 +1923,36 @@ struct AnimationSample final {
     Machine& machine,
     ObjectRef track,
     i32 world_time) {
-    auto sequence = reference_field(machine, track, kAnimationTrack,
-        "sequence", "Ljavax/microedition/m3g/KeyframeSequence;");
-    auto controller = reference_field(machine, track, kAnimationTrack,
-        "controller", "Ljavax/microedition/m3g/AnimationController;");
-    auto property = int_field(machine, track, kAnimationTrack, "property");
+    constexpr std::array<ObjectFieldSpec, 3> track_fields {{
+        {"sequence", "Ljavax/microedition/m3g/KeyframeSequence;"},
+        {"controller", "Ljavax/microedition/m3g/AnimationController;"},
+        {"property", "I"},
+    }};
+    auto track_state = object_fields(
+        machine, track, kAnimationTrack, track_fields);
+    if (!track_state) return std::unexpected(track_state.error());
+    auto sequence = (*track_state)[0U].as_reference();
+    auto controller = (*track_state)[1U].as_reference();
+    auto property = (*track_state)[2U].as_int();
     if (!sequence) return std::unexpected(sequence.error());
     if (!controller) return std::unexpected(controller.error());
     if (!property) return std::unexpected(property.error());
     if (sequence->is_null() || controller->is_null()) {
         return std::optional<AnimationSample> {};
     }
-    auto active_start = int_field(machine, *controller,
-        kAnimationController, "activeStart");
-    auto active_end = int_field(machine, *controller,
-        kAnimationController, "activeEnd");
-    auto speed = float_field(machine, *controller,
-        kAnimationController, "speed");
-    auto weight = float_field(machine, *controller,
-        kAnimationController, "weight");
+    constexpr std::array<ObjectFieldSpec, 4> controller_fields {{
+        {"activeStart", "I"},
+        {"activeEnd", "I"},
+        {"speed", "F"},
+        {"weight", "F"},
+    }};
+    auto controller_state = object_fields(
+        machine, *controller, kAnimationController, controller_fields);
+    if (!controller_state) return std::unexpected(controller_state.error());
+    auto active_start = (*controller_state)[0U].as_int();
+    auto active_end = (*controller_state)[1U].as_int();
+    auto speed = (*controller_state)[2U].as_float();
+    auto weight = (*controller_state)[3U].as_float();
     if (!active_start) return std::unexpected(active_start.error());
     if (!active_end) return std::unexpected(active_end.error());
     if (!speed) return std::unexpected(speed.error());
@@ -1962,24 +1971,29 @@ struct AnimationSample final {
 
     auto position = animation_controller_position(
         machine, *controller, world_time);
-    auto keyframe_count = int_field(machine, *sequence,
-        kKeyframeSequence, "keyframeCount");
-    auto component_count = int_field(machine, *sequence,
-        kKeyframeSequence, "componentCount");
-    auto interpolation = int_field(machine, *sequence,
-        kKeyframeSequence, "interpolationType");
-    auto valid_first = int_field(machine, *sequence,
-        kKeyframeSequence, "validFirst");
-    auto valid_last = int_field(machine, *sequence,
-        kKeyframeSequence, "validLast");
-    auto duration = int_field(machine, *sequence,
-        kKeyframeSequence, "duration");
-    auto repeat_mode = int_field(machine, *sequence,
-        kKeyframeSequence, "repeatMode");
-    auto times = reference_field(machine, *sequence,
-        kKeyframeSequence, "times", "[I");
-    auto values = reference_field(machine, *sequence,
-        kKeyframeSequence, "values", "[F");
+    constexpr std::array<ObjectFieldSpec, 9> sequence_fields {{
+        {"keyframeCount", "I"},
+        {"componentCount", "I"},
+        {"interpolationType", "I"},
+        {"validFirst", "I"},
+        {"validLast", "I"},
+        {"duration", "I"},
+        {"repeatMode", "I"},
+        {"times", "[I"},
+        {"values", "[F"},
+    }};
+    auto sequence_state = object_fields(
+        machine, *sequence, kKeyframeSequence, sequence_fields);
+    if (!sequence_state) return std::unexpected(sequence_state.error());
+    auto keyframe_count = (*sequence_state)[0U].as_int();
+    auto component_count = (*sequence_state)[1U].as_int();
+    auto interpolation = (*sequence_state)[2U].as_int();
+    auto valid_first = (*sequence_state)[3U].as_int();
+    auto valid_last = (*sequence_state)[4U].as_int();
+    auto duration = (*sequence_state)[5U].as_int();
+    auto repeat_mode = (*sequence_state)[6U].as_int();
+    auto times = (*sequence_state)[7U].as_reference();
+    auto values = (*sequence_state)[8U].as_reference();
     if (!position) return std::unexpected(position.error());
     if (!keyframe_count) return std::unexpected(keyframe_count.error());
     if (!component_count) return std::unexpected(component_count.error());
@@ -1997,6 +2011,18 @@ struct AnimationSample final {
         return fail(ErrorCode::invalid_state,
                     "animation sequence state is invalid");
     }
+    auto key_times = machine.heap().read_int_array(*times);
+    auto key_values = read_float_array(
+        machine, *values, "KeyframeSequence values");
+    if (!key_times) return std::unexpected(key_times.error());
+    if (!key_values) return std::unexpected(key_values.error());
+    const u64 required_values = static_cast<u64>(*keyframe_count) *
+                                static_cast<u64>(*component_count);
+    if (key_times->size() < static_cast<usize>(*keyframe_count) ||
+        required_values > static_cast<u64>(key_values->size())) {
+        return fail(ErrorCode::invalid_state,
+                    "animation sequence arrays are truncated");
+    }
 
     float sequence_time = *position;
     if (*duration > 0) {
@@ -2012,43 +2038,35 @@ struct AnimationSample final {
         }
     }
 
-    const auto key_time = [&](i32 index) -> Result<i32> {
-        auto value = machine.heap().element(*times,
-                                            static_cast<usize>(index));
-        if (!value) return std::unexpected(value.error());
-        return value->as_int();
+    const auto key_time = [&](i32 index) -> i32 {
+        return (*key_times)[static_cast<usize>(index)];
     };
     i32 left = *valid_first;
     i32 right = *valid_first;
-    auto first_time = key_time(*valid_first);
-    auto last_time = key_time(*valid_last);
-    if (!first_time) return std::unexpected(first_time.error());
-    if (!last_time) return std::unexpected(last_time.error());
-    if (sequence_time <= static_cast<float>(*first_time)) {
+    const i32 first_time = key_time(*valid_first);
+    const i32 last_time = key_time(*valid_last);
+    if (sequence_time <= static_cast<float>(first_time)) {
         left = right = *valid_first;
-    } else if (sequence_time >= static_cast<float>(*last_time)) {
+    } else if (sequence_time >= static_cast<float>(last_time)) {
         left = right = *valid_last;
     } else {
         for (i32 index = *valid_first; index < *valid_last; ++index) {
-            auto next_time = key_time(index + 1);
-            if (!next_time) return std::unexpected(next_time.error());
-            if (sequence_time <= static_cast<float>(*next_time)) {
+            const i32 next_time = key_time(index + 1);
+            if (sequence_time <= static_cast<float>(next_time)) {
                 left = index;
                 right = index + 1;
                 break;
             }
         }
     }
-    auto left_time = key_time(left);
-    auto right_time = key_time(right);
-    if (!left_time) return std::unexpected(left_time.error());
-    if (!right_time) return std::unexpected(right_time.error());
+    const i32 left_time = key_time(left);
+    const i32 right_time = key_time(right);
     float fraction = 0.0F;
     if (left != right && *interpolation != 180 &&
-        *right_time > *left_time) {
+        right_time > left_time) {
         fraction = std::clamp(
-            (sequence_time - static_cast<float>(*left_time)) /
-                static_cast<float>(*right_time - *left_time),
+            (sequence_time - static_cast<float>(left_time)) /
+                static_cast<float>(right_time - left_time),
             0.0F, 1.0F);
     }
     std::vector<float> sampled(static_cast<usize>(*component_count), 0.0F);
@@ -2057,18 +2075,11 @@ struct AnimationSample final {
     const usize right_base = static_cast<usize>(right) *
                              static_cast<usize>(*component_count);
     for (i32 component = 0; component < *component_count; ++component) {
-        auto first_value = machine.heap().element(
-            *values, left_base + static_cast<usize>(component));
-        auto second_value = machine.heap().element(
-            *values, right_base + static_cast<usize>(component));
-        if (!first_value) return std::unexpected(first_value.error());
-        if (!second_value) return std::unexpected(second_value.error());
-        auto first_float = first_value->as_float();
-        auto second_float = second_value->as_float();
-        if (!first_float) return std::unexpected(first_float.error());
-        if (!second_float) return std::unexpected(second_float.error());
+        const usize component_index = static_cast<usize>(component);
+        const float first_value = (*key_values)[left_base + component_index];
+        const float second_value = (*key_values)[right_base + component_index];
         sampled[static_cast<usize>(component)] =
-            *first_float + (*second_float - *first_float) * fraction;
+            first_value + (second_value - first_value) * fraction;
     }
     if ((*interpolation == 177 || *interpolation == 179) &&
         sampled.size() == 4U) {
@@ -2083,7 +2094,7 @@ struct AnimationSample final {
     if (*interpolation == 180 && right != left &&
         std::abs(*speed) > 1.0e-7F) {
         const float sequence_delta =
-            static_cast<float>(*right_time) - sequence_time;
+            static_cast<float>(right_time) - sequence_time;
         validity = std::max(1, static_cast<i32>(std::ceil(
             std::abs(sequence_delta / *speed))));
     }
@@ -2282,21 +2293,37 @@ struct AnimationSample final {
             "javax/microedition/m3g/MorphingMesh", "weights", "[F");
         if (!weights) return std::unexpected(weights.error());
         if (weights->is_null()) return {};
-        auto length = machine.heap().array_length(*weights);
-        if (!length) return std::unexpected(length.error());
-        const usize count = std::min(*length, sample.values.size());
+        auto current_values = read_float_array(
+            machine, *weights, "MorphingMesh weights");
+        if (!current_values) return std::unexpected(current_values.error());
+        const usize count = std::min(current_values->size(), sample.values.size());
         for (usize index = 0U; index < count; ++index) {
-            auto current = machine.heap().element(*weights, index);
-            if (!current) return std::unexpected(current.error());
-            auto current_float = current->as_float();
-            if (!current_float) return std::unexpected(current_float.error());
-            auto stored = machine.heap().set_element(*weights, index,
-                Value::from_float(weighted_value(
-                    *current_float, sample.values[index], sample.weight)));
-            if (!stored) return stored;
+            (*current_values)[index] = weighted_value(
+                (*current_values)[index], sample.values[index], sample.weight);
         }
+        auto stored = machine.heap().write_float_array(
+            *weights, 0U, std::span<const float>(current_values->data(), count));
+        if (!stored) return stored;
     }
     return {};
+}
+
+[[nodiscard]] Result<std::vector<ObjectRef>> active_animation_tracks(
+    Machine& machine,
+    ObjectRef object,
+    i32 count) {
+    if (count <= 0) return std::vector<ObjectRef> {};
+    auto tracks = animation_array(machine, object);
+    if (!tracks) return std::unexpected(tracks.error());
+    auto values = scene_reference_array(
+        machine, *tracks, "Object3D animation tracks");
+    if (!values) return std::unexpected(values.error());
+    if (values->size() < static_cast<usize>(count)) {
+        return fail(ErrorCode::invalid_state,
+                    "Object3D animation track array is truncated");
+    }
+    values->resize(static_cast<usize>(count));
+    return values;
 }
 
 [[nodiscard]] Result<i32> animate_object_recursive(
@@ -2315,16 +2342,11 @@ struct AnimationSample final {
     auto count = int_field(machine, object, kObject3D, "animationTrackCount");
     if (!count) return std::unexpected(count.error());
     if (*count > 0) {
-        auto tracks = animation_array(machine, object);
+        auto tracks = active_animation_tracks(machine, object, *count);
         if (!tracks) return std::unexpected(tracks.error());
-        for (i32 index = 0; index < *count; ++index) {
-            auto track_value = machine.heap().element(
-                *tracks, static_cast<usize>(index));
-            if (!track_value) return std::unexpected(track_value.error());
-            auto track = track_value->as_reference();
-            if (!track) return std::unexpected(track.error());
-            if (track->is_null()) continue;
-            auto sample = sample_animation_track(machine, *track, world_time);
+        for (ObjectRef track : *tracks) {
+            if (track.is_null()) continue;
+            auto sample = sample_animation_track(machine, track, world_time);
             if (!sample) return std::unexpected(sample.error());
             if (!sample->has_value()) continue;
             validity = std::min(validity, sample->value().validity);
@@ -2493,19 +2515,20 @@ void register_object3d(NativeMethodRegistry& registry) {
                                    "animationTrackCount");
             if (!tracks) return std::unexpected(tracks.error());
             if (!count) return std::unexpected(count.error());
-            for (i32 index = 0; index < *count; ++index) {
-                auto value = machine.heap().element(*tracks,
-                                                    static_cast<usize>(index));
-                if (!value) return std::unexpected(value.error());
-                auto current = value->as_reference();
-                if (!current) return std::unexpected(current.error());
-                if (*current != *track) continue;
-                for (i32 move = index; move + 1 < *count; ++move) {
-                    auto next = machine.heap().element(
-                        *tracks, static_cast<usize>(move + 1));
-                    if (!next) return std::unexpected(next.error());
-                    auto shifted = machine.heap().set_element(
-                        *tracks, static_cast<usize>(move), *next);
+            auto track_values = machine.heap().read_reference_array(*tracks);
+            if (!track_values) return std::unexpected(track_values.error());
+            const usize active_count = static_cast<usize>(std::max(*count, 0));
+            const auto end = track_values->begin() +
+                static_cast<std::ptrdiff_t>(
+                    std::min(active_count, track_values->size()));
+            const auto found = std::find(track_values->begin(), end, *track);
+            if (found != end) {
+                const usize index = static_cast<usize>(
+                    std::distance(track_values->begin(), found));
+                const usize move_count = active_count - index - 1U;
+                if (move_count != 0U) {
+                    auto shifted = machine.heap().copy_array_range(
+                        *tracks, index + 1U, *tracks, index, move_count);
                     if (!shifted) return std::unexpected(shifted.error());
                 }
                 auto cleared = machine.heap().set_element(
@@ -2515,7 +2538,6 @@ void register_object3d(NativeMethodRegistry& registry) {
                 auto updated = set_int_field(machine, *object, kObject3D,
                                              "animationTrackCount", *count - 1);
                 if (!updated) return std::unexpected(updated.error());
-                break;
             }
             return std::optional<Value> {};
         });
@@ -3014,19 +3036,20 @@ void register_group(NativeMethodRegistry& registry) {
             auto count = int_field(machine, *object, kGroup, "childCount");
             if (!children) return std::unexpected(children.error());
             if (!count) return std::unexpected(count.error());
-            for (i32 index = 0; index < *count; ++index) {
-                auto value = machine.heap().element(*children,
-                                                    static_cast<usize>(index));
-                if (!value) return std::unexpected(value.error());
-                auto current = value->as_reference();
-                if (!current) return std::unexpected(current.error());
-                if (*current != *child) continue;
-                for (i32 move = index; move + 1 < *count; ++move) {
-                    auto next = machine.heap().element(
-                        *children, static_cast<usize>(move + 1));
-                    if (!next) return std::unexpected(next.error());
-                    auto shifted = machine.heap().set_element(
-                        *children, static_cast<usize>(move), *next);
+            auto child_values = machine.heap().read_reference_array(*children);
+            if (!child_values) return std::unexpected(child_values.error());
+            const usize active_count = static_cast<usize>(std::max(*count, 0));
+            const auto end = child_values->begin() +
+                static_cast<std::ptrdiff_t>(
+                    std::min(active_count, child_values->size()));
+            const auto found = std::find(child_values->begin(), end, *child);
+            if (found != end) {
+                const usize index = static_cast<usize>(
+                    std::distance(child_values->begin(), found));
+                const usize move_count = active_count - index - 1U;
+                if (move_count != 0U) {
+                    auto shifted = machine.heap().copy_array_range(
+                        *children, index + 1U, *children, index, move_count);
                     if (!shifted) return std::unexpected(shifted.error());
                 }
                 auto cleared = machine.heap().set_element(
@@ -3041,7 +3064,6 @@ void register_group(NativeMethodRegistry& registry) {
                 auto updated = set_int_field(machine, *object, kGroup,
                                              "childCount", *count - 1);
                 if (!updated) return std::unexpected(updated.error());
-                return std::optional<Value> {};
             }
             return std::optional<Value> {};
         });

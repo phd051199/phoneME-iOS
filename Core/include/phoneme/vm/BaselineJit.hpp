@@ -12,6 +12,7 @@
 #include "phoneme/classfile/ClassFile.hpp"
 #include "phoneme/vm/MetadataId.hpp"
 #include "phoneme/vm/RuntimeMetadata.hpp"
+#include "phoneme/vm/SlotStorage.hpp"
 #include "phoneme/vm/Value.hpp"
 
 namespace phoneme::vm {
@@ -146,7 +147,11 @@ using JitRuntimeDispatch = u32 (*)(void* context,
                                    u64* result_bits);
 using JitRootPublisher = void (*)(void* context,
                                   const u64* roots,
-                                  usize root_count);
+                                  usize root_count,
+                                  const u64* frame_base,
+                                  const u32* root_offsets,
+                                  usize root_offset_count,
+                                  bool defer_scheduler_publication);
 
 struct JitRuntimeHooks final {
     void* context {nullptr};
@@ -170,10 +175,40 @@ struct JitInlineResolverHooks final {
     JitInlineResolver resolve {nullptr};
 };
 
+struct JitPhysicalFrameView final {
+    u32 bytecode_pc {0U};
+    u32 local_slots {0U};
+    u32 stack_slots {0U};
+    std::span<const u64> physical_slots;
+
+    [[nodiscard]] usize expected_slot_count() const noexcept {
+        return static_cast<usize>(local_slots) +
+               static_cast<usize>(stack_slots);
+    }
+
+    [[nodiscard]] bool valid() const noexcept {
+        return physical_slots.size() == expected_slot_count();
+    }
+};
+
 struct JitDeoptState final {
     u32 bytecode_pc {0U};
-    std::vector<std::optional<Value>> locals;
-    std::vector<Value> stack;
+    u32 local_slots {0U};
+    u32 stack_slots {0U};
+    // Physical JVM slots: locals first, followed by the operand stack.
+    // Slot kinds come from RuntimeMethod::verified_frames when the interpreter
+    // restores the frame, so a precise deopt copies only raw 64-bit payloads
+    // instead of materializing Value/optional<Value> vectors.
+    std::vector<u64> physical_slots;
+
+    [[nodiscard]] JitPhysicalFrameView view() const noexcept {
+        return JitPhysicalFrameView {
+            .bytecode_pc = bytecode_pc,
+            .local_slots = local_slots,
+            .stack_slots = stack_slots,
+            .physical_slots = physical_slots,
+        };
+    }
 };
 
 struct JitExecutionResult final {
@@ -300,7 +335,22 @@ public:
         bool has_receiver,
         u64 instruction_budget,
         JitRuntimeHooks runtime_hooks = {},
-        std::shared_ptr<const classfile::ClassFile> owner_lifetime = {});
+        std::shared_ptr<const classfile::ClassFile> owner_lifetime = {},
+        std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames = {},
+        std::shared_ptr<const CachedMethodDescriptor> descriptor_lifetime = {});
+
+    [[nodiscard]] Result<std::optional<JitExecutionResult>> try_execute(
+        MethodId method_id,
+        const classfile::ClassFile& owner,
+        const classfile::Method& method,
+        const CachedMethodDescriptor& descriptor,
+        const InvocationArguments& arguments,
+        bool has_receiver,
+        u64 instruction_budget,
+        JitRuntimeHooks runtime_hooks = {},
+        std::shared_ptr<const classfile::ClassFile> owner_lifetime = {},
+        std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames = {},
+        std::shared_ptr<const CachedMethodDescriptor> descriptor_lifetime = {});
 
     [[nodiscard]] Result<std::optional<JitExecutionResult>> try_execute_osr(
         MethodId method_id,
@@ -308,11 +358,12 @@ public:
         const classfile::Method& method,
         const CachedMethodDescriptor& descriptor,
         bool has_receiver,
-        u32 entry_bci,
-        std::span<const u64> frame_slots,
+        JitPhysicalFrameView frame,
         u64 instruction_budget,
         JitRuntimeHooks runtime_hooks = {},
-        std::shared_ptr<const classfile::ClassFile> owner_lifetime = {});
+        std::shared_ptr<const classfile::ClassFile> owner_lifetime = {},
+        std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames = {},
+        std::shared_ptr<const CachedMethodDescriptor> descriptor_lifetime = {});
 
     // Executes an already-compiled method directly without triggering
     // compilation. Runtime-dispatching entries are admitted only when hooks are
@@ -328,7 +379,18 @@ public:
         u64 instruction_budget,
         JitRuntimeHooks runtime_hooks = {});
 
+    [[nodiscard]] Result<std::optional<JitExecutionResult>> try_execute_cached(
+        MethodId method_id,
+        const classfile::ClassFile& owner,
+        const classfile::Method& method,
+        const CachedMethodDescriptor& descriptor,
+        const InvocationArguments& arguments,
+        bool has_receiver,
+        u64 instruction_budget,
+        JitRuntimeHooks runtime_hooks = {});
+
     [[nodiscard]] static JitAvailability probe_platform() noexcept;
+    [[nodiscard]] static bool conservative_device_mode() noexcept;
 
 private:
     class Impl;

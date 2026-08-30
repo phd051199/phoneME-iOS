@@ -113,6 +113,60 @@ void add(NativeMethodRegistry& registry,
                                     Value::from_reference(value));
 }
 
+struct ByteInputState final {
+    ObjectRef buffer {};
+    i32 position {0};
+    i32 count {0};
+};
+
+[[nodiscard]] Result<ByteInputState> byte_input_state(Machine& machine,
+                                                      ObjectRef stream) {
+    constexpr std::array<usize, 3> fields {
+        kByteInputBufferField,
+        kByteInputPositionField,
+        kByteInputCountField,
+    };
+    std::array<Value, fields.size()> values {};
+    auto read = machine.heap().read_fields(stream, fields, values);
+    if (!read) return std::unexpected(read.error());
+    auto buffer = values[0U].as_reference();
+    auto position = values[1U].as_int();
+    auto count = values[2U].as_int();
+    if (!buffer || !position || !count || buffer->is_null() ||
+        *position < 0 || *count < *position) {
+        return fail(ErrorCode::invalid_state,
+                    "ByteArrayInputStream state is invalid");
+    }
+    return ByteInputState {
+        .buffer = *buffer,
+        .position = *position,
+        .count = *count,
+    };
+}
+
+struct ByteOutputState final {
+    ObjectRef buffer {};
+    i32 count {0};
+};
+
+[[nodiscard]] Result<ByteOutputState> byte_output_state(Machine& machine,
+                                                        ObjectRef stream) {
+    constexpr std::array<usize, 2> fields {
+        kByteOutputBufferField,
+        kByteOutputCountField,
+    };
+    std::array<Value, fields.size()> values {};
+    auto read = machine.heap().read_fields(stream, fields, values);
+    if (!read) return std::unexpected(read.error());
+    auto buffer = values[0U].as_reference();
+    auto count = values[1U].as_int();
+    if (!buffer || !count || buffer->is_null() || *count < 0) {
+        return fail(ErrorCode::invalid_state,
+                    "ByteArrayOutputStream state is invalid");
+    }
+    return ByteOutputState {.buffer = *buffer, .count = *count};
+}
+
 [[nodiscard]] Result<bool> is_instance(Machine& machine,
                                        ObjectRef object,
                                        std::string_view class_name) {
@@ -127,12 +181,12 @@ void add(NativeMethodRegistry& registry,
         return fail_java("java/lang/NullPointerException",
                          "byte array is null");
     }
-    auto class_name = machine.heap().class_name(array);
-    if (!class_name || *class_name != "[B") {
+    auto info = machine.heap().array_info(array);
+    if (!info || info->kind != HeapArrayKind::byte) {
         return fail_java("java/lang/IllegalArgumentException",
                          "value is not byte[]");
     }
-    return machine.heap().array_length(array);
+    return info->length;
 }
 
 [[nodiscard]] Result<u8> byte_array_value(Machine& machine,
@@ -189,12 +243,12 @@ void add(NativeMethodRegistry& registry,
         return fail_java("java/lang/NullPointerException",
                          "char array is null");
     }
-    auto class_name = machine.heap().class_name(array);
-    if (!class_name || *class_name != "[C") {
+    auto info = machine.heap().array_info(array);
+    if (!info || info->kind != HeapArrayKind::character) {
         return fail_java("java/lang/IllegalArgumentException",
                          "value is not char[]");
     }
-    return machine.heap().array_length(array);
+    return info->length;
 }
 
 [[nodiscard]] Result<char16_t> char_array_value(Machine& machine,
@@ -424,21 +478,15 @@ void add(NativeMethodRegistry& registry,
 
 [[nodiscard]] Result<i32> byte_input_read_one(Machine& machine,
                                                ObjectRef stream) {
-    auto position = int_field(machine, stream, kByteInputPositionField);
-    auto count = int_field(machine, stream, kByteInputCountField);
-    auto buffer = reference_field(machine, stream, kByteInputBufferField);
-    if (!position || !count || !buffer || *position < 0 ||
-        *count < *position) {
-        return fail(ErrorCode::invalid_state,
-                    "ByteArrayInputStream state is invalid");
-    }
-    if (*position >= *count) return -1;
-    auto byte = byte_array_value(machine, *buffer,
-                                 static_cast<usize>(*position));
+    auto state = byte_input_state(machine, stream);
+    if (!state) return std::unexpected(state.error());
+    if (state->position >= state->count) return -1;
+    auto byte = byte_array_value(machine, state->buffer,
+                                 static_cast<usize>(state->position));
     if (!byte) return std::unexpected(byte.error());
     auto updated = set_int_field(machine, stream,
                                  kByteInputPositionField,
-                                 *position + 1);
+                                 state->position + 1);
     if (!updated) return std::unexpected(updated.error());
     return static_cast<i32>(*byte);
 }
@@ -448,27 +496,21 @@ void add(NativeMethodRegistry& registry,
                                                  ObjectRef destination,
                                                  i32 offset,
                                                  i32 length) {
-    auto position = int_field(machine, stream, kByteInputPositionField);
-    auto count = int_field(machine, stream, kByteInputCountField);
-    auto buffer = reference_field(machine, stream, kByteInputBufferField);
-    if (!position || !count || !buffer || *position < 0 ||
-        *count < *position) {
-        return fail(ErrorCode::invalid_state,
-                    "ByteArrayInputStream state is invalid");
-    }
-    const i32 available = *count - *position;
+    auto state = byte_input_state(machine, stream);
+    if (!state) return std::unexpected(state.error());
+    const i32 available = state->count - state->position;
     if (available <= 0) return -1;
     const i32 copied_count = std::min(length, available);
     auto copied = machine.heap().copy_array_range(
-        *buffer,
-        static_cast<usize>(*position),
+        state->buffer,
+        static_cast<usize>(state->position),
         destination,
         static_cast<usize>(offset),
         static_cast<usize>(copied_count));
     if (!copied) return std::unexpected(copied.error());
     auto updated = set_int_field(machine, stream,
                                  kByteInputPositionField,
-                                 *position + copied_count);
+                                 state->position + copied_count);
     if (!updated) return std::unexpected(updated.error());
     return copied_count;
 }
@@ -511,13 +553,13 @@ void add(NativeMethodRegistry& registry,
         }
         return invoked->return_value->as_int();
     }
-    auto byte_array = is_instance(machine, stream,
-                                  "java/io/ByteArrayInputStream");
+    auto byte_array = machine.classes().is_assignable(
+        *runtime_class, "java/io/ByteArrayInputStream");
     if (!byte_array) return std::unexpected(byte_array.error());
     if (*byte_array) return byte_input_read_one(machine, stream);
 
-    auto file_input = is_instance(machine, stream,
-                                  "java/io/FileInputStream");
+    auto file_input = machine.classes().is_assignable(
+        *runtime_class, "java/io/FileInputStream");
     if (!file_input) return std::unexpected(file_input.error());
     if (*file_input) return file_input_read_one(machine, stream);
 
@@ -525,16 +567,16 @@ void add(NativeMethodRegistry& registry,
     if (!network_input) return std::unexpected(network_input.error());
     if (network_input->has_value()) return **network_input;
 
-    auto data_input = is_instance(machine, stream,
-                                  "java/io/DataInputStream");
+    auto data_input = machine.classes().is_assignable(
+        *runtime_class, "java/io/DataInputStream");
     if (!data_input) return std::unexpected(data_input.error());
     if (*data_input) {
         auto input = reference_field(machine, stream, kFilterStreamField);
         if (!input) return std::unexpected(input.error());
         return stream_read_one(machine, *input, depth + 1U);
     }
-    auto filter = is_instance(machine, stream,
-                              "java/io/FilterInputStream");
+    auto filter = machine.classes().is_assignable(
+        *runtime_class, "java/io/FilterInputStream");
     if (!filter) return std::unexpected(filter.error());
     if (*filter) {
         auto input = reference_field(machine, stream, kFilterStreamField);
@@ -577,16 +619,16 @@ void add(NativeMethodRegistry& registry,
     if (!network_read) return std::unexpected(network_read.error());
     if (network_read->has_value()) return **network_read;
 
-    auto data_input = is_instance(machine, stream,
-                                  "java/io/DataInputStream");
+    auto data_input = machine.classes().is_assignable(
+        *runtime_class, "java/io/DataInputStream");
     if (!data_input) return std::unexpected(data_input.error());
     if (*data_input) {
         auto input = reference_field(machine, stream, kFilterStreamField);
         if (!input) return std::unexpected(input.error());
         return stream_read_bytes(machine, *input, destination, offset, length);
     }
-    auto filter = is_instance(machine, stream,
-                              "java/io/FilterInputStream");
+    auto filter = machine.classes().is_assignable(
+        *runtime_class, "java/io/FilterInputStream");
     if (!filter) return std::unexpected(filter.error());
     if (*filter) {
         auto input = reference_field(machine, stream, kFilterStreamField);
@@ -626,38 +668,39 @@ void add(NativeMethodRegistry& registry,
         return fail_java("java/io/IOException",
                          "input stream filter chain is too deep");
     }
-    auto byte_array = is_instance(machine, stream,
-                                  "java/io/ByteArrayInputStream");
+    auto runtime_class = machine.heap().class_name(stream);
+    if (!runtime_class) return std::unexpected(runtime_class.error());
+    auto byte_array = machine.classes().is_assignable(
+        *runtime_class, "java/io/ByteArrayInputStream");
     if (!byte_array) return std::unexpected(byte_array.error());
     if (*byte_array) {
-        auto position = int_field(machine, stream, kByteInputPositionField);
-        auto count = int_field(machine, stream, kByteInputCountField);
-        if (!position || !count)
-            return fail(ErrorCode::invalid_state,
-                        "ByteArrayInputStream state is invalid");
-        const i64 available = static_cast<i64>(*count - *position);
+        auto state = byte_input_state(machine, stream);
+        if (!state) return std::unexpected(state.error());
+        const i64 available =
+            static_cast<i64>(state->count - state->position);
         const i64 skipped = std::min(requested, available);
         auto updated = set_int_field(machine, stream,
                                      kByteInputPositionField,
-                                     *position + static_cast<i32>(skipped));
+                                     state->position +
+                                         static_cast<i32>(skipped));
         if (!updated) return std::unexpected(updated.error());
         return skipped;
     }
-    auto file_input = is_instance(machine, stream,
-                                  "java/io/FileInputStream");
+    auto file_input = machine.classes().is_assignable(
+        *runtime_class, "java/io/FileInputStream");
     if (!file_input) return std::unexpected(file_input.error());
     if (*file_input) return file_input_skip(machine, stream, requested);
 
-    auto data_input = is_instance(machine, stream,
-                                  "java/io/DataInputStream");
+    auto data_input = machine.classes().is_assignable(
+        *runtime_class, "java/io/DataInputStream");
     if (!data_input) return std::unexpected(data_input.error());
     if (*data_input) {
         auto input = reference_field(machine, stream, kFilterStreamField);
         if (!input) return std::unexpected(input.error());
         return stream_skip(machine, *input, requested, depth + 1U);
     }
-    auto filter = is_instance(machine, stream,
-                              "java/io/FilterInputStream");
+    auto filter = machine.classes().is_assignable(
+        *runtime_class, "java/io/FilterInputStream");
     if (!filter) return std::unexpected(filter.error());
     if (*filter) {
         auto input = reference_field(machine, stream, kFilterStreamField);
@@ -686,19 +729,18 @@ void add(NativeMethodRegistry& registry,
         return fail_java("java/io/IOException",
                          "input stream filter chain is too deep");
     }
-    auto byte_array = is_instance(machine, stream,
-                                  "java/io/ByteArrayInputStream");
+    auto runtime_class = machine.heap().class_name(stream);
+    if (!runtime_class) return std::unexpected(runtime_class.error());
+    auto byte_array = machine.classes().is_assignable(
+        *runtime_class, "java/io/ByteArrayInputStream");
     if (!byte_array) return std::unexpected(byte_array.error());
     if (*byte_array) {
-        auto position = int_field(machine, stream, kByteInputPositionField);
-        auto count = int_field(machine, stream, kByteInputCountField);
-        if (!position || !count)
-            return fail(ErrorCode::invalid_state,
-                        "ByteArrayInputStream state is invalid");
-        return *count - *position;
+        auto state = byte_input_state(machine, stream);
+        if (!state) return std::unexpected(state.error());
+        return state->count - state->position;
     }
-    auto file_input = is_instance(machine, stream,
-                                  "java/io/FileInputStream");
+    auto file_input = machine.classes().is_assignable(
+        *runtime_class, "java/io/FileInputStream");
     if (!file_input) return std::unexpected(file_input.error());
     if (*file_input) return file_input_available(machine, stream);
 
@@ -710,16 +752,16 @@ void add(NativeMethodRegistry& registry,
             static_cast<usize>(std::numeric_limits<i32>::max())));
     }
 
-    auto data_input = is_instance(machine, stream,
-                                  "java/io/DataInputStream");
+    auto data_input = machine.classes().is_assignable(
+        *runtime_class, "java/io/DataInputStream");
     if (!data_input) return std::unexpected(data_input.error());
     if (*data_input) {
         auto input = reference_field(machine, stream, kFilterStreamField);
         if (!input) return std::unexpected(input.error());
         return stream_available(machine, *input, depth + 1U);
     }
-    auto filter = is_instance(machine, stream,
-                              "java/io/FilterInputStream");
+    auto filter = machine.classes().is_assignable(
+        *runtime_class, "java/io/FilterInputStream");
     if (!filter) return std::unexpected(filter.error());
     if (*filter) {
         auto input = reference_field(machine, stream, kFilterStreamField);
@@ -731,10 +773,9 @@ void add(NativeMethodRegistry& registry,
 
 [[nodiscard]] Status byte_output_ensure_capacity(Machine& machine,
                                                  ObjectRef stream,
+                                                 ByteOutputState& state,
                                                  i32 minimum) {
-    auto buffer = reference_field(machine, stream, kByteOutputBufferField);
-    if (!buffer) return std::unexpected(buffer.error());
-    auto capacity = byte_array_length(machine, *buffer);
+    auto capacity = byte_array_length(machine, state.buffer);
     if (!capacity) return std::unexpected(capacity.error());
     if (minimum <= static_cast<i32>(*capacity)) return {};
     usize new_capacity = *capacity == 0U ? 1U : *capacity * 2U;
@@ -742,48 +783,74 @@ void add(NativeMethodRegistry& registry,
         new_capacity = static_cast<usize>(minimum);
     auto replacement = allocate_byte_array(machine, new_capacity);
     if (!replacement) return std::unexpected(replacement.error());
-    auto count = int_field(machine, stream, kByteOutputCountField);
-    if (!count) return std::unexpected(count.error());
-    for (i32 index = 0; index < *count; ++index) {
-        auto value = byte_array_value(machine, *buffer,
-                                      static_cast<usize>(index));
-        if (!value) return std::unexpected(value.error());
-        auto stored = set_byte_array_value(machine, *replacement,
-                                           static_cast<usize>(index),
-                                           *value);
-        if (!stored) return stored;
+    if (state.count > 0) {
+        auto copied = machine.heap().copy_array_range(
+            state.buffer,
+            0U,
+            *replacement,
+            0U,
+            static_cast<usize>(state.count));
+        if (!copied) return copied;
     }
-    return set_reference_field(machine, stream,
-                               kByteOutputBufferField, *replacement);
+    auto stored = set_reference_field(machine, stream,
+                                      kByteOutputBufferField, *replacement);
+    if (!stored) return stored;
+    state.buffer = *replacement;
+    return {};
 }
 
 [[nodiscard]] Status byte_output_write_one(Machine& machine,
                                             ObjectRef stream,
                                             u8 byte) {
-    auto count = int_field(machine, stream, kByteOutputCountField);
-    if (!count) return std::unexpected(count.error());
-    if (*count == std::numeric_limits<i32>::max()) {
+    auto state = byte_output_state(machine, stream);
+    if (!state) return std::unexpected(state.error());
+    if (state->count == std::numeric_limits<i32>::max()) {
         return fail_java("java/lang/OutOfMemoryError",
                          "ByteArrayOutputStream exceeds int capacity");
     }
-    auto capacity = byte_output_ensure_capacity(machine, stream, *count + 1);
+    auto capacity = byte_output_ensure_capacity(
+        machine, stream, *state, state->count + 1);
     if (!capacity) return capacity;
-    auto buffer = reference_field(machine, stream, kByteOutputBufferField);
-    if (!buffer) return std::unexpected(buffer.error());
-    auto stored = set_byte_array_value(machine, *buffer,
-                                       static_cast<usize>(*count), byte);
+    auto stored = set_byte_array_value(machine, state->buffer,
+                                       static_cast<usize>(state->count), byte);
     if (!stored) return stored;
     return set_int_field(machine, stream,
-                         kByteOutputCountField, *count + 1);
+                         kByteOutputCountField, state->count + 1);
+}
+
+[[nodiscard]] Status byte_output_write_bytes(Machine& machine,
+                                              ObjectRef stream,
+                                              std::span<const u8> bytes) {
+    if (bytes.empty()) return {};
+    auto state = byte_output_state(machine, stream);
+    if (!state) return std::unexpected(state.error());
+    if (bytes.size() > static_cast<usize>(
+            std::numeric_limits<i32>::max() - state->count)) {
+        return fail_java("java/lang/OutOfMemoryError",
+                         "ByteArrayOutputStream exceeds int capacity");
+    }
+    const i32 updated_count =
+        state->count + static_cast<i32>(bytes.size());
+    auto capacity = byte_output_ensure_capacity(
+        machine, stream, *state, updated_count);
+    if (!capacity) return capacity;
+    auto stored = machine.heap().write_byte_array(
+        state->buffer, static_cast<usize>(state->count), bytes);
+    if (!stored) return stored;
+    return set_int_field(machine, stream,
+                         kByteOutputCountField, updated_count);
 }
 
 [[nodiscard]] Status increment_data_written(Machine& machine,
                                             ObjectRef stream,
-                                            i32 amount) {
-    auto data_output = is_instance(machine, stream,
-                                   "java/io/DataOutputStream");
-    if (!data_output) return std::unexpected(data_output.error());
-    if (!*data_output) return {};
+                                            i32 amount,
+                                            bool known_data_output = false) {
+    if (!known_data_output) {
+        auto data_output = is_instance(machine, stream,
+                                       "java/io/DataOutputStream");
+        if (!data_output) return std::unexpected(data_output.error());
+        if (!*data_output) return {};
+    }
     auto written = int_field(machine, stream, kDataOutputWrittenField);
     if (!written) return std::unexpected(written.error());
     const u32 updated = static_cast<u32>(*written) +
@@ -828,13 +895,13 @@ void add(NativeMethodRegistry& registry,
         }
         return {};
     }
-    auto byte_array = is_instance(machine, stream,
-                                  "java/io/ByteArrayOutputStream");
+    auto byte_array = machine.classes().is_assignable(
+        *runtime_class, "java/io/ByteArrayOutputStream");
     if (!byte_array) return std::unexpected(byte_array.error());
     if (*byte_array) return byte_output_write_one(machine, stream, byte);
 
-    auto file_output = is_instance(machine, stream,
-                                   "java/io/FileOutputStream");
+    auto file_output = machine.classes().is_assignable(
+        *runtime_class, "java/io/FileOutputStream");
     if (!file_output) return std::unexpected(file_output.error());
     if (*file_output) return file_output_write_one(machine, stream, byte);
 
@@ -842,25 +909,25 @@ void add(NativeMethodRegistry& registry,
     if (!network_output) return std::unexpected(network_output.error());
     if (network_output->has_value()) return {};
 
-    auto data_output = is_instance(machine, stream,
-                                   "java/io/DataOutputStream");
+    auto data_output = machine.classes().is_assignable(
+        *runtime_class, "java/io/DataOutputStream");
     if (!data_output) return std::unexpected(data_output.error());
     if (*data_output) {
         auto output = reference_field(machine, stream, kFilterStreamField);
         if (!output) return std::unexpected(output.error());
         auto written = stream_write_one(machine, *output, byte, depth + 1U);
         if (!written) return written;
-        return increment_data_written(machine, stream, 1);
+        return increment_data_written(machine, stream, 1, true);
     }
-    auto filter = is_instance(machine, stream,
-                              "java/io/FilterOutputStream");
+    auto filter = machine.classes().is_assignable(
+        *runtime_class, "java/io/FilterOutputStream");
     if (!filter) return std::unexpected(filter.error());
     if (*filter) {
         auto output = reference_field(machine, stream, kFilterStreamField);
         if (!output) return std::unexpected(output.error());
         auto written = stream_write_one(machine, *output, byte, depth + 1U);
         if (!written) return written;
-        return increment_data_written(machine, stream, 1);
+        return {};
     }
     return fail_java("java/io/IOException",
                      "output stream implementation is not connected");
@@ -880,12 +947,29 @@ void add(NativeMethodRegistry& registry,
                          "output stream filter chain is too deep");
     }
 
-    auto native = connection_stream_write_bytes(machine, stream, bytes);
-    if (!native) return std::unexpected(native.error());
-    if (native->has_value()) return true;
+    auto runtime_class = machine.heap().class_name(stream);
+    if (!runtime_class) return std::unexpected(runtime_class.error());
 
-    auto data_output = is_instance(machine, stream,
-                                   "java/io/DataOutputStream");
+    auto network_stream = machine.classes().is_assignable(
+        *runtime_class, "javax/microedition/io/NativeOutputStream");
+    if (!network_stream) return std::unexpected(network_stream.error());
+    if (*network_stream) {
+        auto native = connection_stream_write_bytes(machine, stream, bytes);
+        if (!native) return std::unexpected(native.error());
+        if (native->has_value()) return true;
+    }
+
+    auto byte_array = machine.classes().is_assignable(
+        *runtime_class, "java/io/ByteArrayOutputStream");
+    if (!byte_array) return std::unexpected(byte_array.error());
+    if (*byte_array) {
+        auto written = byte_output_write_bytes(machine, stream, bytes);
+        if (!written) return std::unexpected(written.error());
+        return true;
+    }
+
+    auto data_output = machine.classes().is_assignable(
+        *runtime_class, "java/io/DataOutputStream");
     if (!data_output) return std::unexpected(data_output.error());
     if (*data_output) {
         auto output = reference_field(machine, stream, kFilterStreamField);
@@ -895,14 +979,12 @@ void add(NativeMethodRegistry& registry,
         if (!written) return std::unexpected(written.error());
         if (*written) {
             auto counted = increment_data_written(
-                machine, stream, static_cast<i32>(bytes.size()));
+                machine, stream, static_cast<i32>(bytes.size()), true);
             if (!counted) return std::unexpected(counted.error());
         }
         return *written;
     }
 
-    auto runtime_class = machine.heap().class_name(stream);
-    if (!runtime_class) return std::unexpected(runtime_class.error());
     if (*runtime_class == "java/io/FilterOutputStream" ||
         *runtime_class == "java/io/BufferedOutputStream") {
         auto output = reference_field(machine, stream, kFilterStreamField);
@@ -1079,26 +1161,20 @@ read_required_from_byte_array(Machine& machine,
         return std::optional<std::vector<u8>> {};
     }
 
-    auto position = int_field(machine, input, kByteInputPositionField);
-    auto limit = int_field(machine, input, kByteInputCountField);
-    auto buffer = reference_field(machine, input, kByteInputBufferField);
-    if (!position || !limit || !buffer || buffer->is_null() ||
-        *position < 0 || *limit < *position) {
-        return fail(ErrorCode::invalid_state,
-                    "ByteArrayInputStream state is invalid");
-    }
+    auto state = byte_input_state(machine, input);
+    if (!state) return std::unexpected(state.error());
 
-    const usize available = static_cast<usize>(*limit - *position);
+    const usize available = static_cast<usize>(state->count - state->position);
     const usize copied_count = std::min(count, available);
     auto bytes = machine.heap().read_byte_array(
-        *buffer, static_cast<usize>(*position), copied_count);
+        state->buffer, static_cast<usize>(state->position), copied_count);
     if (!bytes) return std::unexpected(bytes.error());
     if (copied_count != 0U) {
         auto updated = set_int_field(
             machine,
             input,
             kByteInputPositionField,
-            *position + static_cast<i32>(copied_count));
+            state->position + static_cast<i32>(copied_count));
         if (!updated) return std::unexpected(updated.error());
     }
     if (copied_count != count) {
@@ -1616,19 +1692,20 @@ void register_byte_array_streams(NativeMethodRegistry& registry) {
             if (!buffer) return std::unexpected(buffer.error());
             auto length = byte_array_length(machine, *buffer);
             if (!length) return std::unexpected(length.error());
-            auto buffer_stored = set_reference_field(
-                machine, *object, kByteInputBufferField, *buffer);
-            auto position_stored = set_int_field(
-                machine, *object, kByteInputPositionField, 0);
-            auto mark_stored = set_int_field(
-                machine, *object, kByteInputMarkField, 0);
-            auto count_stored = set_int_field(
-                machine, *object, kByteInputCountField,
-                static_cast<i32>(*length));
-            if (!buffer_stored) return std::unexpected(buffer_stored.error());
-            if (!position_stored) return std::unexpected(position_stored.error());
-            if (!mark_stored) return std::unexpected(mark_stored.error());
-            if (!count_stored) return std::unexpected(count_stored.error());
+            constexpr std::array<usize, 4> fields {
+                kByteInputBufferField,
+                kByteInputPositionField,
+                kByteInputMarkField,
+                kByteInputCountField,
+            };
+            const std::array<Value, fields.size()> values {
+                Value::from_reference(*buffer),
+                Value::from_int(0),
+                Value::from_int(0),
+                Value::from_int(static_cast<i32>(*length)),
+            };
+            auto stored = machine.heap().write_fields(*object, fields, values);
+            if (!stored) return std::unexpected(stored.error());
             return std::optional<Value> {};
         });
     add(registry, "java/io/ByteArrayInputStream", "<init>", "([BII)V",
@@ -1650,19 +1727,20 @@ void register_byte_array_streams(NativeMethodRegistry& registry) {
             const usize end = std::min(
                 *array_length,
                 static_cast<usize>(*offset) + static_cast<usize>(*length));
-            auto buffer_stored = set_reference_field(
-                machine, *object, kByteInputBufferField, *buffer);
-            auto position_stored = set_int_field(
-                machine, *object, kByteInputPositionField, *offset);
-            auto mark_stored = set_int_field(
-                machine, *object, kByteInputMarkField, *offset);
-            auto count_stored = set_int_field(
-                machine, *object, kByteInputCountField,
-                static_cast<i32>(end));
-            if (!buffer_stored) return std::unexpected(buffer_stored.error());
-            if (!position_stored) return std::unexpected(position_stored.error());
-            if (!mark_stored) return std::unexpected(mark_stored.error());
-            if (!count_stored) return std::unexpected(count_stored.error());
+            constexpr std::array<usize, 4> fields {
+                kByteInputBufferField,
+                kByteInputPositionField,
+                kByteInputMarkField,
+                kByteInputCountField,
+            };
+            const std::array<Value, fields.size()> values {
+                Value::from_reference(*buffer),
+                Value::from_int(*offset),
+                Value::from_int(*offset),
+                Value::from_int(static_cast<i32>(end)),
+            };
+            auto stored = machine.heap().write_fields(*object, fields, values);
+            if (!stored) return std::unexpected(stored.error());
             return std::optional<Value> {};
         });
     add(registry, "java/io/ByteArrayInputStream", "mark", "(I)V",
@@ -1706,12 +1784,15 @@ void register_byte_array_streams(NativeMethodRegistry& registry) {
         auto buffer = allocate_byte_array(machine,
                                           static_cast<usize>(capacity));
         if (!buffer) return std::unexpected(buffer.error());
-        auto buffer_stored = set_reference_field(
-            machine, object, kByteOutputBufferField, *buffer);
-        auto count_stored = set_int_field(
-            machine, object, kByteOutputCountField, 0);
-        if (!buffer_stored) return buffer_stored;
-        return count_stored;
+        constexpr std::array<usize, 2> fields {
+            kByteOutputBufferField,
+            kByteOutputCountField,
+        };
+        const std::array<Value, fields.size()> values {
+            Value::from_reference(*buffer),
+            Value::from_int(0),
+        };
+        return machine.heap().write_fields(object, fields, values);
     };
     add(registry, "java/io/ByteArrayOutputStream", "<init>", "()V",
         [initialize_output](Machine& machine,
@@ -1759,23 +1840,16 @@ void register_byte_array_streams(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto count = int_field(machine, *object, kByteOutputCountField);
-            auto buffer = reference_field(machine, *object,
-                                          kByteOutputBufferField);
-            if (!count || !buffer)
-                return fail(ErrorCode::invalid_state,
-                            "ByteArrayOutputStream state is invalid");
-            auto copy = allocate_byte_array(machine,
-                                            static_cast<usize>(*count));
+            auto state = byte_output_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            auto copy = allocate_byte_array(
+                machine, static_cast<usize>(state->count));
             if (!copy) return std::unexpected(copy.error());
-            for (i32 index = 0; index < *count; ++index) {
-                auto value = byte_array_value(machine, *buffer,
-                                              static_cast<usize>(index));
-                if (!value) return std::unexpected(value.error());
-                auto stored = set_byte_array_value(machine, *copy,
-                                                   static_cast<usize>(index),
-                                                   *value);
-                if (!stored) return std::unexpected(stored.error());
+            if (state->count > 0) {
+                auto copied = machine.heap().copy_array_range(
+                    state->buffer, 0U, *copy, 0U,
+                    static_cast<usize>(state->count));
+                if (!copied) return std::unexpected(copied.error());
             }
             return std::optional<Value>(Value::from_reference(*copy));
         });
@@ -1789,14 +1863,10 @@ void register_byte_array_streams(NativeMethodRegistry& registry) {
             if (!target || target->is_null())
                 return fail_java("java/lang/NullPointerException",
                                  "ByteArrayOutputStream target is null");
-            auto count = int_field(machine, *object, kByteOutputCountField);
-            auto buffer = reference_field(machine, *object,
-                                          kByteOutputBufferField);
-            if (!count || !buffer)
-                return fail(ErrorCode::invalid_state,
-                            "ByteArrayOutputStream state is invalid");
-            auto written = stream_write_bytes(machine, *target, *buffer,
-                                              0, *count);
+            auto state = byte_output_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            auto written = stream_write_bytes(
+                machine, *target, state->buffer, 0, state->count);
             if (!written) return std::unexpected(written.error());
             return std::optional<Value> {};
         });
@@ -1806,13 +1876,8 @@ void register_byte_array_streams(NativeMethodRegistry& registry) {
         bool named) -> Result<std::optional<Value>> {
         auto object = receiver(arguments);
         if (!object) return std::unexpected(object.error());
-        auto count = int_field(machine, *object, kByteOutputCountField);
-        auto buffer = reference_field(machine, *object,
-                                      kByteOutputBufferField);
-        if (!count || !buffer) {
-            return fail(ErrorCode::invalid_state,
-                        "ByteArrayOutputStream state is invalid");
-        }
+        auto state = byte_output_state(machine, *object);
+        if (!state) return std::unexpected(state.error());
         StreamCharset charset = StreamCharset::utf8;
         if (named) {
             auto name = arguments[1].as_reference();
@@ -1822,7 +1887,7 @@ void register_byte_array_streams(NativeMethodRegistry& registry) {
             charset = *resolved;
         }
         auto decoded = decode_byte_array(
-            machine, *buffer, *count, charset);
+            machine, state->buffer, state->count, charset);
         if (!decoded) return std::unexpected(decoded.error());
         auto string = create_string(machine, std::move(*decoded));
         if (!string) return std::unexpected(string.error());
@@ -2023,11 +2088,27 @@ void register_data_input(NativeMethodRegistry& registry) {
                 -> Result<std::optional<Value>> {
                 auto input = receiver(arguments);
                 if (!input) return std::unexpected(input.error());
-                auto bytes = read_required(machine, *input, byte_count);
-                if (!bytes) return std::unexpected(bytes.error());
-                u64 bits = 0;
-                for (const u8 byte : *bytes)
-                    bits = (bits << 8U) | byte;
+                auto fast = machine.try_read_byte_array_input_bits(
+                    *input, byte_count);
+                if (!fast) return std::unexpected(fast.error());
+                u64 bits = 0U;
+                if (fast->has_value()) {
+                    bits = **fast;
+                } else {
+                    // Generic/custom stream fallback. Primitive reads are at
+                    // most eight bytes, so assemble directly on the stack and
+                    // avoid allocating std::vector<u8> for every read.
+                    for (usize index = 0U; index < byte_count; ++index) {
+                        auto value = stream_read_one(machine, *input, 0U);
+                        if (!value) return std::unexpected(value.error());
+                        if (*value < 0) {
+                            return fail_java("java/io/EOFException",
+                                             "data stream reached end of input");
+                        }
+                        bits = (bits << 8U) |
+                            static_cast<u8>(*value);
+                    }
+                }
                 return std::optional<Value>(convert(bits));
             });
     };
@@ -2502,9 +2583,9 @@ struct FastBufferedLine final {
     }
 
     if (!bytes.empty()) {
-        auto native = connection_stream_write_bytes(machine, *output, bytes);
+        auto native = write_native_filter_chain(machine, *output, bytes, 0U);
         if (!native) return std::unexpected(native.error());
-        if (!native->has_value()) {
+        if (!*native) {
             for (const u8 byte : bytes) {
                 auto written = stream_write_one(machine, *output, byte, 0U);
                 if (!written) return written;

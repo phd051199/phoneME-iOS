@@ -100,7 +100,14 @@ Image::Image(i32 width,
       pixels_(std::move(pixels)),
       alpha_kind_(mutable_image
           ? ImageAlphaKind::translucent
-          : classify_alpha(pixels_)) {}
+          : classify_alpha(pixels_)) {
+    if (!mutable_ && alpha_kind_ != ImageAlphaKind::translucent) {
+        device_pixels_.resize(pixels_.size());
+        std::transform(
+            pixels_.begin(), pixels_.end(), device_pixels_.begin(),
+            [](Pixel pixel) noexcept { return rgb565_roundtrip(pixel); });
+    }
+}
 
 Result<Size> validate_dimensions(i32 width, i32 height) {
     if (width <= 0 || height <= 0) {

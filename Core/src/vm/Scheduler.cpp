@@ -6,6 +6,7 @@
 #include <thread>
 
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
 #include <os/log.h>
 #endif
 
@@ -79,9 +80,18 @@ constexpr auto kMinimumFramePacingRequest =
 constexpr auto kMinimumSleepStabilityTolerance =
     std::chrono::milliseconds(2);
 constexpr u32 kOverrideActivationStreak = 6U;
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+// Avoid oscillating right at the frame deadline. Only sustained, clearly
+// over-fast rendering is capped on device; near-target heavy games are left
+// alone so the pacing gate cannot manufacture stutter.
+constexpr u32 kNativeBackpressureActivationStreak = 3U;
+constexpr i64 kNativeBackpressureFastFrameNumerator = 4;
+constexpr i64 kNativeBackpressureFastFrameDenominator = 5;
+#else
 constexpr u32 kNativeBackpressureActivationStreak = 4U;
 constexpr i64 kNativeBackpressureFastFrameNumerator = 4;
 constexpr i64 kNativeBackpressureFastFrameDenominator = 5;
+#endif
 
 [[nodiscard]] const char* thread_state_name(JavaThreadState state) noexcept {
     switch (state) {
@@ -873,10 +883,28 @@ void Scheduler::cooperative_quantum(Machine& machine) {
         !unpaced_execution && !deterministic_mode &&
         !background_deadline.has_value() &&
         ((tls_unblocked_quantum_count_ & 7U) == 0U);
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+    // Harrier/JarlyME naturally spends less package power on guest worker
+    // loops because its interpreter has coarser scheduling. Match that
+    // behavior only for threads that have never published a frame and have
+    // run for a long uninterrupted stretch. Normal game/render loops reset
+    // the counter at frame/sleep/blocking boundaries and never reach this
+    // path. Keep the pause sub-millisecond so network/AI workers remain
+    // responsive while pathological polling loops cannot pin a performance
+    // core indefinitely.
+    const bool thermal_non_render_spin_backoff =
+        !unpaced_execution && !deterministic_mode &&
+        !background_deadline.has_value() &&
+        !tls_pressure_frame_boundary_valid_ &&
+        tls_unblocked_quantum_count_ >= 96U &&
+        ((tls_unblocked_quantum_count_ & 15U) == 0U);
+#else
+    const bool thermal_non_render_spin_backoff = false;
+#endif
     const bool needs_execution_handoff =
         background_deadline.has_value() || unpaced_execution ||
         deterministic_mode || foreground_peer_runnable ||
-        periodic_foreground_handoff;
+        periodic_foreground_handoff || thermal_non_render_spin_backoff;
 
     if (!needs_execution_handoff) {
         // Most healthy foreground quanta have no Java peer waiting and are not
@@ -909,6 +937,9 @@ void Scheduler::cooperative_quantum(Machine& machine) {
         // pause so timing-sensitive scheduler tests do not become host-load
         // dependent.
         std::this_thread::sleep_for(backoff);
+    } else if (thermal_non_render_spin_backoff) {
+        std::this_thread::sleep_for(std::min(
+            backoff, std::chrono::microseconds(500)));
     } else if (foreground_peer_runnable || periodic_foreground_handoff) {
         // Foreground scheduler fairness must not become a CPU duty-cycle cap.
         // Sustained work here may be class loading, decompression, AI or a
@@ -1381,6 +1412,16 @@ void Scheduler::publish_current_roots(
     if (current) {
         current->context_->publish_roots(invocation_depth, roots);
     }
+}
+
+std::span<const ObjectRef> Scheduler::exchange_current_roots(
+    u32 invocation_depth,
+    std::vector<ObjectRef>& roots) {
+    auto current = current_thread_record();
+    if (current) {
+        return current->context_->exchange_roots(invocation_depth, roots);
+    }
+    return {};
 }
 
 void Scheduler::clear_current_roots(u32 invocation_depth) noexcept {

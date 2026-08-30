@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cctype>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -27,6 +29,7 @@
 
 #if defined(__APPLE__)
 #include <os/log.h>
+#include <TargetConditionals.h>
 #endif
 
 namespace phoneme::runtime {
@@ -594,15 +597,42 @@ private:
 
 constexpr usize kParallelFrameConversionPixels = 32U * 1024U;
 
-void convert_image_region_to_rgba(
+[[nodiscard]] constexpr FramePixelFormat canvas_frame_pixel_format() noexcept {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    return FramePixelFormat::bgra8;
+#else
+    return FramePixelFormat::rgba8;
+#endif
+}
+
+void convert_image_region_to_frame_pixels(
     std::span<const graphics::Pixel> source_pixels,
     i32 source_width,
     const graphics::ImageRegion& region,
-    std::span<u8> destination) {
+    std::span<u8> destination,
+    FramePixelFormat format) {
     const usize region_width = static_cast<usize>(region.width);
     const usize region_height = static_cast<usize>(region.height);
     const usize pixel_count = region_width * region_height;
     const usize source_stride = static_cast<usize>(source_width);
+
+    // Pixel is Java ARGB in a u32. On the little-endian iOS ARM64 host its
+    // in-memory bytes are exactly BGRA, matching Metal's native drawable
+    // format. Publish dirty rows with memcpy instead of shuffling four
+    // channels for every pixel. Other hosts retain the portable RGBA path.
+    if (format == FramePixelFormat::bgra8 &&
+        std::endian::native == std::endian::little) {
+        const usize row_bytes = region_width * sizeof(graphics::Pixel);
+        for (usize row = 0U; row < region_height; ++row) {
+            const usize source =
+                (static_cast<usize>(region.y) + row) * source_stride +
+                static_cast<usize>(region.x);
+            std::memcpy(destination.data() + row * row_bytes,
+                        source_pixels.data() + source,
+                        row_bytes);
+        }
+        return;
+    }
 
     const auto convert_rows = [&](usize row_begin, usize row_end) {
         for (usize row = row_begin; row < row_end; ++row) {
@@ -611,11 +641,21 @@ void convert_image_region_to_rgba(
                 static_cast<usize>(region.x);
             usize output = row * region_width * 4U;
             for (usize column = 0U; column < region_width; ++column) {
-                const graphics::Pixel display_pixel =
-                    graphics::rgb565_roundtrip(source_pixels[source++]);
-                destination[output++] = graphics::red(display_pixel);
-                destination[output++] = graphics::green(display_pixel);
-                destination[output++] = graphics::blue(display_pixel);
+                // Canvas/mutable image writes are already converted to the
+                // emulated RGB565 device representation at draw/composite
+                // time. Repeating rgb565_roundtrip() here did the same bit
+                // expansion for every published pixel, i.e. millions of
+                // redundant operations per second on larger games.
+                const graphics::Pixel display_pixel = source_pixels[source++];
+                if (format == FramePixelFormat::rgba8) {
+                    destination[output++] = graphics::red(display_pixel);
+                    destination[output++] = graphics::green(display_pixel);
+                    destination[output++] = graphics::blue(display_pixel);
+                } else {
+                    destination[output++] = graphics::blue(display_pixel);
+                    destination[output++] = graphics::green(display_pixel);
+                    destination[output++] = graphics::red(display_pixel);
+                }
                 destination[output++] = graphics::alpha(display_pixel);
             }
         }
@@ -674,11 +714,13 @@ void convert_image_region_to_rgba(
         ? *reusable_rgba
         : local_rgba;
     const Dimensions dimensions {(*image)->width(), (*image)->height()};
+    const FramePixelFormat frame_format = canvas_frame_pixel_format();
     const auto current_frame = framebuffer.metadata();
     const bool can_update_region =
         current_frame.dimensions.width == dimensions.width &&
         current_frame.dimensions.height == dimensions.height &&
-        current_frame.byte_count == (*image)->pixels().size() * 4U;
+        current_frame.byte_count == (*image)->pixels().size() * 4U &&
+        current_frame.pixel_format == frame_format;
 
     if (can_update_region) {
         const auto dirty_regions = (*image)->dirty_regions();
@@ -702,20 +744,22 @@ void convert_image_region_to_rgba(
         }
         rgba.resize(dirty_pixels * 4U);
         usize destination = 0U;
-        std::vector<FrameRegionUpdate> updates;
-        updates.reserve(use_islands ? dirty_regions.size() : 1U);
+        std::array<FrameRegionUpdate, graphics::Image::kMaximumDirtyRegions>
+            updates;
+        usize update_count = 0U;
         const auto append_region = [&](const graphics::ImageRegion& region) {
             const usize byte_start = destination;
             const usize region_pixels = static_cast<usize>(region.width) *
                                         static_cast<usize>(region.height);
             const usize region_bytes = region_pixels * 4U;
-            convert_image_region_to_rgba(
+            convert_image_region_to_frame_pixels(
                 (*image)->pixels(),
                 (*image)->width(),
                 region,
-                std::span<u8>(rgba).subspan(byte_start, region_bytes));
+                std::span<u8>(rgba).subspan(byte_start, region_bytes),
+                frame_format);
             destination += region_bytes;
-            updates.push_back(FrameRegionUpdate {
+            updates[update_count++] = FrameRegionUpdate {
                 .x = region.x,
                 .y = region.y,
                 .width = region.width,
@@ -723,7 +767,7 @@ void convert_image_region_to_rgba(
                 .rgba = std::span<const u8>(
                     rgba.data() + static_cast<std::ptrdiff_t>(byte_start),
                     destination - byte_start),
-            });
+            };
         };
         if (use_islands) {
             for (const graphics::ImageRegion& region : dirty_regions) {
@@ -732,7 +776,10 @@ void convert_image_region_to_rgba(
         } else {
             append_region(dirty);
         }
-        auto updated = framebuffer.update_regions(dimensions, updates);
+        auto updated = framebuffer.update_regions(
+            dimensions,
+            std::span<const FrameRegionUpdate>(updates.data(), update_count),
+            frame_format);
         if (!updated) return updated;
         (*image)->clear_dirty_region();
         const usize full_frame_pixels = (*image)->pixels().size();
@@ -745,7 +792,7 @@ void convert_image_region_to_rgba(
     }
 
     rgba.resize((*image)->pixels().size() * 4U);
-    convert_image_region_to_rgba(
+    convert_image_region_to_frame_pixels(
         (*image)->pixels(),
         (*image)->width(),
         graphics::ImageRegion {
@@ -754,8 +801,9 @@ void convert_image_region_to_rgba(
             .width = (*image)->width(),
             .height = (*image)->height(),
         },
-        rgba);
-    auto replaced = framebuffer.replace_exchange(dimensions, rgba);
+        rgba,
+        frame_format);
+    auto replaced = framebuffer.replace_exchange(dimensions, rgba, frame_format);
     if (replaced) {
         (*image)->clear_dirty_region();
         vm::PerformanceCounters::record_canvas_publication(
@@ -1617,8 +1665,11 @@ Status Runtime::start_midlet(SuiteId suite_id,
     // I/O is opportunistic: a missing/unwritable profile must never prevent a
     // MIDlet from launching, while a valid profile lets the next run compile
     // previously hot methods on their first invocation.
+    // Keep hot profiles generation-scoped. They only store method identities,
+    // but carrying an old profile across a materially different JIT can force
+    // newly changed compiler/deopt paths hot on the first gameplay transition.
     (void)application_vm->machine.configure_jit_profile(
-        runtime_home + "/jit/" + std::to_string(suite_id.value) + ".hot");
+        runtime_home + "/jit/v2/" + std::to_string(suite_id.value) + ".hot");
     // Launch is latency-sensitive: avoid eagerly decoding/compiling every
     // one-shot helper while still allowing sufficiently large loop-heavy
     // constructor/startApp work to benefit from native execution. The guard
@@ -1969,7 +2020,19 @@ Status Runtime::start_midlet(SuiteId suite_id,
         if (!resized) return fail_start(resized.error());
         auto foregrounded = application_vm->canvas.set_host_foreground(true);
         if (!foregrounded) return fail_start(foregrounded.error());
+        // On Web, startApp is deliberately left running on a lifecycle pthread
+        // before this entrypoint returns. A busy startApp can own Machine's
+        // execution gate for an arbitrary amount of time; a blocking host pump
+        // here therefore turns an otherwise successful launch into a deadlock
+        // (the browser cannot observe/present anything until start_midlet
+        // returns). Native hosts can keep the eager blocking pump, while Web
+        // publishes whatever complete frame is already available and lets the
+        // worker render loop retry Canvas work on its next tick.
+#if defined(PHONEME_WEB)
+        auto pumped = application_vm->canvas.try_pump();
+#else
         auto pumped = application_vm->canvas.pump();
+#endif
         if (!pumped) return fail_start(pumped.error());
     }
 
@@ -2019,13 +2082,16 @@ Status Runtime::start_midlet(SuiteId suite_id,
                           ? "MIDlet became observable while startApp continues on the lifecycle thread"
                           : "MIDlet constructor and startApp completed in the C++ VM")),
     });
-    if (suite.managed) {
+    if (suite.managed && !start_app_deferred) {
         auto verified_classes =
             application_vm->classes.verified_classes(suite.jar_path);
         std::scoped_lock lock(mutex_);
         // This cache is an optimization only. A storage error must never turn
         // a successfully started MIDlet into a launch failure; the next start
-        // simply verifies the affected classes again.
+        // simply verifies the affected classes again. Deferred startApp owns
+        // the class repository concurrently, so its verification snapshot is
+        // persisted by finalize_deferred_start() after the lifecycle thread
+        // has completed instead of blocking the host launch here.
         static_cast<void>(suite_store_.update_verified_classes(
             suite_id,
             vm::ClassRepository::verification_cache_version(),
@@ -3046,6 +3112,22 @@ std::optional<FrameReadView> Runtime::acquire_current_frame_rgba_since(
     u64 previous_generation) noexcept {
     frame_read_lease_.reset();
     auto lease = framebuffer_.acquire_rgba_since(previous_generation);
+    if (!lease) return std::nullopt;
+    const FrameMetadata metadata = lease->metadata();
+    const auto pixels = lease->pixels();
+    const auto damage_regions = lease->damage_regions();
+    frame_read_lease_.emplace(std::move(*lease));
+    return FrameReadView {
+        .pixels = pixels.data(),
+        .metadata = metadata,
+        .damage_regions = damage_regions,
+    };
+}
+
+std::optional<FrameReadView> Runtime::acquire_current_frame_native_since(
+    u64 previous_generation) noexcept {
+    frame_read_lease_.reset();
+    auto lease = framebuffer_.acquire_native_since(previous_generation);
     if (!lease) return std::nullopt;
     const FrameMetadata metadata = lease->metadata();
     const auto pixels = lease->pixels();

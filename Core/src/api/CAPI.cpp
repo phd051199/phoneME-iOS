@@ -979,6 +979,55 @@ const uint8_t* phoneme_acquire_current_frame_rgba_regions_since(
     return frame->pixels;
 }
 
+const uint8_t* phoneme_acquire_current_frame_native_regions_since(
+    PhoneMERuntimeRef runtime,
+    uint64_t previous_generation,
+    int32_t* width,
+    int32_t* height,
+    uint64_t* generation,
+    int32_t* pixel_format,
+    PhoneMEFrameDamageRegion* regions,
+    int32_t region_capacity,
+    int32_t* region_count) {
+    Runtime* instance = cast_runtime(runtime);
+    if (instance == nullptr) return nullptr;
+
+    instance->release_current_frame_rgba();
+    const auto frame = instance->acquire_current_frame_native_since(
+        previous_generation);
+    if (!frame.has_value()) return nullptr;
+    if (width != nullptr) width[0] = frame->metadata.dimensions.width;
+    if (height != nullptr) height[0] = frame->metadata.dimensions.height;
+    if (generation != nullptr) generation[0] = frame->metadata.generation;
+    if (pixel_format != nullptr) {
+        pixel_format[0] = frame->metadata.pixel_format ==
+                phoneme::runtime::FramePixelFormat::bgra8
+            ? static_cast<int32_t>(PHONEME_FRAME_PIXEL_BGRA8)
+            : static_cast<int32_t>(PHONEME_FRAME_PIXEL_RGBA8);
+    }
+    const std::size_t total_regions = frame->damage_regions.size();
+    const int32_t reported_region_count = total_regions >
+            static_cast<std::size_t>(std::numeric_limits<int32_t>::max())
+        ? std::numeric_limits<int32_t>::max()
+        : static_cast<int32_t>(total_regions);
+    if (region_count != nullptr) region_count[0] = reported_region_count;
+    if (regions != nullptr && region_capacity > 0) {
+        const std::size_t writable = std::min<std::size_t>(
+            total_regions,
+            static_cast<std::size_t>(region_capacity));
+        for (std::size_t index = 0U; index < writable; ++index) {
+            const auto& source = frame->damage_regions[index];
+            regions[index] = PhoneMEFrameDamageRegion {
+                .x = source.x,
+                .y = source.y,
+                .width = source.width,
+                .height = source.height,
+            };
+        }
+    }
+    return frame->pixels;
+}
+
 void phoneme_release_frame_rgba(PhoneMERuntimeRef runtime) {
     if (Runtime* instance = cast_runtime(runtime); instance != nullptr) {
         instance->release_current_frame_rgba();

@@ -1,6 +1,7 @@
 #include "ChoiceNatives.hpp"
 
 #include <algorithm>
+#include <array>
 #include <exception>
 #include <limits>
 #include <string>
@@ -160,6 +161,26 @@ void add(NativeMethodRegistry& registry,
     auto value = machine.heap().field(object, index);
     if (!value) return std::unexpected(value.error());
     return value->as_reference();
+}
+
+template <usize N>
+[[nodiscard]] Result<std::array<Value, N>> field_values(
+    Machine& machine,
+    ObjectRef object,
+    const std::array<usize, N>& indices) {
+    std::array<Value, N> values {};
+    auto loaded = machine.heap().read_fields(object, indices, values);
+    if (!loaded) return std::unexpected(loaded.error());
+    return values;
+}
+
+template <usize N>
+[[nodiscard]] Status set_field_values(
+    Machine& machine,
+    ObjectRef object,
+    const std::array<usize, N>& indices,
+    const std::array<Value, N>& values) {
+    return machine.heap().write_fields(object, indices, values);
 }
 
 [[nodiscard]] Status set_int_field(Machine& machine,
@@ -356,13 +377,9 @@ void append_utf8(std::string& output, u32 code_point) {
         return std::unexpected(replacement.error());
     }
     if (!current->is_null()) {
-        for (usize index = 0; index < capacity; ++index) {
-            auto value = machine.heap().element(*current, index);
-            if (!value) return std::unexpected(value.error());
-            auto stored = machine.heap().set_element(*replacement,
-                                                     index, *value);
-            if (!stored) return std::unexpected(stored.error());
-        }
+        auto copied = machine.heap().copy_array_range(
+            *current, 0U, *replacement, 0U, capacity);
+        if (!copied) return std::unexpected(copied.error());
     }
     auto assigned = set_reference_field(machine, owner, field_index,
                                         *replacement);
@@ -476,17 +493,31 @@ void append_utf8(std::string& output, u32 code_point) {
 [[nodiscard]] Result<i32> selected_index(Machine& machine,
                                          ObjectRef object,
                                          const ChoiceLayout& layout) {
-    auto type = int_field(machine, object, layout.type);
-    if (!type) return std::unexpected(type.error());
+    const std::array<usize, 3> fields {
+        layout.type,
+        layout.count,
+        layout.selected,
+    };
+    auto values = field_values(machine, object, fields);
+    if (!values) return std::unexpected(values.error());
+    auto type = (*values)[0U].as_int();
+    auto count = (*values)[1U].as_int();
+    auto selected = (*values)[2U].as_reference();
+    if (!type || !count || !selected) {
+        return fail(ErrorCode::invalid_state,
+                    "Choice selection state is invalid");
+    }
     // MIDP Choice.getSelectedIndex() is undefined for MULTIPLE choices and
     // the reference implementation returns -1 even when flags are selected.
     if (*type == kChoiceMultiple) return -1;
-    auto count = choice_count(machine, object, layout);
-    if (!count) return std::unexpected(count.error());
+    auto flags = machine.heap().read_boolean_array(*selected);
+    if (!flags) return std::unexpected(flags.error());
+    if (*count < 0 || static_cast<usize>(*count) > flags->size()) {
+        return fail(ErrorCode::invalid_state,
+                    "Choice selection storage is truncated");
+    }
     for (i32 index = 0; index < *count; ++index) {
-        auto selected = selected_at(machine, object, layout, index);
-        if (!selected) return std::unexpected(selected.error());
-        if (*selected) return index;
+        if ((*flags)[static_cast<usize>(index)] != 0U) return index;
     }
     return -1;
 }
@@ -495,18 +526,44 @@ void append_utf8(std::string& output, u32 code_point) {
                                                  ObjectRef object,
                                                  const ChoiceLayout& layout,
                                                  i32 index) {
+    auto checked = check_index(machine, object, layout, index);
+    if (!checked) return std::unexpected(checked.error());
     auto component_id = ensure_component_id(machine, object, layout);
-    auto text = choice_string(machine, object, layout, index);
-    auto selected = selected_at(machine, object, layout, index);
-    auto fit = int_field(machine, object, layout.fit_policy);
-    auto type = int_field(machine, object, layout.type);
-    auto image = choice_image(machine, object, layout, index);
     if (!component_id) return std::unexpected(component_id.error());
-    if (!text) return std::unexpected(text.error());
-    if (!selected) return std::unexpected(selected.error());
-    if (!fit) return std::unexpected(fit.error());
-    if (!type) return std::unexpected(type.error());
-    if (!image) return std::unexpected(image.error());
+
+    const std::array<usize, 5> fields {
+        layout.strings,
+        layout.images,
+        layout.selected,
+        layout.fit_policy,
+        layout.type,
+    };
+    auto values = field_values(machine, object, fields);
+    if (!values) return std::unexpected(values.error());
+    auto strings = (*values)[0U].as_reference();
+    auto images = (*values)[1U].as_reference();
+    auto selections = (*values)[2U].as_reference();
+    auto fit = (*values)[3U].as_int();
+    auto type = (*values)[4U].as_int();
+    if (!strings || !images || !selections || !fit || !type) {
+        return fail(ErrorCode::invalid_state,
+                    "Choice event state is invalid");
+    }
+
+    const usize element_index = static_cast<usize>(index);
+    auto text_value = machine.heap().element(*strings, element_index);
+    auto image_value = machine.heap().element(*images, element_index);
+    auto selected_value = machine.heap().element(*selections, element_index);
+    if (!text_value) return std::unexpected(text_value.error());
+    if (!image_value) return std::unexpected(image_value.error());
+    if (!selected_value) return std::unexpected(selected_value.error());
+    auto text = text_value->as_reference();
+    auto image = image_value->as_reference();
+    auto selected = selected_value->as_int();
+    if (!text || !image || !selected) {
+        return fail(ErrorCode::invalid_state,
+                    "Choice event element state is invalid");
+    }
     auto encoded = string_utf8(machine, *text);
     if (!encoded) return std::unexpected(encoded.error());
 
@@ -527,7 +584,7 @@ void append_utf8(std::string& output, u32 code_point) {
         .component_id = *component_id,
         .component_type = component_type(*type),
         .index = index,
-        .arguments = {*selected ? 1 : 0, 0, *fit, image_key},
+        .arguments = {*selected != 0 ? 1 : 0, 0, *fit, image_key},
         .text = std::move(*encoded),
     };
 }
@@ -555,31 +612,30 @@ void append_utf8(std::string& output, u32 code_point) {
         if (!empty) return std::unexpected(empty.error());
         label = *empty;
     }
-    auto type_stored = set_int_field(machine, group, kItemTypeField,
-                                     component_type(choice_type));
-    auto label_stored = set_reference_field(machine, group,
-                                            kItemLabelField, label);
-    auto parent_stored = set_int_field(machine, group, kItemParentField, 0);
-    auto layout_stored = set_int_field(machine, group, kItemLayoutField, 0);
-    auto listener_stored = set_reference_field(machine, group,
-                                               kItemListenerField, {});
-    auto command_count_stored = set_int_field(machine, group,
-                                              kItemCommandCountField, 0);
-    auto default_stored = set_reference_field(machine, group,
-                                              kItemDefaultCommandField, {});
-    auto preferred_width_stored = set_int_field(machine, group,
-                                                kItemPreferredWidthField, -1);
-    auto preferred_height_stored = set_int_field(machine, group,
-                                                 kItemPreferredHeightField, -1);
-    if (!type_stored) return type_stored;
-    if (!label_stored) return label_stored;
-    if (!parent_stored) return parent_stored;
-    if (!layout_stored) return layout_stored;
-    if (!listener_stored) return listener_stored;
-    if (!command_count_stored) return command_count_stored;
-    if (!default_stored) return default_stored;
-    if (!preferred_width_stored) return preferred_width_stored;
-    if (!preferred_height_stored) return preferred_height_stored;
+    constexpr std::array<usize, 9> fields {
+        kItemTypeField,
+        kItemLabelField,
+        kItemParentField,
+        kItemLayoutField,
+        kItemListenerField,
+        kItemCommandCountField,
+        kItemDefaultCommandField,
+        kItemPreferredWidthField,
+        kItemPreferredHeightField,
+    };
+    const std::array<Value, 9> values {
+        Value::from_int(component_type(choice_type)),
+        Value::from_reference(label),
+        Value::from_int(0),
+        Value::from_int(0),
+        Value::from_reference({}),
+        Value::from_int(0),
+        Value::from_reference({}),
+        Value::from_int(-1),
+        Value::from_int(-1),
+    };
+    auto initialized = set_field_values(machine, group, fields, values);
+    if (!initialized) return initialized;
     auto commands = ensure_array(machine, group, kItemCommandsField,
                                  "[Ljavax/microedition/lcdui/Command;", 4U,
                                  Value::from_reference({}));
@@ -609,23 +665,25 @@ void append_utf8(std::string& output, u32 code_point) {
         return fail_java("java/lang/OutOfMemoryError",
                          "List select command ID space is exhausted");
     }
-    auto first = set_int_field(machine, *allocated, kCommandIdField, id);
-    auto second = set_reference_field(machine, *allocated,
-                                      kCommandLabelField, *label);
-    auto third = set_reference_field(machine, *allocated,
-                                     kCommandLongLabelField, *label);
-    auto fourth = set_int_field(machine, *allocated,
-                                kCommandTypeField, 1);
-    auto fifth = set_int_field(machine, *allocated,
-                               kCommandPriorityField, 0);
-    auto sixth = set_int_field(machine, *allocated,
-                               kCommandOwnerItemField, 0);
-    if (!first) return std::unexpected(first.error());
-    if (!second) return std::unexpected(second.error());
-    if (!third) return std::unexpected(third.error());
-    if (!fourth) return std::unexpected(fourth.error());
-    if (!fifth) return std::unexpected(fifth.error());
-    if (!sixth) return std::unexpected(sixth.error());
+    constexpr std::array<usize, 6> fields {
+        kCommandIdField,
+        kCommandLabelField,
+        kCommandLongLabelField,
+        kCommandTypeField,
+        kCommandPriorityField,
+        kCommandOwnerItemField,
+    };
+    const std::array<Value, 6> values {
+        Value::from_int(id),
+        Value::from_reference(*label),
+        Value::from_reference(*label),
+        Value::from_int(1),
+        Value::from_int(0),
+        Value::from_int(0),
+    };
+    auto initialized = set_field_values(
+        machine, *allocated, fields, values);
+    if (!initialized) return std::unexpected(initialized.error());
     auto registered = machine.register_ui_component(id, *allocated);
     if (!registered) return std::unexpected(registered.error());
     auto stored = machine.class_states().set_static_field(
@@ -652,25 +710,28 @@ void append_utf8(std::string& output, u32 code_point) {
     }
     auto screen_registered = machine.register_ui_component(screen_id, list);
     if (!screen_registered) return screen_registered;
-    auto first = set_int_field(machine, list, kDisplayableIdField, screen_id);
-    auto second = set_int_field(machine, list, kDisplayableTypeField, kTypeForm);
-    auto third = set_reference_field(machine, list,
-                                     kDisplayableTitleField, title);
-    auto fourth = set_reference_field(machine, list,
-                                      kDisplayableListenerField, {});
-    auto fifth = set_int_field(machine, list,
-                               kDisplayableCommandCountField, 0);
-    auto sixth = set_int_field(machine, list, kDisplayableShownField, 0);
-    auto ticker_stored = set_reference_field(machine, list, 7U, {});
-    auto scroll_stored = set_int_field(machine, list, 8U, 0);
-    if (!first) return first;
-    if (!second) return second;
-    if (!third) return third;
-    if (!fourth) return fourth;
-    if (!fifth) return fifth;
-    if (!sixth) return sixth;
-    if (!ticker_stored) return ticker_stored;
-    if (!scroll_stored) return scroll_stored;
+    constexpr std::array<usize, 8> fields {
+        kDisplayableIdField,
+        kDisplayableTypeField,
+        kDisplayableTitleField,
+        kDisplayableListenerField,
+        kDisplayableCommandCountField,
+        kDisplayableShownField,
+        7U,
+        8U,
+    };
+    const std::array<Value, 8> values {
+        Value::from_int(screen_id),
+        Value::from_int(kTypeForm),
+        Value::from_reference(title),
+        Value::from_reference({}),
+        Value::from_int(0),
+        Value::from_int(0),
+        Value::from_reference({}),
+        Value::from_int(0),
+    };
+    auto initialized = set_field_values(machine, list, fields, values);
+    if (!initialized) return initialized;
     auto commands = ensure_array(machine, list, kDisplayableCommandsField,
                                  "[Ljavax/microedition/lcdui/Command;", 4U,
                                  Value::from_reference({}));
@@ -798,32 +859,17 @@ void append_utf8(std::string& output, u32 code_point) {
     if (!images) return std::unexpected(images.error());
     if (!fonts) return std::unexpected(fonts.error());
     if (!selected) return std::unexpected(selected.error());
-    for (i32 cursor = *count; cursor > index; --cursor) {
-        auto previous_text = machine.heap().element(
-            *strings, static_cast<usize>(cursor - 1));
-        auto previous_image = machine.heap().element(
-            *images, static_cast<usize>(cursor - 1));
-        auto previous_font = machine.heap().element(
-            *fonts, static_cast<usize>(cursor - 1));
-        auto previous_selected = machine.heap().element(
-            *selected, static_cast<usize>(cursor - 1));
-        if (!previous_text) return std::unexpected(previous_text.error());
-        if (!previous_image) return std::unexpected(previous_image.error());
-        if (!previous_font) return std::unexpected(previous_font.error());
-        if (!previous_selected)
-            return std::unexpected(previous_selected.error());
-        auto first = machine.heap().set_element(
-            *strings, static_cast<usize>(cursor), *previous_text);
-        auto second = machine.heap().set_element(
-            *images, static_cast<usize>(cursor), *previous_image);
-        auto font_stored = machine.heap().set_element(
-            *fonts, static_cast<usize>(cursor), *previous_font);
-        auto third = machine.heap().set_element(
-            *selected, static_cast<usize>(cursor), *previous_selected);
-        if (!first) return first;
-        if (!second) return second;
-        if (!font_stored) return font_stored;
-        if (!third) return third;
+    const usize shifted = static_cast<usize>(*count - index);
+    if (shifted != 0U) {
+        for (const ObjectRef array : {*strings, *images, *fonts, *selected}) {
+            auto moved = machine.heap().copy_array_range(
+                array,
+                static_cast<usize>(index),
+                array,
+                static_cast<usize>(index + 1),
+                shifted);
+            if (!moved) return moved;
+        }
     }
     auto first = machine.heap().set_element(
         *strings, static_cast<usize>(index), Value::from_reference(text));
@@ -867,31 +913,17 @@ void append_utf8(std::string& output, u32 code_point) {
     if (!images) return std::unexpected(images.error());
     if (!fonts) return std::unexpected(fonts.error());
     if (!selected) return std::unexpected(selected.error());
-    for (i32 cursor = index; cursor + 1 < *count; ++cursor) {
-        auto next_text = machine.heap().element(
-            *strings, static_cast<usize>(cursor + 1));
-        auto next_image = machine.heap().element(
-            *images, static_cast<usize>(cursor + 1));
-        auto next_font = machine.heap().element(
-            *fonts, static_cast<usize>(cursor + 1));
-        auto next_selected = machine.heap().element(
-            *selected, static_cast<usize>(cursor + 1));
-        if (!next_text) return std::unexpected(next_text.error());
-        if (!next_image) return std::unexpected(next_image.error());
-        if (!next_font) return std::unexpected(next_font.error());
-        if (!next_selected) return std::unexpected(next_selected.error());
-        auto first = machine.heap().set_element(
-            *strings, static_cast<usize>(cursor), *next_text);
-        auto second = machine.heap().set_element(
-            *images, static_cast<usize>(cursor), *next_image);
-        auto font_stored = machine.heap().set_element(
-            *fonts, static_cast<usize>(cursor), *next_font);
-        auto third = machine.heap().set_element(
-            *selected, static_cast<usize>(cursor), *next_selected);
-        if (!first) return first;
-        if (!second) return second;
-        if (!font_stored) return font_stored;
-        if (!third) return third;
+    const usize shifted = static_cast<usize>(*count - index - 1);
+    if (shifted != 0U) {
+        for (const ObjectRef array : {*strings, *images, *fonts, *selected}) {
+            auto moved = machine.heap().copy_array_range(
+                array,
+                static_cast<usize>(index + 1),
+                array,
+                static_cast<usize>(index),
+                shifted);
+            if (!moved) return moved;
+        }
     }
     auto first = machine.heap().set_element(
         *strings, static_cast<usize>(*count - 1), Value::from_reference({}));
@@ -936,20 +968,32 @@ void append_utf8(std::string& output, u32 code_point) {
                                   bool selected) {
     auto checked = check_index(machine, object, layout, index);
     if (!checked) return checked;
-    auto type = int_field(machine, object, layout.type);
-    auto count = choice_count(machine, object, layout);
-    if (!type) return std::unexpected(type.error());
-    if (!count) return std::unexpected(count.error());
+    const std::array<usize, 3> fields {
+        layout.type,
+        layout.count,
+        layout.selected,
+    };
+    auto values = field_values(machine, object, fields);
+    if (!values) return std::unexpected(values.error());
+    auto type = (*values)[0U].as_int();
+    auto count = (*values)[1U].as_int();
+    auto array = (*values)[2U].as_reference();
+    if (!type || !count || !array) {
+        return fail(ErrorCode::invalid_state,
+                    "Choice selection state is invalid");
+    }
     if (*type == kChoiceMultiple) {
-        auto stored = set_selected_raw(machine, object, layout,
-                                       index, selected);
+        auto stored = machine.heap().set_element(
+            *array, static_cast<usize>(index),
+            Value::from_int(selected ? 1 : 0));
         if (!stored) return stored;
     } else if (selected) {
-        for (i32 cursor = 0; cursor < *count; ++cursor) {
-            auto stored = set_selected_raw(machine, object, layout,
-                                           cursor, cursor == index);
-            if (!stored) return stored;
-        }
+        auto cleared = machine.heap().fill_array_range(
+            *array, 0U, static_cast<usize>(*count), Value::from_int(0));
+        if (!cleared) return cleared;
+        auto stored = machine.heap().set_element(
+            *array, static_cast<usize>(index), Value::from_int(1));
+        if (!stored) return stored;
     }
     return emit_choice_elements(machine, object);
 }
@@ -973,21 +1017,70 @@ void append_utf8(std::string& output, u32 code_point) {
                              "Choice image array length does not match text array");
         }
     }
+
+    // Preserve the constructor's NullPointerException semantics before
+    // publishing any part of the source arrays into the Choice storage.
     for (usize index = 0; index < *count; ++index) {
         auto text_value = machine.heap().element(strings, index);
         if (!text_value) return std::unexpected(text_value.error());
         auto text = text_value->as_reference();
         if (!text) return std::unexpected(text.error());
-        ObjectRef image;
-        if (!images.is_null()) {
-            auto image_value = machine.heap().element(images, index);
-            if (!image_value) return std::unexpected(image_value.error());
-            auto parsed = image_value->as_reference();
-            if (!parsed) return std::unexpected(parsed.error());
-            image = *parsed;
+        if (text->is_null()) {
+            return fail_java("java/lang/NullPointerException",
+                             "Choice text is null");
         }
-        auto appended = append_choice(machine, object, layout, *text, image);
-        if (!appended) return std::unexpected(appended.error());
+    }
+
+    if (*count == 0U) return {};
+
+    auto destination_strings = ensure_array(
+        machine, object, layout.strings, "[Ljava/lang/String;", *count,
+        Value::from_reference({}));
+    auto destination_images = ensure_array(
+        machine, object, layout.images, "[Ljavax/microedition/lcdui/Image;",
+        *count, Value::from_reference({}));
+    auto destination_fonts = ensure_array(
+        machine, object, layout.fonts, "[Ljavax/microedition/lcdui/Font;",
+        *count, Value::from_reference({}));
+    auto destination_selected = ensure_array(
+        machine, object, layout.selected, "[Z", *count, Value::from_int(0));
+    if (!destination_strings) {
+        return std::unexpected(destination_strings.error());
+    }
+    if (!destination_images) {
+        return std::unexpected(destination_images.error());
+    }
+    if (!destination_fonts) {
+        return std::unexpected(destination_fonts.error());
+    }
+    if (!destination_selected) {
+        return std::unexpected(destination_selected.error());
+    }
+
+    auto strings_copied = machine.heap().copy_array_range(
+        strings, 0U, *destination_strings, 0U, *count);
+    if (!strings_copied) return strings_copied;
+    if (!images.is_null()) {
+        auto images_copied = machine.heap().copy_array_range(
+            images, 0U, *destination_images, 0U, *count);
+        if (!images_copied) return images_copied;
+    }
+
+    auto type = int_field(machine, object, layout.type);
+    if (!type) return std::unexpected(type.error());
+    if (*type != kChoiceMultiple) {
+        auto selected = machine.heap().set_element(
+            *destination_selected, 0U, Value::from_int(1));
+        if (!selected) return selected;
+    }
+    auto count_stored = set_int_field(
+        machine, object, layout.count, static_cast<i32>(*count));
+    if (!count_stored) return count_stored;
+
+    for (usize index = 0; index < *count; ++index) {
+        auto emitted = emit_choice_element(
+            machine, object, layout, static_cast<i32>(index));
+        if (!emitted) return emitted;
     }
     return {};
 }
@@ -1197,24 +1290,40 @@ void register_choice_methods(NativeMethodRegistry& registry,
             auto destination = reference_argument(arguments, 1U, false);
             if (!object) return std::unexpected(object.error());
             if (!destination) return std::unexpected(destination.error());
-            auto count = choice_count(machine, *object, layout);
+            const std::array<usize, 2> fields {
+                layout.count,
+                layout.selected,
+            };
+            auto values = field_values(machine, *object, fields);
+            if (!values) return std::unexpected(values.error());
+            auto count = (*values)[0U].as_int();
+            auto selected_array = (*values)[1U].as_reference();
+            if (!count || !selected_array) {
+                return fail(ErrorCode::invalid_state,
+                            "Choice selection state is invalid");
+            }
             auto length = machine.heap().array_length(*destination);
-            if (!count) return std::unexpected(count.error());
             if (!length) return std::unexpected(length.error());
             if (*length < static_cast<usize>(*count)) {
                 return fail_java("java/lang/IllegalArgumentException",
                                  "selection flags array is too short");
             }
+            auto flags = machine.heap().read_boolean_array(*selected_array);
+            if (!flags) return std::unexpected(flags.error());
+            if (*count < 0 || static_cast<usize>(*count) > flags->size()) {
+                return fail(ErrorCode::invalid_state,
+                            "Choice selection storage is truncated");
+            }
             i32 selected_count = 0;
             for (i32 index = 0; index < *count; ++index) {
-                auto selected = selected_at(machine, *object, layout, index);
-                if (!selected) return std::unexpected(selected.error());
-                auto stored = machine.heap().set_element(
-                    *destination, static_cast<usize>(index),
-                    Value::from_int(*selected ? 1 : 0));
-                if (!stored) return std::unexpected(stored.error());
-                if (*selected) ++selected_count;
+                if ((*flags)[static_cast<usize>(index)] != 0U) {
+                    ++selected_count;
+                }
             }
+            auto stored = machine.heap().write_boolean_array(
+                *destination, 0U,
+                std::span<const u8>(flags->data(), static_cast<usize>(*count)));
+            if (!stored) return std::unexpected(stored.error());
             return std::optional<Value>(Value::from_int(selected_count));
         });
     add(registry, owner, "setSelectedIndex", "(IZ)V",
@@ -1238,39 +1347,45 @@ void register_choice_methods(NativeMethodRegistry& registry,
             auto source = reference_argument(arguments, 1U, false);
             if (!object) return std::unexpected(object.error());
             if (!source) return std::unexpected(source.error());
-            auto count = choice_count(machine, *object, layout);
-            auto length = machine.heap().array_length(*source);
-            auto type = int_field(machine, *object, layout.type);
-            if (!count) return std::unexpected(count.error());
-            if (!length) return std::unexpected(length.error());
-            if (!type) return std::unexpected(type.error());
-            if (*length < static_cast<usize>(*count)) {
+            const std::array<usize, 3> fields {
+                layout.count,
+                layout.type,
+                layout.selected,
+            };
+            auto values = field_values(machine, *object, fields);
+            if (!values) return std::unexpected(values.error());
+            auto count = (*values)[0U].as_int();
+            auto type = (*values)[1U].as_int();
+            auto selected_array = (*values)[2U].as_reference();
+            if (!count || !type || !selected_array) {
+                return fail(ErrorCode::invalid_state,
+                            "Choice selection state is invalid");
+            }
+            auto source_flags = machine.heap().read_boolean_array(*source);
+            if (!source_flags) return std::unexpected(source_flags.error());
+            if (*count < 0 || source_flags->size() < static_cast<usize>(*count)) {
                 return fail_java("java/lang/IllegalArgumentException",
                                  "selection flags array is too short");
             }
             i32 first_selected = -1;
             for (i32 index = 0; index < *count; ++index) {
-                auto value = machine.heap().element(
-                    *source, static_cast<usize>(index));
-                if (!value) return std::unexpected(value.error());
-                auto flag = value->as_int();
-                if (!flag) return std::unexpected(flag.error());
-                if (*flag != 0 && first_selected < 0) first_selected = index;
-                if (*type == kChoiceMultiple) {
-                    auto stored = set_selected_raw(machine, *object, layout,
-                                                   index, *flag != 0);
-                    if (!stored) return std::unexpected(stored.error());
+                if ((*source_flags)[static_cast<usize>(index)] != 0U &&
+                    first_selected < 0) {
+                    first_selected = index;
                 }
+            }
+            std::vector<u8> normalized(static_cast<usize>(*count), 0U);
+            if (*type == kChoiceMultiple) {
+                std::copy_n(source_flags->begin(), static_cast<usize>(*count),
+                            normalized.begin());
             }
             if (*type != kChoiceMultiple && *count > 0) {
                 if (first_selected < 0) first_selected = 0;
-                for (i32 index = 0; index < *count; ++index) {
-                    auto stored = set_selected_raw(
-                        machine, *object, layout, index,
-                        index == first_selected);
-                    if (!stored) return std::unexpected(stored.error());
-                }
+                normalized[static_cast<usize>(first_selected)] = 1U;
             }
+            auto stored = machine.heap().write_boolean_array(
+                *selected_array, 0U, normalized);
+            if (!stored) return std::unexpected(stored.error());
             auto emitted = emit_choice_elements(machine, *object);
             if (!emitted) return std::unexpected(emitted.error());
             return std::optional<Value> {};
@@ -1309,11 +1424,76 @@ void register_choice_methods(NativeMethodRegistry& registry,
 Status emit_choice_elements(Machine& machine, ObjectRef choice) {
     auto layout = layout_for(machine, choice);
     if (!layout) return std::unexpected(layout.error());
-    auto count = choice_count(machine, choice, *layout);
-    if (!count) return std::unexpected(count.error());
-    for (i32 index = 0; index < *count; ++index) {
-        auto emitted = emit_choice_element(machine, choice, *layout, index);
-        if (!emitted) return emitted;
+    auto component_id = ensure_component_id(machine, choice, *layout);
+    if (!component_id) return std::unexpected(component_id.error());
+
+    const std::array<usize, 6> fields {
+        layout->strings,
+        layout->images,
+        layout->selected,
+        layout->fit_policy,
+        layout->type,
+        layout->count,
+    };
+    auto values = field_values(machine, choice, fields);
+    if (!values) return std::unexpected(values.error());
+    auto strings = (*values)[0U].as_reference();
+    auto images = (*values)[1U].as_reference();
+    auto selections = (*values)[2U].as_reference();
+    auto fit = (*values)[3U].as_int();
+    auto type = (*values)[4U].as_int();
+    auto count = (*values)[5U].as_int();
+    if (!strings || !images || !selections || !fit || !type || !count ||
+        strings->is_null() || images->is_null() || selections->is_null() ||
+        *count < 0) {
+        return fail(ErrorCode::invalid_state,
+                    "Choice element storage is invalid");
+    }
+
+    auto string_values = machine.heap().read_reference_array(*strings);
+    auto image_values = machine.heap().read_reference_array(*images);
+    auto selected_values = machine.heap().read_boolean_array(*selections);
+    if (!string_values) return std::unexpected(string_values.error());
+    if (!image_values) return std::unexpected(image_values.error());
+    if (!selected_values) return std::unexpected(selected_values.error());
+    const usize element_count = static_cast<usize>(*count);
+    if (element_count > string_values->size() ||
+        element_count > image_values->size() ||
+        element_count > selected_values->size()) {
+        return fail(ErrorCode::invalid_state,
+                    "Choice element storage is truncated");
+    }
+
+    for (usize element_index = 0U; element_index < element_count;
+         ++element_index) {
+        const ObjectRef text = (*string_values)[element_index];
+        const ObjectRef image = (*image_values)[element_index];
+        auto encoded = string_utf8(machine, text);
+        if (!encoded) return std::unexpected(encoded.error());
+
+        i32 image_key = 0;
+        if (!image.is_null() && element_index < 256U) {
+            const i64 packed =
+                (static_cast<i64>(*component_id) << 8U) |
+                static_cast<i64>(element_index);
+            if (packed > 0 &&
+                packed <= static_cast<i64>(std::numeric_limits<i32>::max())) {
+                image_key = -static_cast<i32>(packed);
+            }
+        }
+        machine.emit_ui_event(UiBridgeEvent {
+            .kind = kEventChoiceElement,
+            .component_id = *component_id,
+            .component_type = component_type(*type),
+            .index = static_cast<i32>(element_index),
+            .arguments = {
+                (*selected_values)[element_index] != 0U ? 1 : 0,
+                0,
+                *fit,
+                image_key,
+            },
+            .text = std::move(*encoded),
+        });
     }
     return {};
 }

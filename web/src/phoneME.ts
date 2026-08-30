@@ -268,7 +268,6 @@ export class PhoneMEWebRuntime {
       this.assertOk(result, "Cài đặt JAR");
       const suiteId = module.HEAP32[suitePointer >> 2];
       this.assertOk(module._phoneme_set_suite_trust(this.runtime, suiteId, 1), "Cấp quyền suite");
-      await this.flushStorage();
       return {
         id,
         suiteId,
@@ -287,7 +286,12 @@ export class PhoneMEWebRuntime {
       } catch {
         // The managed suite store already owns its private JAR copy.
       }
-      void this.flushStorage();
+      // Installation is not complete until both the managed suite and removal
+      // of the transient import file are durable in IDBFS. The old detached
+      // flush allowed the UI to launch/reload while syncfs was still running,
+      // which could leave a stale import or a partially persisted suite after
+      // a quick navigation/reload on mobile browsers.
+      await this.flushStorage();
     }
   }
 

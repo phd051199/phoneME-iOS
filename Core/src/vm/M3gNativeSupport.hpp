@@ -133,6 +133,30 @@ inline void add(NativeMethodRegistry& registry,
     return machine.class_states().resolve_field(owner, name, descriptor, is_static);
 }
 
+struct ObjectFieldSpec final {
+    std::string_view name;
+    std::string_view descriptor;
+};
+
+template <usize N>
+[[nodiscard]] inline Result<std::array<Value, N>> object_fields(
+    Machine& machine,
+    ObjectRef object,
+    std::string_view owner,
+    const std::array<ObjectFieldSpec, N>& specs) {
+    std::array<usize, N> indices {};
+    for (usize index = 0U; index < N; ++index) {
+        auto location = field_location(
+            machine, owner, specs[index].name, specs[index].descriptor);
+        if (!location) return std::unexpected(location.error());
+        indices[index] = location->index;
+    }
+    std::array<Value, N> values {};
+    auto loaded = machine.heap().read_fields(object, indices, values);
+    if (!loaded) return std::unexpected(loaded.error());
+    return values;
+}
+
 [[nodiscard]] inline Result<Value> object_field(
     Machine& machine,
     ObjectRef object,
@@ -457,11 +481,8 @@ inline void add(NativeMethodRegistry& registry,
     std::span<const float> values) {
     auto array = allocate_array(machine, "[F", values.size(), Value::from_float(0.0F));
     if (!array) return std::unexpected(array.error());
-    for (usize index = 0; index < values.size(); ++index) {
-        auto stored = machine.heap().set_element(*array, index,
-                                                 Value::from_float(values[index]));
-        if (!stored) return std::unexpected(stored.error());
-    }
+    auto stored = machine.heap().write_float_array(*array, 0U, values);
+    if (!stored) return std::unexpected(stored.error());
     return *array;
 }
 
@@ -473,22 +494,12 @@ inline void add(NativeMethodRegistry& registry,
         return fail_java("java/lang/NullPointerException",
                          std::string(operation) + " array is null");
     }
-    auto class_name = machine.heap().class_name(array);
-    auto length = machine.heap().array_length(array);
-    if (!class_name) return std::unexpected(class_name.error());
-    if (!length) return std::unexpected(length.error());
-    if (*class_name != "[F") {
+    auto result = machine.heap().read_float_array(array);
+    if (!result && result.error().code == ErrorCode::invalid_argument) {
         return fail_java("java/lang/IllegalArgumentException",
                          std::string(operation) + " requires float[]");
     }
-    std::vector<float> result(*length);
-    for (usize index = 0; index < *length; ++index) {
-        auto value = machine.heap().element(array, index);
-        if (!value) return std::unexpected(value.error());
-        auto number = value->as_float();
-        if (!number) return std::unexpected(number.error());
-        result[index] = *number;
-    }
+    if (!result) return std::unexpected(result.error());
     return result;
 }
 
@@ -497,20 +508,13 @@ inline void add(NativeMethodRegistry& registry,
     ObjectRef array,
     std::span<const float> values,
     usize offset = 0U) {
-    auto class_name = machine.heap().class_name(array);
-    auto length = machine.heap().array_length(array);
-    if (!class_name) return std::unexpected(class_name.error());
-    if (!length) return std::unexpected(length.error());
-    if (*class_name != "[F" || offset > *length || values.size() > *length - offset) {
+    auto stored = machine.heap().write_float_array(array, offset, values);
+    if (!stored && (stored.error().code == ErrorCode::invalid_argument ||
+                    stored.error().code == ErrorCode::out_of_range)) {
         return fail_java("java/lang/IllegalArgumentException",
                          "M3G float[] destination is invalid");
     }
-    for (usize index = 0; index < values.size(); ++index) {
-        auto stored = machine.heap().set_element(
-            array, offset + index, Value::from_float(values[index]));
-        if (!stored) return stored;
-    }
-    return {};
+    return stored;
 }
 
 [[nodiscard]] inline Result<ObjectRef> ensure_matrix_array(
@@ -592,10 +596,18 @@ inline void add(NativeMethodRegistry& registry,
 [[nodiscard]] inline Result<Quaternion> transformable_quaternion(
     Machine& machine,
     ObjectRef object) {
-    auto x = float_field(machine, object, kTransformable, "orientationX");
-    auto y = float_field(machine, object, kTransformable, "orientationY");
-    auto z = float_field(machine, object, kTransformable, "orientationZ");
-    auto w = float_field(machine, object, kTransformable, "orientationW");
+    constexpr std::array<ObjectFieldSpec, 4> fields {{
+        {"orientationX", "F"},
+        {"orientationY", "F"},
+        {"orientationZ", "F"},
+        {"orientationW", "F"},
+    }};
+    auto state = object_fields(machine, object, kTransformable, fields);
+    if (!state) return std::unexpected(state.error());
+    auto x = (*state)[0U].as_float();
+    auto y = (*state)[1U].as_float();
+    auto z = (*state)[2U].as_float();
+    auto w = (*state)[3U].as_float();
     if (!x) return std::unexpected(x.error());
     if (!y) return std::unexpected(y.error());
     if (!z) return std::unexpected(z.error());
@@ -629,13 +641,30 @@ inline void add(NativeMethodRegistry& registry,
 [[nodiscard]] inline Status rebuild_transformable_matrix(
     Machine& machine,
     ObjectRef object) {
-    auto tx = float_field(machine, object, kTransformable, "translationX");
-    auto ty = float_field(machine, object, kTransformable, "translationY");
-    auto tz = float_field(machine, object, kTransformable, "translationZ");
-    auto sx = float_field(machine, object, kTransformable, "scaleX");
-    auto sy = float_field(machine, object, kTransformable, "scaleY");
-    auto sz = float_field(machine, object, kTransformable, "scaleZ");
-    auto orientation = transformable_quaternion(machine, object);
+    constexpr std::array<ObjectFieldSpec, 10> fields {{
+        {"translationX", "F"},
+        {"translationY", "F"},
+        {"translationZ", "F"},
+        {"scaleX", "F"},
+        {"scaleY", "F"},
+        {"scaleZ", "F"},
+        {"orientationX", "F"},
+        {"orientationY", "F"},
+        {"orientationZ", "F"},
+        {"orientationW", "F"},
+    }};
+    auto state = object_fields(machine, object, kTransformable, fields);
+    if (!state) return std::unexpected(state.error());
+    auto tx = (*state)[0U].as_float();
+    auto ty = (*state)[1U].as_float();
+    auto tz = (*state)[2U].as_float();
+    auto sx = (*state)[3U].as_float();
+    auto sy = (*state)[4U].as_float();
+    auto sz = (*state)[5U].as_float();
+    auto ox = (*state)[6U].as_float();
+    auto oy = (*state)[7U].as_float();
+    auto oz = (*state)[8U].as_float();
+    auto ow = (*state)[9U].as_float();
     auto generic = generic_transform(machine, object);
     if (!tx) return std::unexpected(tx.error());
     if (!ty) return std::unexpected(ty.error());
@@ -643,8 +672,18 @@ inline void add(NativeMethodRegistry& registry,
     if (!sx) return std::unexpected(sx.error());
     if (!sy) return std::unexpected(sy.error());
     if (!sz) return std::unexpected(sz.error());
-    if (!orientation) return std::unexpected(orientation.error());
+    if (!ox) return std::unexpected(ox.error());
+    if (!oy) return std::unexpected(oy.error());
+    if (!oz) return std::unexpected(oz.error());
+    if (!ow) return std::unexpected(ow.error());
     if (!generic) return std::unexpected(generic.error());
+    auto orientation = normalized_quaternion(Quaternion {
+        .x = *ox,
+        .y = *oy,
+        .z = *oz,
+        .w = *ow,
+    });
+    if (!orientation) return std::unexpected(orientation.error());
     auto rotation = quaternion_matrix(*orientation);
     auto generic_matrix = transform_matrix(machine, *generic);
     if (!rotation) return std::unexpected(rotation.error());

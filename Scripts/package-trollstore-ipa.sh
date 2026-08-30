@@ -13,9 +13,9 @@ Create a TrollStore JIT-enabled .tipa from an existing phoneME device IPA.
 Usage:
   bash Scripts/package-trollstore-ipa.sh [input.ipa] [output.tipa]
 
-The output replaces distribution entitlements with a clean UTM-HV-compatible
-TrollStore set. The main binary is fake-signed with ldid and the final archive,
-ptrace bootstrap, csflags bridge and forbidden entitlements are verified.
+The output replaces distribution entitlements with a clean TrollStore-compatible
+set. The main binary is fake-signed with ldid and the final archive, safe
+CS_DEBUGGED JIT-status bridge and forbidden entitlements are verified.
 USAGE
 }
 
@@ -99,8 +99,9 @@ set_string_array_entitlement() {
 }
 
 # The package remains attachable by TrollStore/StikDebug. JIT readiness is
-# verified at runtime from the process code-signing flags (CS_DEBUGGED or
-# CS_KILL cleared); a successful child spawn alone is never treated as proof.
+# verified at runtime from the target process's CS_DEBUGGED flag only. On A12+
+# devices CS_KILL being absent is not sufficient proof that unsigned generated
+# code can execute.
 set_boolean_entitlement "get-task-allow"
 set_boolean_entitlement "com.apple.developer.kernel.increased-memory-limit"
 set_boolean_entitlement "com.apple.developer.kernel.extended-virtual-addressing"
@@ -126,8 +127,8 @@ set_string_array_entitlement \
   "AppleNVMeEANClient" \
   "ASPToolPathDriverUserClient"
 
-# TrollStore rejects these on newer A12+ devices and the ptrace-child path does
-# not require them.
+# TrollStore rejects these on newer A12+ devices. JIT is granted externally by
+# TrollStore's supported attach flow instead.
 delete_entitlement "dynamic-codesigning"
 delete_entitlement "com.apple.private.cs.debugger"
 delete_entitlement "com.apple.private.skip-library-validation"
@@ -196,11 +197,10 @@ nm -gU "$VERIFY_BINARY" | \
     echo "The TrollStore binary is missing the safe JIT status bridge." >&2
     exit 1
   }
-strings -a "$VERIFY_BINARY" | \
-  grep -- '--phoneme-trollstore-jit-child' >/dev/null || {
-    echo "The TrollStore binary is missing the UTM-compatible ptrace child." >&2
-    exit 1
-  }
+if strings -a "$VERIFY_BINARY" | grep -q -- '--phoneme-trollstore-jit-child'; then
+  echo "The TrollStore binary still contains the unsafe self-JIT child path." >&2
+  exit 1
+fi
 
 TIPA_SIZE="$(du -h "$OUTPUT_TIPA" | awk '{print $1}')"
 SHA256="$(shasum -a 256 "$OUTPUT_TIPA" | awk '{print $1}')"
@@ -210,8 +210,8 @@ TrollStore JIT-enabled package created successfully.
 Input: $INPUT_IPA
 Output: $OUTPUT_TIPA
 Architecture: $ARCH_INFO
-Entitlements: UTM-HV-compatible no-sandbox platform package
-JIT activation: ptrace child + csflags status (no launch-time code execution)
+Entitlements: TrollStore no-sandbox platform package
+JIT activation: TrollStore external attach + CS_DEBUGGED status
 Size: $TIPA_SIZE
 SHA-256: $SHA256
 RESULT

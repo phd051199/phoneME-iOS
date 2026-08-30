@@ -7,10 +7,11 @@ PROJECT_PATH="$REPO_ROOT/phoneME.xcodeproj"
 SCHEME="${SCHEME:-phoneME}"
 CONFIGURATION="Release"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$REPO_ROOT/Artifacts}"
-OUTPUT_TIPA="${OUTPUT_TIPA:-$OUTPUT_ROOT/phoneME-TrollStore-JIT.tipa}"
-DERIVED_DATA="${DERIVED_DATA:-$REPO_ROOT/.build/trollstore-device}"
-UNSIGNED_IPA="$OUTPUT_ROOT/phoneME-TrollStore-unsigned.ipa"
-BUILD_LOG="$OUTPUT_ROOT/phoneME-TrollStore-build.log"
+INTERPRETER_ONLY=false
+OUTPUT_TIPA="${OUTPUT_TIPA:-}"
+DERIVED_DATA="${DERIVED_DATA:-}"
+UNSIGNED_IPA=""
+BUILD_LOG=""
 REBUILD_CORE=false
 SKIP_BUILD=false
 CLEAN_BUILD=false
@@ -27,6 +28,7 @@ Options:
   --rebuild-core       Run the Core host test suite before the iPhone build.
   --clean              Remove cached device build outputs first.
   --skip-build         Repackage the last unsigned device IPA.
+  --interpreter-only   Build the same source with guest JIT disabled by default.
   --output PATH        Output .tipa path.
   --output-root PATH   Artifact directory.
   --derived-data PATH  Xcode DerivedData directory.
@@ -37,6 +39,7 @@ Environment overrides:
 
 Examples:
   bash Scripts/build-trollstore-tipa.sh
+  bash Scripts/build-trollstore-tipa.sh --interpreter-only
   bash Scripts/build-trollstore-tipa.sh --rebuild-core
   bash Scripts/build-trollstore-tipa.sh --skip-build --output ~/Desktop/phoneME.tipa
 
@@ -58,6 +61,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-build)
       SKIP_BUILD=true
+      shift
+      ;;
+    --interpreter-only)
+      INTERPRETER_ONLY=true
       shift
       ;;
     --output)
@@ -89,6 +96,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ "$INTERPRETER_ONLY" == true ]]; then
+  OUTPUT_TIPA="${OUTPUT_TIPA:-$OUTPUT_ROOT/phoneME-TrollStore-Interpreter.tipa}"
+  DERIVED_DATA="${DERIVED_DATA:-$REPO_ROOT/.build/trollstore-device-interpreter}"
+  UNSIGNED_IPA="$OUTPUT_ROOT/phoneME-TrollStore-Interpreter-unsigned.ipa"
+  BUILD_LOG="$OUTPUT_ROOT/phoneME-TrollStore-Interpreter-build.log"
+else
+  OUTPUT_TIPA="${OUTPUT_TIPA:-$OUTPUT_ROOT/phoneME-TrollStore-JIT.tipa}"
+  DERIVED_DATA="${DERIVED_DATA:-$REPO_ROOT/.build/trollstore-device}"
+  UNSIGNED_IPA="$OUTPUT_ROOT/phoneME-TrollStore-unsigned.ipa"
+  BUILD_LOG="$OUTPUT_ROOT/phoneME-TrollStore-build.log"
+fi
+
 for command in xcodebuild zip unzip find mktemp cp rm mkdir tee grep; do
   command -v "$command" >/dev/null 2>&1 || {
     echo "Required command not found: $command" >&2
@@ -114,6 +133,10 @@ if [[ "$REBUILD_CORE" == true ]]; then
 fi
 
 run_device_build() {
+  local swift_conditions='$(inherited)'
+  if [[ "$INTERPRETER_ONLY" == true ]]; then
+    swift_conditions='$(inherited) PHONEME_INTERPRETER_ONLY'
+  fi
   set +e
   set -o pipefail
   xcodebuild \
@@ -126,6 +149,7 @@ run_device_build() {
     CODE_SIGNING_REQUIRED=NO \
     CODE_SIGN_IDENTITY='' \
     TARGETED_DEVICE_FAMILY=1 \
+    "SWIFT_ACTIVE_COMPILATION_CONDITIONS=$swift_conditions" \
     'GCC_PREPROCESSOR_DEFINITIONS=$(inherited) PHONEME_TROLLSTORE_BUILD=1' \
     build \
     2>&1 | tee "$BUILD_LOG"
@@ -187,7 +211,11 @@ fi
   exit 1
 }
 
-echo "== Packaging TrollStore JIT-enabled TIPA =="
+if [[ "$INTERPRETER_ONLY" == true ]]; then
+  echo "== Packaging TrollStore interpreter-only A/B TIPA =="
+else
+  echo "== Packaging TrollStore JIT-enabled TIPA =="
+fi
 PHONEME_BASE_ENTITLEMENTS="$REPO_ROOT/phoneME/Support/phoneME.entitlements" \
   bash "$SCRIPT_DIR/package-trollstore-ipa.sh" "$UNSIGNED_IPA" "$OUTPUT_TIPA"
 

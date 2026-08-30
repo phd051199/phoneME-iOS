@@ -17,6 +17,7 @@ void require(bool condition, const char* message) {
 
 int main() {
     using phoneme::vm::AllocationPayloadKind;
+    using phoneme::vm::LockedHeapOperationKind;
     using phoneme::vm::PerformanceCounters;
 
     require(PerformanceCounters::enabled(),
@@ -34,6 +35,10 @@ int main() {
     PerformanceCounters::record_class_initialization();
     PerformanceCounters::record_instruction_budget_exit();
     PerformanceCounters::record_scheduler_quantum();
+    PerformanceCounters::observe_execution_frame_slots(8U, 12U, false, false);
+    PerformanceCounters::observe_execution_frame_slots(32U, 12U, true, false);
+    PerformanceCounters::observe_execution_frame_slots(8U, 24U, false, true);
+    PerformanceCounters::observe_execution_frame_slots(48U, 40U, true, true);
 
     PerformanceCounters::record_class_cache(true);
     PerformanceCounters::record_class_cache(false);
@@ -65,9 +70,26 @@ int main() {
     PerformanceCounters::record_allocation(
         AllocationPayloadKind::array, 128U);
     PerformanceCounters::record_failed_allocation();
-    PerformanceCounters::record_locked_heap_operation();
+    PerformanceCounters::record_locked_heap_operation(
+        LockedHeapOperationKind::allocation);
     PerformanceCounters::record_vm_fast_heap_operation();
     PerformanceCounters::record_gc(1'250U, 8U, 13U, 5U, 512U);
+    PerformanceCounters::observe_execution_root_publication(3U, false);
+    PerformanceCounters::observe_execution_root_publication(7U, true);
+    PerformanceCounters::record_verified_root_scan(true, false, 4U, 9U, 0U);
+    PerformanceCounters::record_verified_root_scan(false, true, 2U, 5U, 3U);
+    PerformanceCounters::record_verified_root_scan(false, false, 0U, 0U, 9U);
+    PerformanceCounters::record_jit_runtime_operation(7U, false);
+    PerformanceCounters::record_jit_runtime_operation(7U, true);
+    PerformanceCounters::observe_jit_call_operands(3U, false);
+    PerformanceCounters::observe_jit_call_operands(11U, true);
+    PerformanceCounters::record_jit_root_stage();
+    PerformanceCounters::record_jit_root_stage();
+    PerformanceCounters::record_jit_root_stage_commit();
+    PerformanceCounters::observe_jit_staged_root_materialization(5U);
+    PerformanceCounters::observe_jit_staged_root_materialization(2U);
+    PerformanceCounters::observe_jit_staged_reference_slots(9U, false);
+    PerformanceCounters::observe_jit_staged_reference_slots(3U, true);
 
     PerformanceCounters::record_scheduler_state_transition();
     PerformanceCounters::record_scheduler_queue_erase_scan(9U);
@@ -89,6 +111,41 @@ int main() {
             "native invocation count");
     require(snapshot.maximum_java_call_depth == 7U,
             "maximum Java call depth");
+    require(snapshot.oversized_execution_frames == 3U &&
+                snapshot.local_slot_storage_fallbacks == 2U &&
+                snapshot.operand_slot_storage_fallbacks == 2U &&
+                snapshot.maximum_frame_local_slots == 48U &&
+                snapshot.maximum_frame_operand_slots == 40U,
+            "execution slot-storage fallback counters");
+    require(snapshot.execution_root_publications == 2U &&
+                snapshot.execution_root_copy_publications == 1U &&
+                snapshot.execution_root_exchange_publications == 1U &&
+                snapshot.execution_roots_published == 10U &&
+                snapshot.maximum_execution_roots_per_publication == 7U,
+            "execution root publication counters");
+    require(snapshot.verified_root_map_hits == 1U &&
+                snapshot.verified_root_map_partial_hits == 1U &&
+                snapshot.verified_root_map_fallbacks == 1U &&
+                snapshot.verified_root_slots_visited == 6U &&
+                snapshot.verified_root_slots_avoided == 14U &&
+                snapshot.fallback_root_slots_scanned == 12U,
+            "verified execution root-map counters");
+    require(snapshot.jit_runtime_operation_calls[7U] == 2U &&
+                snapshot.jit_runtime_safepoint_calls[7U] == 1U,
+            "JIT runtime operation histogram counters");
+    require(snapshot.jit_call_operand_decodes == 2U &&
+                snapshot.jit_call_operand_overflows == 1U &&
+                snapshot.maximum_jit_call_operand_values == 11U,
+            "JIT call operand storage counters");
+    require(snapshot.jit_root_stages == 2U &&
+                snapshot.jit_root_stage_commits == 1U,
+            "JIT deferred root publication counters");
+    require(snapshot.jit_staged_root_materializations == 2U &&
+                snapshot.jit_staged_roots_materialized == 7U,
+            "JIT staged root materialization counters");
+    require(snapshot.jit_staged_reference_slots_deferred == 9U &&
+                snapshot.jit_staged_reference_slots_scanned == 3U,
+            "JIT staged reference-slot counters");
     require(snapshot.class_cache_hits == 1U &&
                 snapshot.class_cache_misses == 1U,
             "class cache hit and miss counts");
@@ -120,6 +177,11 @@ int main() {
     require(snapshot.allocated_bytes_by_kind[
                 static_cast<phoneme::usize>(AllocationPayloadKind::array)] == 128U,
             "array allocation byte count");
+    require(snapshot.public_locked_heap_operations == 1U &&
+                snapshot.locked_heap_operations_by_kind[
+                    static_cast<phoneme::usize>(
+                        LockedHeapOperationKind::allocation)] == 1U,
+            "locked heap allocation counters");
     require(snapshot.gc_count == 1U &&
                 snapshot.gc_total_nanoseconds == 1'250U &&
                 snapshot.gc_max_pause_nanoseconds == 1'250U,

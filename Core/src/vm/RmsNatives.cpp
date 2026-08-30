@@ -28,12 +28,11 @@ constexpr usize kEnumerationIdsField = 1;
 constexpr usize kEnumerationIndexField = 2;
 constexpr usize kEnumerationDestroyedField = 3;
 constexpr usize kEnumerationKeepUpdatedField = 4;
-constexpr usize kEnumerationStateField = 5;
-constexpr usize kEnumerationStateNameIndex = 0;
-constexpr usize kEnumerationStateFilterIndex = 1;
-constexpr usize kEnumerationStateComparatorIndex = 2;
-constexpr usize kEnumerationStateStoreIndex = 3;
-constexpr usize kEnumerationStateVersionIndex = 4;
+constexpr usize kEnumerationStoreNameField = 5;
+constexpr usize kEnumerationFilterField = 6;
+constexpr usize kEnumerationComparatorField = 7;
+constexpr usize kEnumerationStoreField = 8;
+constexpr usize kEnumerationVersionField = 9;
 
 std::mutex g_open_handles_mutex;
 std::unordered_map<Machine*, std::vector<ObjectRef>> g_open_handles;
@@ -588,34 +587,26 @@ struct EnumerationContext final {
 [[nodiscard]] Result<EnumerationContext> enumeration_context(
     Machine& machine,
     ObjectRef enumeration) {
-    auto state_value = machine.heap().field(
-        enumeration, kEnumerationStateField);
-    if (!state_value) return std::unexpected(state_value.error());
-    auto state = state_value->as_reference();
-    if (!state || state->is_null()) {
-        return fail(ErrorCode::invalid_state,
-                    "RecordEnumeration context is invalid");
-    }
-    auto name_value = machine.heap().element(
-        *state, kEnumerationStateNameIndex);
-    auto filter_value = machine.heap().element(
-        *state, kEnumerationStateFilterIndex);
-    auto comparator_value = machine.heap().element(
-        *state, kEnumerationStateComparatorIndex);
-    auto store_value = machine.heap().element(
-        *state, kEnumerationStateStoreIndex);
-    auto version_value = machine.heap().element(
-        *state, kEnumerationStateVersionIndex);
-    if (!name_value || !filter_value || !comparator_value ||
-        !store_value || !version_value) {
-        return fail(ErrorCode::invalid_state,
-                    "RecordEnumeration context is incomplete");
-    }
-    auto name = name_value->as_reference();
-    auto filter = filter_value->as_reference();
-    auto comparator = comparator_value->as_reference();
-    auto store = store_value->as_reference();
-    auto version = version_value->as_int();
+    constexpr std::array<usize, 5> indices {
+        kEnumerationStoreNameField,
+        kEnumerationFilterField,
+        kEnumerationComparatorField,
+        kEnumerationStoreField,
+        kEnumerationVersionField,
+    };
+    std::array<Value, indices.size()> values {};
+    auto snapshot = machine.heap().read_fields(enumeration, indices, values);
+    if (!snapshot) return std::unexpected(snapshot.error());
+    const Value& name_value = values[0];
+    const Value& filter_value = values[1];
+    const Value& comparator_value = values[2];
+    const Value& store_value = values[3];
+    const Value& version_value = values[4];
+    auto name = name_value.as_reference();
+    auto filter = filter_value.as_reference();
+    auto comparator = comparator_value.as_reference();
+    auto store = store_value.as_reference();
+    auto version = version_value.as_int();
     if (!name || !filter || !comparator || !store || !version ||
         name->is_null() || store->is_null()) {
         return fail(ErrorCode::invalid_state,
@@ -633,17 +624,8 @@ struct EnumerationContext final {
 [[nodiscard]] Status set_enumeration_version(Machine& machine,
                                              ObjectRef enumeration,
                                              i32 version) {
-    auto state_value = machine.heap().field(
-        enumeration, kEnumerationStateField);
-    if (!state_value) return std::unexpected(state_value.error());
-    auto state = state_value->as_reference();
-    if (!state || state->is_null()) {
-        return fail(ErrorCode::invalid_state,
-                    "RecordEnumeration context is invalid");
-    }
-    return machine.heap().set_element(
-        *state, kEnumerationStateVersionIndex,
-        Value::from_int(version));
+    return machine.heap().set_field(
+        enumeration, kEnumerationVersionField, Value::from_int(version));
 }
 
 [[nodiscard]] Result<bool> filter_matches(
@@ -904,33 +886,31 @@ filtered_and_sorted_snapshot(Machine& machine,
     auto enumeration = machine.class_states().allocate_instance(
         machine.heap(),
         "javax/microedition/rms/SnapshotRecordEnumeration");
-    auto state = machine.heap().allocate_array(
-        "[Ljava/lang/Object;", 5U, Value::from_reference({}));
     if (!enumeration) return std::unexpected(enumeration.error());
-    if (!state) return std::unexpected(state.error());
-    const std::array<Value, 5> state_values {
+    constexpr std::array<usize, 5> context_indices {
+        kEnumerationStoreNameField,
+        kEnumerationFilterField,
+        kEnumerationComparatorField,
+        kEnumerationStoreField,
+        kEnumerationVersionField,
+    };
+    const std::array<Value, context_indices.size()> context_values {
         Value::from_reference(*store_name),
         Value::from_reference(filter),
         Value::from_reference(comparator),
         Value::from_reference(store),
         Value::from_int(0),
     };
-    for (usize index = 0; index < state_values.size(); ++index) {
-        auto stored = machine.heap().set_element(*state, index,
-                                                  state_values[index]);
-        if (!stored) return std::unexpected(stored.error());
-    }
+    auto context_stored = machine.heap().write_fields(
+        *enumeration, context_indices, context_values);
+    if (!context_stored) return std::unexpected(context_stored.error());
     auto destroyed_stored = machine.heap().set_field(
         *enumeration, kEnumerationDestroyedField, Value::from_int(0));
     auto keep_stored = machine.heap().set_field(
         *enumeration, kEnumerationKeepUpdatedField,
         Value::from_int(keep_updated ? 1 : 0));
-    auto state_stored = machine.heap().set_field(
-        *enumeration, kEnumerationStateField,
-        Value::from_reference(*state));
     if (!destroyed_stored) return std::unexpected(destroyed_stored.error());
     if (!keep_stored) return std::unexpected(keep_stored.error());
-    if (!state_stored) return std::unexpected(state_stored.error());
     auto populated = populate_enumeration(machine, *enumeration, true);
     if (!populated) return std::unexpected(populated.error());
     return *enumeration;
@@ -1626,9 +1606,20 @@ void register_rms_natives(NativeMethodRegistry& registry) {
             auto ids = machine.heap().set_field(
                 *enumeration, kEnumerationIdsField,
                 Value::from_reference({}));
-            auto state = machine.heap().set_field(
-                *enumeration, kEnumerationStateField,
-                Value::from_reference({}));
+            constexpr std::array<usize, 4> context_indices {
+                kEnumerationStoreNameField,
+                kEnumerationFilterField,
+                kEnumerationComparatorField,
+                kEnumerationStoreField,
+            };
+            const std::array<Value, context_indices.size()> null_context {
+                Value::from_reference({}),
+                Value::from_reference({}),
+                Value::from_reference({}),
+                Value::from_reference({}),
+            };
+            auto state = machine.heap().write_fields(
+                *enumeration, context_indices, null_context);
             if (!destroyed) return std::unexpected(destroyed.error());
             if (!records) return std::unexpected(records.error());
             if (!ids) return std::unexpected(ids.error());

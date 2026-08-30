@@ -199,6 +199,18 @@ export class PhoneMEWebRuntime {
     return await this.request<GameEntry>("installJar", { file, metadata });
   }
 
+  async recycleIdleRuntime() {
+    if (this.activeGame) return;
+    if (!this.worker && !this.directRuntime) return;
+
+    // Installing/parsing a JAR can permanently grow WebAssembly linear memory;
+    // Wasm memory cannot shrink again inside the same instance. Persist first,
+    // then discard the idle installer instance so the next MIDlet starts from
+    // a clean runtime instead of inheriting installer memory/state.
+    await this.flushStorage();
+    this.invalidateRuntime(new Error("Khởi tạo lại phoneME sau khi cài ứng dụng"));
+  }
+
   async uninstall(game: GameEntry, removeData: boolean) {
     await this.ensureReady();
     if (this.directRuntime) {
@@ -642,8 +654,12 @@ export class PhoneMEWebRuntime {
     switch (type) {
     case "tick": return 2_000;
     case "stopMidlet": return 1_000;
-    case "initialize":
-    case "launch": return 20_000;
+    case "initialize": return 20_000;
+    // Large MIDlets can spend tens of seconds in first-start verification,
+    // class indexing and static initialization, especially on mobile Safari.
+    // Treating that work as a hung Worker after 20 seconds killed a healthy
+    // launch and made freshly installed larger games appear permanently broken.
+    case "launch": return 30_000;
     case "installJar":
     case "uninstall": return 30_000;
     case "flushStorage":

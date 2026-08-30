@@ -168,15 +168,13 @@ namespace phoneme::vm::graphics_native {
         return fail_java("java/lang/IllegalArgumentException",
                          std::string(operation) + " expects int[]");
     }
+    auto values = machine.heap().read_int_array(array);
+    if (!values) return std::unexpected(values.error());
     std::vector<graphics::Pixel> result;
-    result.reserve(*length);
-    for (usize index = 0; index < *length; ++index) {
-        auto value = machine.heap().element(array, index);
-        if (!value) return std::unexpected(value.error());
-        auto integer = value->as_int();
-        if (!integer) return std::unexpected(integer.error());
+    result.reserve(values->size());
+    for (const i32 integer : *values) {
         result.push_back(static_cast<graphics::Pixel>(
-            static_cast<u32>(*integer)));
+            static_cast<u32>(integer)));
     }
     return result;
 }

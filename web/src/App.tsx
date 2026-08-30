@@ -950,14 +950,48 @@ export default function App() {
         const metadata = await readJarMetadata(file);
         installed.push(await runtime.installJar(file, metadata));
       }
-      const next = [...games, ...installed]
-        .filter((game, index, all) => all.findIndex((entry) => entry.suiteId === game.suiteId) === index);
+      const next = [...games];
+      for (const installedGame of installed) {
+        const existingIndex = next.findIndex((game) => game.suiteId === installedGame.suiteId);
+        if (existingIndex < 0) {
+          next.push(installedGame);
+          continue;
+        }
+
+        // SuiteStore deliberately keeps the same suiteId when an installed
+        // MIDlet is upgraded. Preserve our UI/profile identity, but replace all
+        // manifest/launch metadata with the newly installed JAR. Keeping the
+        // older entry here could leave mainClass/version/title stale and make
+        // an otherwise successful update impossible to launch.
+        next[existingIndex] = {
+          ...installedGame,
+          id: next[existingIndex].id
+        };
+      }
       saveGames(next);
       setSnackbar({ message: `Đã cài ${installed.length} ứng dụng`, severity: "success" });
     } catch (error) {
       setSnackbar({ message: error instanceof Error ? error.message : String(error), severity: "error" });
-      if (installed.length) saveGames([...games, ...installed]);
+      if (installed.length) {
+        const next = [...games];
+        for (const installedGame of installed) {
+          const existingIndex = next.findIndex((game) => game.suiteId === installedGame.suiteId);
+          if (existingIndex < 0) next.push(installedGame);
+          else next[existingIndex] = { ...installedGame, id: next[existingIndex].id };
+        }
+        saveGames(next);
+      }
     } finally {
+      // JAR inspection/installation can leave a large Wasm high-water mark.
+      // Start the next MIDlet in a fresh instance after all selected JARs have
+      // been persisted, rather than reusing the installer process.
+      try {
+        await runtime.recycleIdleRuntime();
+      } catch {
+        // installJar already waits for the durable IDBFS flush. Recycling is a
+        // memory/state hygiene optimization and must not turn a good install
+        // into a false UI failure if a final redundant flush is interrupted.
+      }
       setInstalling(false);
     }
   }, [games, runtime, saveGames]);

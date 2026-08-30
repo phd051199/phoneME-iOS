@@ -982,12 +982,9 @@ try_open_wireless_connection(Machine& machine,
     if (!bytes) return std::unexpected(bytes.error());
     if (bytes->empty()) return -1;
 
-    for (usize index = 0; index < bytes->size(); ++index) {
-        auto stored = set_byte(machine, destination,
-                               static_cast<usize>(offset) + index,
-                               (*bytes)[index]);
-        if (!stored) return std::unexpected(stored.error());
-    }
+    auto stored = machine.heap().write_byte_array(
+        destination, static_cast<usize>(offset), *bytes);
+    if (!stored) return std::unexpected(stored.error());
     return static_cast<i32>(bytes->size());
 }
 

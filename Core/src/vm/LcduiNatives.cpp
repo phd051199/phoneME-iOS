@@ -227,6 +227,26 @@ void add(NativeMethodRegistry& registry,
     return machine.heap().field(object, index);
 }
 
+template <usize N>
+[[nodiscard]] Result<std::array<Value, N>> field_values(
+    Machine& machine,
+    ObjectRef object,
+    const std::array<usize, N>& indices) {
+    std::array<Value, N> values {};
+    auto loaded = machine.heap().read_fields(object, indices, values);
+    if (!loaded) return std::unexpected(loaded.error());
+    return values;
+}
+
+template <usize N>
+[[nodiscard]] Status set_field_values(
+    Machine& machine,
+    ObjectRef object,
+    const std::array<usize, N>& indices,
+    const std::array<Value, N>& values) {
+    return machine.heap().write_fields(object, indices, values);
+}
+
 [[nodiscard]] Result<i32> int_field(Machine& machine,
                                     ObjectRef object,
                                     usize index) {
@@ -496,12 +516,9 @@ void append_utf8(std::string& output, u32 code_point) {
         return std::unexpected(replacement.error());
     }
     if (!current->is_null()) {
-        for (usize index = 0; index < current_capacity; ++index) {
-            auto value = machine.heap().element(*current, index);
-            if (!value) return std::unexpected(value.error());
-            auto stored = machine.heap().set_element(*replacement, index, *value);
-            if (!stored) return std::unexpected(stored.error());
-        }
+        auto copied = machine.heap().copy_array_range(
+            *current, 0U, *replacement, 0U, current_capacity);
+        if (!copied) return std::unexpected(copied.error());
     }
     auto assigned = set_reference_field(machine, owner, field_index,
                                         *replacement);
@@ -516,6 +533,22 @@ void append_utf8(std::string& output, u32 code_point) {
     return *shown != 0;
 }
 
+template <usize N>
+[[nodiscard]] Result<std::array<bool, N>> instance_matches(
+    Machine& machine,
+    ObjectRef object,
+    const std::array<std::string_view, N>& targets) {
+    auto source = machine.heap().class_name(object);
+    if (!source) return std::unexpected(source.error());
+    std::array<bool, N> result {};
+    for (usize index = 0U; index < N; ++index) {
+        auto assignable = machine.classes().is_assignable(*source, targets[index]);
+        if (!assignable) return std::unexpected(assignable.error());
+        result[index] = *assignable;
+    }
+    return result;
+}
+
 [[nodiscard]] Status initialize_displayable(Machine& machine,
                                             ObjectRef object,
                                             i32 type,
@@ -527,27 +560,26 @@ void append_utf8(std::string& output, u32 code_point) {
         if (!empty) return std::unexpected(empty.error());
         title = *empty;
     }
-    auto type_stored = set_int_field(machine, object,
-                                     kDisplayableTypeField, type);
-    auto title_stored = set_reference_field(machine, object,
-                                            kDisplayableTitleField, title);
-    auto listener_stored = set_reference_field(machine, object,
-                                               kDisplayableListenerField, {});
-    auto count_stored = set_int_field(machine, object,
-                                      kDisplayableCommandCountField, 0);
-    auto shown_stored = set_int_field(machine, object,
-                                      kDisplayableShownField, 0);
-    auto ticker_stored = set_reference_field(machine, object,
-                                             kDisplayableTickerField, {});
-    auto scroll_stored = set_int_field(machine, object,
-                                       kDisplayableScrollField, 0);
-    if (!type_stored) return type_stored;
-    if (!title_stored) return title_stored;
-    if (!listener_stored) return listener_stored;
-    if (!count_stored) return count_stored;
-    if (!shown_stored) return shown_stored;
-    if (!ticker_stored) return ticker_stored;
-    if (!scroll_stored) return scroll_stored;
+    constexpr std::array<usize, 7> fields {
+        kDisplayableTypeField,
+        kDisplayableTitleField,
+        kDisplayableListenerField,
+        kDisplayableCommandCountField,
+        kDisplayableShownField,
+        kDisplayableTickerField,
+        kDisplayableScrollField,
+    };
+    const std::array<Value, 7> values {
+        Value::from_int(type),
+        Value::from_reference(title),
+        Value::from_reference({}),
+        Value::from_int(0),
+        Value::from_int(0),
+        Value::from_reference({}),
+        Value::from_int(0),
+    };
+    auto initialized = set_field_values(machine, object, fields, values);
+    if (!initialized) return initialized;
     auto commands = ensure_reference_array(
         machine, object, kDisplayableCommandsField,
         "[Ljavax/microedition/lcdui/Command;", 4U);
@@ -566,30 +598,30 @@ void append_utf8(std::string& output, u32 code_point) {
         if (!empty) return std::unexpected(empty.error());
         label = *empty;
     }
-    auto type_stored = set_int_field(machine, item, kItemTypeField, type);
-    auto label_stored = set_reference_field(machine, item,
-                                            kItemLabelField, label);
-    auto parent_stored = set_int_field(machine, item, kItemParentField, 0);
-    auto layout_stored = set_int_field(machine, item, kItemLayoutField, 0);
-    auto listener_stored = set_reference_field(machine, item,
-                                               kItemListenerField, {});
-    auto command_count_stored = set_int_field(machine, item,
-                                              kItemCommandCountField, 0);
-    auto default_stored = set_reference_field(machine, item,
-                                              kItemDefaultCommandField, {});
-    auto preferred_width_stored = set_int_field(machine, item,
-                                                kItemPreferredWidthField, -1);
-    auto preferred_height_stored = set_int_field(machine, item,
-                                                 kItemPreferredHeightField, -1);
-    if (!type_stored) return type_stored;
-    if (!label_stored) return label_stored;
-    if (!parent_stored) return parent_stored;
-    if (!layout_stored) return layout_stored;
-    if (!listener_stored) return listener_stored;
-    if (!command_count_stored) return command_count_stored;
-    if (!default_stored) return default_stored;
-    if (!preferred_width_stored) return preferred_width_stored;
-    if (!preferred_height_stored) return preferred_height_stored;
+    constexpr std::array<usize, 9> fields {
+        kItemTypeField,
+        kItemLabelField,
+        kItemParentField,
+        kItemLayoutField,
+        kItemListenerField,
+        kItemCommandCountField,
+        kItemDefaultCommandField,
+        kItemPreferredWidthField,
+        kItemPreferredHeightField,
+    };
+    const std::array<Value, 9> values {
+        Value::from_int(type),
+        Value::from_reference(label),
+        Value::from_int(0),
+        Value::from_int(0),
+        Value::from_reference({}),
+        Value::from_int(0),
+        Value::from_reference({}),
+        Value::from_int(-1),
+        Value::from_int(-1),
+    };
+    auto initialized = set_field_values(machine, item, fields, values);
+    if (!initialized) return initialized;
     auto commands = ensure_reference_array(
         machine, item, kItemCommandsField,
         "[Ljavax/microedition/lcdui/Command;", 4U);
@@ -601,9 +633,14 @@ void append_utf8(std::string& output, u32 code_point) {
                                                  ObjectRef displayable,
                                                  i32 kind) {
     auto id = ensure_native_id(machine, displayable, kDisplayableIdField);
-    auto type = int_field(machine, displayable, kDisplayableTypeField);
-    auto title = reference_field(machine, displayable, kDisplayableTitleField);
     if (!id) return std::unexpected(id.error());
+    constexpr std::array<usize, 2> screen_fields {
+        kDisplayableTypeField, kDisplayableTitleField,
+    };
+    auto screen_state = field_values(machine, displayable, screen_fields);
+    if (!screen_state) return std::unexpected(screen_state.error());
+    auto type = (*screen_state)[0U].as_int();
+    auto title = (*screen_state)[1U].as_reference();
     if (!type) return std::unexpected(type.error());
     if (!title) return std::unexpected(title.error());
     auto title_text = utf8_string(machine, *title);
@@ -615,13 +652,20 @@ void append_utf8(std::string& output, u32 code_point) {
         .text = std::move(*title_text),
     };
     if (*type >= kTypeNullAlert && *type <= kTypeConfirmationAlert) {
-        auto alert_text = reference_field(machine, displayable,
-                                          kAlertTextField);
-        auto timeout = int_field(machine, displayable, kAlertTimeoutField);
-        auto next = reference_field(machine, displayable, kAlertNextField);
-        auto image = reference_field(machine, displayable, kAlertImageField);
-        auto image_generation = int_field(
-            machine, displayable, kAlertImageGenerationField);
+        constexpr std::array<usize, 5> alert_fields {
+            kAlertTextField,
+            kAlertTimeoutField,
+            kAlertNextField,
+            kAlertImageField,
+            kAlertImageGenerationField,
+        };
+        auto alert_state = field_values(machine, displayable, alert_fields);
+        if (!alert_state) return std::unexpected(alert_state.error());
+        auto alert_text = (*alert_state)[0U].as_reference();
+        auto timeout = (*alert_state)[1U].as_int();
+        auto next = (*alert_state)[2U].as_reference();
+        auto image = (*alert_state)[3U].as_reference();
+        auto image_generation = (*alert_state)[4U].as_int();
         if (!alert_text) return std::unexpected(alert_text.error());
         if (!timeout) return std::unexpected(timeout.error());
         if (!next) return std::unexpected(next.error());
@@ -640,8 +684,13 @@ void append_utf8(std::string& output, u32 code_point) {
         i32 image_width = 0;
         i32 image_height = 0;
         if (!image->is_null()) {
-            auto width = int_field(machine, *image, kImageWidthField);
-            auto height = int_field(machine, *image, kImageHeightField);
+            constexpr std::array<usize, 2> image_fields {
+                kImageWidthField, kImageHeightField,
+            };
+            auto image_state = field_values(machine, *image, image_fields);
+            if (!image_state) return std::unexpected(image_state.error());
+            auto width = (*image_state)[0U].as_int();
+            auto height = (*image_state)[1U].as_int();
             if (!width) return std::unexpected(width.error());
             if (!height) return std::unexpected(height.error());
             image_width = std::max(*width, 0);
@@ -675,10 +724,15 @@ void append_utf8(std::string& output, u32 code_point) {
                                                ObjectRef item,
                                                i32 kind) {
     auto id = ensure_native_id(machine, item, kItemIdField);
-    auto type = int_field(machine, item, kItemTypeField);
-    auto label = reference_field(machine, item, kItemLabelField);
-    auto parent = int_field(machine, item, kItemParentField);
     if (!id) return std::unexpected(id.error());
+    constexpr std::array<usize, 3> item_fields {
+        kItemTypeField, kItemLabelField, kItemParentField,
+    };
+    auto item_state = field_values(machine, item, item_fields);
+    if (!item_state) return std::unexpected(item_state.error());
+    auto type = (*item_state)[0U].as_int();
+    auto label = (*item_state)[1U].as_reference();
+    auto parent = (*item_state)[2U].as_int();
     if (!type) return std::unexpected(type.error());
     if (!label) return std::unexpected(label.error());
     if (!parent) return std::unexpected(parent.error());
@@ -697,10 +751,16 @@ void append_utf8(std::string& output, u32 code_point) {
         item, "javax/microedition/lcdui/CustomItem");
     if (!is_custom) return std::unexpected(is_custom.error());
     if (*is_custom) {
-        auto width = int_field(machine, item, kItemPreferredWidthField);
-        auto height = int_field(machine, item, kItemPreferredHeightField);
-        auto generation = int_field(machine, item,
-                                    kCustomItemPaintGenerationField);
+        constexpr std::array<usize, 3> custom_fields {
+            kItemPreferredWidthField,
+            kItemPreferredHeightField,
+            kCustomItemPaintGenerationField,
+        };
+        auto custom_state = field_values(machine, item, custom_fields);
+        if (!custom_state) return std::unexpected(custom_state.error());
+        auto width = (*custom_state)[0U].as_int();
+        auto height = (*custom_state)[1U].as_int();
+        auto generation = (*custom_state)[2U].as_int();
         if (!width) return std::unexpected(width.error());
         if (!height) return std::unexpected(height.error());
         if (!generation) return std::unexpected(generation.error());
@@ -713,10 +773,18 @@ void append_utf8(std::string& output, u32 code_point) {
         if (!encoded) return std::unexpected(encoded.error());
         event.detail = std::move(*encoded);
     } else if (*type == kTypeTextField) {
-        auto text = reference_field(machine, item, kTextFieldTextField);
-        auto maximum = int_field(machine, item, kTextFieldMaxSizeField);
-        auto constraints = int_field(machine, item, kTextFieldConstraintsField);
-        auto caret = int_field(machine, item, kTextFieldCaretField);
+        constexpr std::array<usize, 4> text_fields {
+            kTextFieldTextField,
+            kTextFieldMaxSizeField,
+            kTextFieldConstraintsField,
+            kTextFieldCaretField,
+        };
+        auto text_state = field_values(machine, item, text_fields);
+        if (!text_state) return std::unexpected(text_state.error());
+        auto text = (*text_state)[0U].as_reference();
+        auto maximum = (*text_state)[1U].as_int();
+        auto constraints = (*text_state)[2U].as_int();
+        auto caret = (*text_state)[3U].as_int();
         if (!text) return std::unexpected(text.error());
         if (!maximum) return std::unexpected(maximum.error());
         if (!constraints) return std::unexpected(constraints.error());
@@ -728,18 +796,30 @@ void append_utf8(std::string& output, u32 code_point) {
         event.detail = std::move(*encoded);
     } else if (*type == kTypeProgressGauge ||
                *type == kTypeInteractiveGauge) {
-        auto interactive = int_field(machine, item, kGaugeInteractiveField);
-        auto maximum = int_field(machine, item, kGaugeMaxValueField);
-        auto value = int_field(machine, item, kGaugeValueField);
+        constexpr std::array<usize, 3> gauge_fields {
+            kGaugeInteractiveField, kGaugeMaxValueField, kGaugeValueField,
+        };
+        auto gauge_state = field_values(machine, item, gauge_fields);
+        if (!gauge_state) return std::unexpected(gauge_state.error());
+        auto interactive = (*gauge_state)[0U].as_int();
+        auto maximum = (*gauge_state)[1U].as_int();
+        auto value = (*gauge_state)[2U].as_int();
         if (!interactive) return std::unexpected(interactive.error());
         if (!maximum) return std::unexpected(maximum.error());
         if (!value) return std::unexpected(value.error());
         event.arguments = {*value, *maximum, *interactive,
                            kGaugeMetadata};
     } else if (*type == kTypeDateField) {
-        auto date = reference_field(machine, item, kDateFieldDateField);
-        auto mode = int_field(machine, item, kDateFieldInputModeField);
-        auto zone = reference_field(machine, item, kDateFieldTimeZoneField);
+        constexpr std::array<usize, 3> date_fields {
+            kDateFieldDateField,
+            kDateFieldInputModeField,
+            kDateFieldTimeZoneField,
+        };
+        auto date_state = field_values(machine, item, date_fields);
+        if (!date_state) return std::unexpected(date_state.error());
+        auto date = (*date_state)[0U].as_reference();
+        auto mode = (*date_state)[1U].as_int();
+        auto zone = (*date_state)[2U].as_reference();
         if (!date) return std::unexpected(date.error());
         if (!mode) return std::unexpected(mode.error());
         if (!zone) return std::unexpected(zone.error());
@@ -758,16 +838,29 @@ void append_utf8(std::string& output, u32 code_point) {
             event.detail = std::move(*encoded);
         }
     } else if (*type == kTypeSpacer) {
-        auto width = int_field(machine, item, kSpacerWidthField);
-        auto height = int_field(machine, item, kSpacerHeightField);
+        constexpr std::array<usize, 2> spacer_fields {
+            kSpacerWidthField, kSpacerHeightField,
+        };
+        auto spacer_state = field_values(machine, item, spacer_fields);
+        if (!spacer_state) return std::unexpected(spacer_state.error());
+        auto width = (*spacer_state)[0U].as_int();
+        auto height = (*spacer_state)[1U].as_int();
         if (!width) return std::unexpected(width.error());
         if (!height) return std::unexpected(height.error());
         event.arguments = {0, 0, *width, *height};
     } else if (*type >= kTypePlainImage && *type <= kTypeButtonImage) {
-        auto image = reference_field(machine, item, kImageItemImageField);
-        auto alt = reference_field(machine, item, kImageItemAltTextField);
-        auto generation = int_field(machine, item,
-                                    kImageItemGenerationField);
+        constexpr std::array<usize, 3> image_item_fields {
+            kImageItemImageField,
+            kImageItemAltTextField,
+            kImageItemGenerationField,
+        };
+        auto image_item_state = field_values(machine, item, image_item_fields);
+        if (!image_item_state) {
+            return std::unexpected(image_item_state.error());
+        }
+        auto image = (*image_item_state)[0U].as_reference();
+        auto alt = (*image_item_state)[1U].as_reference();
+        auto generation = (*image_item_state)[2U].as_int();
         if (!image) return std::unexpected(image.error());
         if (!alt) return std::unexpected(alt.error());
         if (!generation) return std::unexpected(generation.error());
@@ -777,8 +870,13 @@ void append_utf8(std::string& output, u32 code_point) {
         i32 width = 0;
         i32 height = 0;
         if (!image->is_null()) {
-            auto image_width = int_field(machine, *image, kImageWidthField);
-            auto image_height = int_field(machine, *image, kImageHeightField);
+            constexpr std::array<usize, 2> image_fields {
+                kImageWidthField, kImageHeightField,
+            };
+            auto image_state = field_values(machine, *image, image_fields);
+            if (!image_state) return std::unexpected(image_state.error());
+            auto image_width = (*image_state)[0U].as_int();
+            auto image_height = (*image_state)[1U].as_int();
             if (!image_width) return std::unexpected(image_width.error());
             if (!image_height) return std::unexpected(image_height.error());
             width = *image_width;
@@ -793,11 +891,19 @@ void append_utf8(std::string& output, u32 code_point) {
                                                      ObjectRef item,
                                                      i32 kind) {
     auto id = ensure_native_id(machine, item, kItemIdField);
-    auto type = int_field(machine, item, kItemTypeField);
-    auto label = reference_field(machine, item, kItemLabelField);
-    auto parent = int_field(machine, item, kItemParentField);
-    auto layout = int_field(machine, item, kItemLayoutField);
     if (!id) return std::unexpected(id.error());
+    constexpr std::array<usize, 4> style_fields {
+        kItemTypeField,
+        kItemLabelField,
+        kItemParentField,
+        kItemLayoutField,
+    };
+    auto style_state = field_values(machine, item, style_fields);
+    if (!style_state) return std::unexpected(style_state.error());
+    auto type = (*style_state)[0U].as_int();
+    auto label = (*style_state)[1U].as_reference();
+    auto parent = (*style_state)[2U].as_int();
+    auto layout = (*style_state)[3U].as_int();
     if (!type) return std::unexpected(type.error());
     if (!label) return std::unexpected(label.error());
     if (!parent) return std::unexpected(parent.error());
@@ -839,13 +945,20 @@ void append_utf8(std::string& output, u32 code_point) {
     auto peer_id = ensure_native_id(machine, text_box, kTextBoxPeerIdField);
     auto screen_id = ensure_native_id(machine, text_box,
                                       kDisplayableIdField);
-    auto text = reference_field(machine, text_box, kTextBoxTextField);
-    auto maximum = int_field(machine, text_box, kTextBoxMaxSizeField);
-    auto constraints = int_field(machine, text_box,
-                                 kTextBoxConstraintsField);
-    auto caret = int_field(machine, text_box, kTextBoxCaretField);
     if (!peer_id) return std::unexpected(peer_id.error());
     if (!screen_id) return std::unexpected(screen_id.error());
+    constexpr std::array<usize, 4> text_box_fields {
+        kTextBoxTextField,
+        kTextBoxMaxSizeField,
+        kTextBoxConstraintsField,
+        kTextBoxCaretField,
+    };
+    auto text_box_state = field_values(machine, text_box, text_box_fields);
+    if (!text_box_state) return std::unexpected(text_box_state.error());
+    auto text = (*text_box_state)[0U].as_reference();
+    auto maximum = (*text_box_state)[1U].as_int();
+    auto constraints = (*text_box_state)[2U].as_int();
+    auto caret = (*text_box_state)[3U].as_int();
     if (!text) return std::unexpected(text.error());
     if (!maximum) return std::unexpected(maximum.error());
     if (!constraints) return std::unexpected(constraints.error());
@@ -899,13 +1012,21 @@ void append_utf8(std::string& output, u32 code_point) {
                                                   ObjectRef command,
                                                   i32 order) {
     auto id = ensure_native_id(machine, command, kCommandIdField);
-    auto label = reference_field(machine, command, kCommandLabelField);
-    auto long_label = reference_field(machine, command,
-                                      kCommandLongLabelField);
-    auto type = int_field(machine, command, kCommandTypeField);
-    auto priority = int_field(machine, command, kCommandPriorityField);
-    auto owner = int_field(machine, command, kCommandOwnerItemField);
     if (!id) return std::unexpected(id.error());
+    constexpr std::array<usize, 5> command_fields {
+        kCommandLabelField,
+        kCommandLongLabelField,
+        kCommandTypeField,
+        kCommandPriorityField,
+        kCommandOwnerItemField,
+    };
+    auto command_state = field_values(machine, command, command_fields);
+    if (!command_state) return std::unexpected(command_state.error());
+    auto label = (*command_state)[0U].as_reference();
+    auto long_label = (*command_state)[1U].as_reference();
+    auto type = (*command_state)[2U].as_int();
+    auto priority = (*command_state)[3U].as_int();
+    auto owner = (*command_state)[4U].as_int();
     if (!label) return std::unexpected(label.error());
     if (!long_label) return std::unexpected(long_label.error());
     if (!type) return std::unexpected(type.error());
@@ -947,13 +1068,15 @@ void append_utf8(std::string& output, u32 code_point) {
                                         i32 count,
                                         std::vector<ObjectRef>& output) {
     if (commands.is_null()) return {};
+    auto values = machine.heap().read_reference_array(commands);
+    if (!values) return std::unexpected(values.error());
+    if (count < 0 || static_cast<usize>(count) > values->size()) {
+        return fail(ErrorCode::invalid_state,
+                    "LCDUI command array is shorter than its count");
+    }
     for (i32 index = 0; index < count; ++index) {
-        auto value = machine.heap().element(commands,
-                                            static_cast<usize>(index));
-        if (!value) return std::unexpected(value.error());
-        auto command = value->as_reference();
-        if (!command) return std::unexpected(command.error());
-        if (!command->is_null()) output.push_back(*command);
+        const ObjectRef command = (*values)[static_cast<usize>(index)];
+        if (!command.is_null()) output.push_back(command);
     }
     return {};
 }
@@ -962,47 +1085,79 @@ void append_utf8(std::string& output, u32 code_point) {
                                    ObjectRef displayable,
                                    ObjectRef focused_item = {}) {
     machine.emit_ui_event(UiBridgeEvent {.kind = kEventCommandsReset});
-    auto commands = reference_field(machine, displayable,
-                                    kDisplayableCommandsField);
-    auto count = int_field(machine, displayable,
-                           kDisplayableCommandCountField);
-    if (!commands) return std::unexpected(commands.error());
-    if (!count) return std::unexpected(count.error());
+    constexpr std::array<usize, 2> displayable_fields {
+        kDisplayableCommandsField,
+        kDisplayableCommandCountField,
+    };
+    auto displayable_state = field_values(
+        machine, displayable, displayable_fields);
+    if (!displayable_state) return std::unexpected(displayable_state.error());
+    auto commands = (*displayable_state)[0U].as_reference();
+    auto count = (*displayable_state)[1U].as_int();
+    if (!commands || !count) {
+        return fail(ErrorCode::invalid_state,
+                    "LCDUI Displayable command state is invalid");
+    }
 
     std::vector<ObjectRef> ordered;
     ordered.reserve(static_cast<usize>(std::max(*count, 0)) + 4U);
     auto screen_added = emit_command_array(machine, *commands, *count, ordered);
     if (!screen_added) return screen_added;
     if (!focused_item.is_null()) {
-        auto item_commands = reference_field(machine, focused_item,
-                                             kItemCommandsField);
-        auto item_count = int_field(machine, focused_item,
-                                    kItemCommandCountField);
-        if (!item_commands) return std::unexpected(item_commands.error());
-        if (!item_count) return std::unexpected(item_count.error());
+        constexpr std::array<usize, 2> item_fields {
+            kItemCommandsField,
+            kItemCommandCountField,
+        };
+        auto item_state = field_values(machine, focused_item, item_fields);
+        if (!item_state) return std::unexpected(item_state.error());
+        auto item_commands = (*item_state)[0U].as_reference();
+        auto item_count = (*item_state)[1U].as_int();
+        if (!item_commands || !item_count) {
+            return fail(ErrorCode::invalid_state,
+                        "LCDUI Item command state is invalid");
+        }
         auto item_added = emit_command_array(machine, *item_commands,
                                              *item_count, ordered);
         if (!item_added) return item_added;
     }
-    std::stable_sort(ordered.begin(), ordered.end(),
-        [&machine](ObjectRef left, ObjectRef right) {
-            auto left_type = int_field(machine, left, kCommandTypeField);
-            auto right_type = int_field(machine, right, kCommandTypeField);
-            auto left_priority = int_field(machine, left, kCommandPriorityField);
-            auto right_priority = int_field(machine, right, kCommandPriorityField);
-            if (!left_type || !right_type || !left_priority || !right_priority) {
-                return left.bits < right.bits;
-            }
-            const i32 left_weight = command_weight(*left_type);
-            const i32 right_weight = command_weight(*right_type);
-            if (left_weight != right_weight) return left_weight < right_weight;
-            if (*left_priority != *right_priority) {
-                return *left_priority < *right_priority;
-            }
-            return left.bits < right.bits;
+    struct CommandSortEntry final {
+        ObjectRef command {};
+        i32 type {0};
+        i32 priority {0};
+    };
+    std::vector<CommandSortEntry> sortable;
+    sortable.reserve(ordered.size());
+    constexpr std::array<usize, 2> command_fields {
+        kCommandTypeField,
+        kCommandPriorityField,
+    };
+    for (const ObjectRef command : ordered) {
+        auto state = field_values(machine, command, command_fields);
+        if (!state) return std::unexpected(state.error());
+        auto type = (*state)[0U].as_int();
+        auto priority = (*state)[1U].as_int();
+        if (!type || !priority) {
+            return fail(ErrorCode::invalid_state,
+                        "LCDUI Command sort state is invalid");
+        }
+        sortable.push_back(CommandSortEntry {
+            .command = command,
+            .type = *type,
+            .priority = *priority,
         });
-    for (usize index = 0; index < ordered.size(); ++index) {
-        auto event = command_event(machine, ordered[index],
+    }
+    std::stable_sort(sortable.begin(), sortable.end(),
+        [](const CommandSortEntry& left, const CommandSortEntry& right) {
+            const i32 left_weight = command_weight(left.type);
+            const i32 right_weight = command_weight(right.type);
+            if (left_weight != right_weight) return left_weight < right_weight;
+            if (left.priority != right.priority) {
+                return left.priority < right.priority;
+            }
+            return left.command.bits < right.command.bits;
+        });
+    for (usize index = 0; index < sortable.size(); ++index) {
+        auto event = command_event(machine, sortable[index].command,
                                    static_cast<i32>(index));
         if (!event) return std::unexpected(event.error());
         machine.emit_ui_event(std::move(*event));
@@ -1039,17 +1194,17 @@ void append_utf8(std::string& output, u32 code_point) {
     }
     auto shown = emit_item(machine, item, kEventItemShown, index);
     if (!shown) return shown;
-    auto is_choice_group = machine.object_is_instance(
-        item, "javax/microedition/lcdui/ChoiceGroup");
-    if (!is_choice_group) return std::unexpected(is_choice_group.error());
-    if (*is_choice_group) {
+    constexpr std::array<std::string_view, 2> item_types {
+        "javax/microedition/lcdui/ChoiceGroup",
+        "javax/microedition/lcdui/CustomItem",
+    };
+    auto item_matches = instance_matches(machine, item, item_types);
+    if (!item_matches) return std::unexpected(item_matches.error());
+    if ((*item_matches)[0U]) {
         auto choices = emit_choice_elements(machine, item);
         if (!choices) return choices;
     }
-    auto is_custom = machine.object_is_instance(
-        item, "javax/microedition/lcdui/CustomItem");
-    if (!is_custom) return std::unexpected(is_custom.error());
-    if (*is_custom) {
+    if ((*item_matches)[1U]) {
         auto form_shown = is_shown(machine, form);
         if (!form_shown) return std::unexpected(form_shown.error());
         auto lifecycle = layout_custom_item(machine, item, *form_shown);
@@ -1197,12 +1352,14 @@ void append_utf8(std::string& output, u32 code_point) {
         }
     }
     if (found < 0) return {};
-    for (i32 index = found; index + 1 < *count; ++index) {
-        auto next = machine.heap().element(*commands,
-                                           static_cast<usize>(index + 1));
-        if (!next) return std::unexpected(next.error());
-        auto moved = machine.heap().set_element(
-            *commands, static_cast<usize>(index), *next);
+    const usize moved_count = static_cast<usize>(*count - found - 1);
+    if (moved_count != 0U) {
+        auto moved = machine.heap().copy_array_range(
+            *commands,
+            static_cast<usize>(found + 1),
+            *commands,
+            static_cast<usize>(found),
+            moved_count);
         if (!moved) return moved;
     }
     auto cleared = machine.heap().set_element(
@@ -1485,13 +1642,20 @@ void append_utf8(std::string& output, u32 code_point) {
     if (!is_alert) return std::unexpected(is_alert.error());
     if (!*is_alert) return {};
 
-    auto shown = int_field(machine, displayable, kDisplayableShownField);
-    auto timeout = int_field(machine, displayable, kAlertTimeoutField);
-    auto command_count = int_field(machine, displayable,
-                                   kDisplayableCommandCountField);
-    if (!shown) return std::unexpected(shown.error());
-    if (!timeout) return std::unexpected(timeout.error());
-    if (!command_count) return std::unexpected(command_count.error());
+    constexpr std::array<usize, 3> fields {
+        kDisplayableShownField,
+        kAlertTimeoutField,
+        kDisplayableCommandCountField,
+    };
+    auto state = field_values(machine, displayable, fields);
+    if (!state) return std::unexpected(state.error());
+    auto shown = (*state)[0U].as_int();
+    auto timeout = (*state)[1U].as_int();
+    auto command_count = (*state)[2U].as_int();
+    if (!shown || !timeout || !command_count) {
+        return fail(ErrorCode::invalid_state,
+                    "LCDUI Alert timeout state is invalid");
+    }
 
     if (*shown == 0 || *timeout == kAlertForever || *command_count != 1) {
         machine.cancel_lcdui_alert_timeout(displayable);
@@ -1705,11 +1869,18 @@ void append_utf8(std::string& output, u32 code_point) {
 
 [[nodiscard]] Result<ObjectRef> sole_alert_command(Machine& machine,
                                                    ObjectRef alert) {
-    auto commands = reference_field(machine, alert,
-                                    kDisplayableCommandsField);
-    auto count = int_field(machine, alert, kDisplayableCommandCountField);
-    if (!commands) return std::unexpected(commands.error());
-    if (!count) return std::unexpected(count.error());
+    constexpr std::array<usize, 2> fields {
+        kDisplayableCommandsField,
+        kDisplayableCommandCountField,
+    };
+    auto state = field_values(machine, alert, fields);
+    if (!state) return std::unexpected(state.error());
+    auto commands = (*state)[0U].as_reference();
+    auto count = (*state)[1U].as_int();
+    if (!commands || !count) {
+        return fail(ErrorCode::invalid_state,
+                    "LCDUI Alert command state is invalid");
+    }
     if (*count != 1 || commands->is_null()) {
         return fail(ErrorCode::invalid_state,
                     "timed Alert does not have exactly one command");
@@ -1948,24 +2119,27 @@ void append_utf8(std::string& output, u32 code_point) {
     auto initialized = initialize_displayable(machine, alert,
                                                *component_type, title);
     if (!initialized) return initialized;
-    auto first = set_reference_field(machine, alert, kAlertTextField,
-                                     *normalized_text);
-    auto second = set_reference_field(machine, alert, kAlertImageField, image);
-    auto third = set_reference_field(machine, alert, kAlertTypeField, type);
-    auto fourth = set_int_field(machine, alert, kAlertTimeoutField,
-                                kDefaultAlertTimeout);
-    auto fifth = set_reference_field(machine, alert, kAlertNextField, {});
-    auto sixth = set_int_field(machine, alert,
-                               kAlertImageGenerationField, 1);
-    auto indicator_stored = set_reference_field(
-        machine, alert, kAlertIndicatorField, {});
-    if (!first) return first;
-    if (!second) return second;
-    if (!third) return third;
-    if (!fourth) return fourth;
-    if (!fifth) return fifth;
-    if (!sixth) return sixth;
-    if (!indicator_stored) return indicator_stored;
+    constexpr std::array<usize, 7> alert_fields {
+        kAlertTextField,
+        kAlertImageField,
+        kAlertTypeField,
+        kAlertTimeoutField,
+        kAlertNextField,
+        kAlertImageGenerationField,
+        kAlertIndicatorField,
+    };
+    const std::array<Value, 7> alert_values {
+        Value::from_reference(*normalized_text),
+        Value::from_reference(image),
+        Value::from_reference(type),
+        Value::from_int(kDefaultAlertTimeout),
+        Value::from_reference({}),
+        Value::from_int(1),
+        Value::from_reference({}),
+    };
+    auto alert_initialized = set_field_values(
+        machine, alert, alert_fields, alert_values);
+    if (!alert_initialized) return alert_initialized;
 
     auto dismiss_field = machine.class_states().resolve_field(
         "javax/microedition/lcdui/Alert", "DISMISS_COMMAND",
@@ -2029,6 +2203,29 @@ void append_utf8(std::string& output, u32 code_point) {
     return std::clamp(value, 0, maximum);
 }
 
+[[nodiscard]] Status initialize_command_state(Machine& machine,
+                                              ObjectRef command,
+                                              ObjectRef label,
+                                              ObjectRef long_label,
+                                              i32 type,
+                                              i32 priority) {
+    constexpr std::array<usize, 5> fields {
+        kCommandLabelField,
+        kCommandLongLabelField,
+        kCommandTypeField,
+        kCommandPriorityField,
+        kCommandOwnerItemField,
+    };
+    const std::array<Value, 5> values {
+        Value::from_reference(label),
+        Value::from_reference(long_label),
+        Value::from_int(type),
+        Value::from_int(priority),
+        Value::from_int(0),
+    };
+    return set_field_values(machine, command, fields, values);
+}
+
 } // namespace
 
 void register_lcdui_natives(NativeMethodRegistry& registry) {
@@ -2050,23 +2247,9 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
             }
             auto id = ensure_native_id(machine, *command, kCommandIdField);
             if (!id) return std::unexpected(id.error());
-            auto label_stored = set_reference_field(machine, *command,
-                                                    kCommandLabelField, *label);
-            auto long_stored = set_reference_field(machine, *command,
-                                                   kCommandLongLabelField, *label);
-            auto type_stored = set_int_field(machine, *command,
-                                             kCommandTypeField, *type);
-            auto priority_stored = set_int_field(machine, *command,
-                                                 kCommandPriorityField,
-                                                 *priority);
-            auto owner_stored = set_int_field(machine, *command,
-                                              kCommandOwnerItemField, 0);
-            if (!label_stored) return std::unexpected(label_stored.error());
-            if (!long_stored) return std::unexpected(long_stored.error());
-            if (!type_stored) return std::unexpected(type_stored.error());
-            if (!priority_stored)
-                return std::unexpected(priority_stored.error());
-            if (!owner_stored) return std::unexpected(owner_stored.error());
+            auto initialized = initialize_command_state(
+                machine, *command, *label, *label, *type, *priority);
+            if (!initialized) return std::unexpected(initialized.error());
             return std::optional<Value> {};
         });
     add(registry, "javax/microedition/lcdui/Command", "<init>",
@@ -2089,22 +2272,9 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
             }
             auto id = ensure_native_id(machine, *command, kCommandIdField);
             if (!id) return std::unexpected(id.error());
-            auto first = set_reference_field(machine, *command,
-                                             kCommandLabelField, *label);
-            auto second = set_reference_field(machine, *command,
-                                              kCommandLongLabelField,
-                                              *long_label);
-            auto third = set_int_field(machine, *command,
-                                       kCommandTypeField, *type);
-            auto fourth = set_int_field(machine, *command,
-                                        kCommandPriorityField, *priority);
-            auto fifth = set_int_field(machine, *command,
-                                       kCommandOwnerItemField, 0);
-            if (!first) return std::unexpected(first.error());
-            if (!second) return std::unexpected(second.error());
-            if (!third) return std::unexpected(third.error());
-            if (!fourth) return std::unexpected(fourth.error());
-            if (!fifth) return std::unexpected(fifth.error());
+            auto initialized = initialize_command_state(
+                machine, *command, *label, *long_label, *type, *priority);
+            if (!initialized) return std::unexpected(initialized.error());
             return std::optional<Value> {};
         });
 
@@ -2382,13 +2552,15 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
                 }
             }
             if (found < 0) return std::optional<Value> {};
-            for (i32 index = found; index + 1 < *count; ++index) {
-                auto next = machine.heap().element(
-                    *commands, static_cast<usize>(index + 1));
-                if (!next) return std::unexpected(next.error());
-                auto stored = machine.heap().set_element(
-                    *commands, static_cast<usize>(index), *next);
-                if (!stored) return std::unexpected(stored.error());
+            const usize moved_count = static_cast<usize>(*count - found - 1);
+            if (moved_count != 0U) {
+                auto moved = machine.heap().copy_array_range(
+                    *commands,
+                    static_cast<usize>(found + 1),
+                    *commands,
+                    static_cast<usize>(found),
+                    moved_count);
+                if (!moved) return std::unexpected(moved.error());
             }
             auto cleared = machine.heap().set_element(
                 *commands, static_cast<usize>(*count - 1),
@@ -2555,13 +2727,13 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
                 return fail_java("java/lang/IllegalArgumentException",
                                  "Display.setCurrent alert is invalid");
             }
-            auto valid_next = machine.object_is_instance(
-                *next, "javax/microedition/lcdui/Displayable");
-            if (!valid_next) return std::unexpected(valid_next.error());
-            auto next_is_alert = machine.object_is_instance(
-                *next, "javax/microedition/lcdui/Alert");
-            if (!next_is_alert) return std::unexpected(next_is_alert.error());
-            if (!*valid_next || *next_is_alert) {
+            constexpr std::array<std::string_view, 2> next_types {
+                "javax/microedition/lcdui/Displayable",
+                "javax/microedition/lcdui/Alert",
+            };
+            auto next_matches = instance_matches(machine, *next, next_types);
+            if (!next_matches) return std::unexpected(next_matches.error());
+            if (!(*next_matches)[0U] || (*next_matches)[1U]) {
                 return fail_java("java/lang/IllegalArgumentException",
                                  "Alert return screen must be a non-Alert Displayable");
             }
@@ -2953,14 +3125,53 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
                     if (!source) return std::unexpected(source.error());
                     auto length = machine.heap().array_length(*source);
                     if (!length) return std::unexpected(length.error());
+                    if (*length > static_cast<usize>(
+                            std::numeric_limits<i32>::max())) {
+                        return fail_java("java/lang/OutOfMemoryError",
+                                         "Form item count exceeds MIDP limits");
+                    }
+
+                    // Validate the complete source before publishing it into
+                    // the new Form. Attachment/lifecycle callbacks still run
+                    // in source order below, matching repeated append().
                     for (usize index = 0; index < *length; ++index) {
                         auto value = machine.heap().element(*source, index);
                         if (!value) return std::unexpected(value.error());
                         auto item = value->as_reference();
                         if (!item) return std::unexpected(item.error());
-                        auto appended = append_item(machine, *form, *item);
-                        if (!appended)
-                            return std::unexpected(appended.error());
+                        auto valid = validate_item(machine, *item);
+                        if (!valid) return std::unexpected(valid.error());
+                    }
+
+                    if (*length != 0U) {
+                        auto destination = ensure_reference_array(
+                            machine, *form, kFormItemsField,
+                            "[Ljavax/microedition/lcdui/Item;", *length);
+                        if (!destination) {
+                            return std::unexpected(destination.error());
+                        }
+                        auto copied = machine.heap().copy_array_range(
+                            *source, 0U, *destination, 0U, *length);
+                        if (!copied) return std::unexpected(copied.error());
+                        auto count_updated = set_int_field(
+                            machine, *form, kFormItemCountField,
+                            static_cast<i32>(*length));
+                        if (!count_updated) {
+                            return std::unexpected(count_updated.error());
+                        }
+
+                        for (usize index = 0; index < *length; ++index) {
+                            auto value = machine.heap().element(*source, index);
+                            if (!value) return std::unexpected(value.error());
+                            auto item = value->as_reference();
+                            if (!item) return std::unexpected(item.error());
+                            auto attached = attach_item(
+                                machine, *form, *item,
+                                static_cast<i32>(index), true);
+                            if (!attached) {
+                                return std::unexpected(attached.error());
+                            }
+                        }
                     }
                 }
                 return std::optional<Value> {};
@@ -3109,13 +3320,15 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
                 "[Ljavax/microedition/lcdui/Item;",
                 static_cast<usize>(*count) + 1U);
             if (!items) return std::unexpected(items.error());
-            for (i32 cursor = *count; cursor > *index; --cursor) {
-                auto previous = machine.heap().element(
-                    *items, static_cast<usize>(cursor - 1));
-                if (!previous) return std::unexpected(previous.error());
-                auto stored = machine.heap().set_element(
-                    *items, static_cast<usize>(cursor), *previous);
-                if (!stored) return std::unexpected(stored.error());
+            const usize moved_count = static_cast<usize>(*count - *index);
+            if (moved_count != 0U) {
+                auto moved = machine.heap().copy_array_range(
+                    *items,
+                    static_cast<usize>(*index),
+                    *items,
+                    static_cast<usize>(*index + 1),
+                    moved_count);
+                if (!moved) return std::unexpected(moved.error());
             }
             auto stored = machine.heap().set_element(
                 *items, static_cast<usize>(*index),
@@ -3160,13 +3373,15 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
             if (!parent_cleared)
                 return std::unexpected(parent_cleared.error());
             machine.unregister_ui_component(*removed_id);
-            for (i32 cursor = *index; cursor + 1 < *count; ++cursor) {
-                auto next = machine.heap().element(
-                    *items, static_cast<usize>(cursor + 1));
-                if (!next) return std::unexpected(next.error());
-                auto stored = machine.heap().set_element(
-                    *items, static_cast<usize>(cursor), *next);
-                if (!stored) return std::unexpected(stored.error());
+            const usize moved_count = static_cast<usize>(*count - *index - 1);
+            if (moved_count != 0U) {
+                auto moved = machine.heap().copy_array_range(
+                    *items,
+                    static_cast<usize>(*index + 1),
+                    *items,
+                    static_cast<usize>(*index),
+                    moved_count);
+                if (!moved) return std::unexpected(moved.error());
             }
             auto cleared = machine.heap().set_element(
                 *items, static_cast<usize>(*count - 1),
@@ -3208,11 +3423,9 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
             if (!items) return std::unexpected(items.error());
             auto length = machine.heap().array_length(*items);
             if (!length) return std::unexpected(length.error());
-            for (usize index = 0; index < *length; ++index) {
-                auto cleared = machine.heap().set_element(
-                    *items, index, Value::from_reference({}));
-                if (!cleared) return std::unexpected(cleared.error());
-            }
+            auto cleared = machine.heap().fill_array_range(
+                *items, 0U, *length, Value::from_reference({}));
+            if (!cleared) return std::unexpected(cleared.error());
             auto count_stored = set_int_field(machine, *form,
                                               kFormItemCountField, 0);
             if (!count_stored)
@@ -3413,23 +3626,24 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
             auto initialized = initialize_item(machine, *item,
                                                kTypeTextField, *label);
             if (!initialized) return std::unexpected(initialized.error());
-            auto first = set_reference_field(machine, *item,
-                                             kTextFieldTextField,
-                                             *normalized);
-            auto second = set_int_field(machine, *item,
-                                        kTextFieldMaxSizeField, *maximum);
-            auto third = set_int_field(machine, *item,
-                                       kTextFieldConstraintsField,
-                                       *constraints);
-            auto fourth = set_int_field(machine, *item,
-                                        kTextFieldCaretField, *length);
-            auto fifth = set_reference_field(machine, *item,
-                                             kTextFieldInputModeField, {});
-            if (!first) return std::unexpected(first.error());
-            if (!second) return std::unexpected(second.error());
-            if (!third) return std::unexpected(third.error());
-            if (!fourth) return std::unexpected(fourth.error());
-            if (!fifth) return std::unexpected(fifth.error());
+            constexpr std::array<usize, 5> fields {
+                kTextFieldTextField,
+                kTextFieldMaxSizeField,
+                kTextFieldConstraintsField,
+                kTextFieldCaretField,
+                kTextFieldInputModeField,
+            };
+            const std::array<Value, 5> values {
+                Value::from_reference(*normalized),
+                Value::from_int(*maximum),
+                Value::from_int(*constraints),
+                Value::from_int(*length),
+                Value::from_reference({}),
+            };
+            auto text_initialized = set_field_values(
+                machine, *item, fields, values);
+            if (!text_initialized)
+                return std::unexpected(text_initialized.error());
             return std::optional<Value> {};
         });
     add(registry, "javax/microedition/lcdui/TextField", "getString",
@@ -3495,12 +3709,9 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
                 return fail_java("java/lang/ArrayIndexOutOfBoundsException",
                                  "TextField destination char[] is too small");
             }
-            for (usize index = 0; index < value->size(); ++index) {
-                auto stored = machine.heap().set_element(
-                    *destination, index,
-                    Value::from_int(static_cast<i32>((*value)[index])));
-                if (!stored) return std::unexpected(stored.error());
-            }
+            auto stored = machine.heap().write_char_array(
+                *destination, 0U, *value);
+            if (!stored) return std::unexpected(stored.error());
             return std::optional<Value>(Value::from_int(
                 static_cast<i32>(value->size())));
         });
@@ -3750,16 +3961,20 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
                                   : kTypeProgressGauge,
                 *label);
             if (!initialized) return std::unexpected(initialized.error());
-            auto first = set_int_field(machine, *item,
-                                       kGaugeInteractiveField,
-                                       *interactive != 0 ? 1 : 0);
-            auto second = set_int_field(machine, *item,
-                                        kGaugeMaxValueField, *maximum);
-            auto third = set_int_field(machine, *item,
-                                       kGaugeValueField, *normalized);
-            if (!first) return std::unexpected(first.error());
-            if (!second) return std::unexpected(second.error());
-            if (!third) return std::unexpected(third.error());
+            constexpr std::array<usize, 3> fields {
+                kGaugeInteractiveField,
+                kGaugeMaxValueField,
+                kGaugeValueField,
+            };
+            const std::array<Value, 3> values {
+                Value::from_int(*interactive != 0 ? 1 : 0),
+                Value::from_int(*maximum),
+                Value::from_int(*normalized),
+            };
+            auto gauge_initialized = set_field_values(
+                machine, *item, fields, values);
+            if (!gauge_initialized)
+                return std::unexpected(gauge_initialized.error());
             return std::optional<Value> {};
         });
     const auto gauge_getter = [&registry](const char* name,
@@ -4203,21 +4418,9 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
             if (!label) return std::unexpected(label.error());
             auto id = ensure_native_id(machine, *command, kCommandIdField);
             if (!id) return std::unexpected(id.error());
-            auto first = set_reference_field(machine, *command,
-                                             kCommandLabelField, *label);
-            auto second = set_reference_field(machine, *command,
-                                              kCommandLongLabelField, *label);
-            auto third = set_int_field(machine, *command,
-                                       kCommandTypeField, 4);
-            auto fourth = set_int_field(machine, *command,
-                                        kCommandPriorityField, 0);
-            auto fifth = set_int_field(machine, *command,
-                                       kCommandOwnerItemField, 0);
-            if (!first) return std::unexpected(first.error());
-            if (!second) return std::unexpected(second.error());
-            if (!third) return std::unexpected(third.error());
-            if (!fourth) return std::unexpected(fourth.error());
-            if (!fifth) return std::unexpected(fifth.error());
+            auto initialized = initialize_command_state(
+                machine, *command, *label, *label, 4, 0);
+            if (!initialized) return std::unexpected(initialized.error());
             auto field = machine.class_states().resolve_field(
                 "javax/microedition/lcdui/Alert", "DISMISS_COMMAND",
                 "Ljavax/microedition/lcdui/Command;", true);
@@ -4523,34 +4726,40 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
             auto peer = ensure_native_id(machine, *text_box,
                                          kTextBoxPeerIdField);
             if (!peer) return std::unexpected(peer.error());
-            auto first = set_reference_field(machine, *text_box,
-                                             kTextBoxTextField, *normalized);
-            auto second = set_int_field(machine, *text_box,
-                                        kTextBoxMaxSizeField, *maximum);
-            auto third = set_int_field(machine, *text_box,
-                                       kTextBoxConstraintsField,
-                                       *constraints);
-            auto fourth = set_int_field(machine, *text_box,
-                                        kTextBoxCaretField, *length);
-            auto fifth = set_reference_field(machine, *text_box,
-                                             kTextBoxInputModeField, {});
-            if (!first) return std::unexpected(first.error());
-            if (!second) return std::unexpected(second.error());
-            if (!third) return std::unexpected(third.error());
-            if (!fourth) return std::unexpected(fourth.error());
-            if (!fifth) return std::unexpected(fifth.error());
+            constexpr std::array<usize, 5> fields {
+                kTextBoxTextField,
+                kTextBoxMaxSizeField,
+                kTextBoxConstraintsField,
+                kTextBoxCaretField,
+                kTextBoxInputModeField,
+            };
+            const std::array<Value, 5> values {
+                Value::from_reference(*normalized),
+                Value::from_int(*maximum),
+                Value::from_int(*constraints),
+                Value::from_int(*length),
+                Value::from_reference({}),
+            };
+            auto text_initialized = set_field_values(
+                machine, *text_box, fields, values);
+            if (!text_initialized)
+                return std::unexpected(text_initialized.error());
 
             auto created = screen_event(machine, *text_box,
                                         kEventScreenCreated);
             if (!created) return std::unexpected(created.error());
             machine.emit_ui_event(std::move(*created));
-            auto screen_id = int_field(machine, *text_box,
-                                       kDisplayableIdField);
-            auto screen_title = reference_field(machine, *text_box,
-                                                kDisplayableTitleField);
+            constexpr std::array<usize, 2> screen_fields {
+                kDisplayableIdField,
+                kDisplayableTitleField,
+            };
+            auto screen_state = field_values(
+                machine, *text_box, screen_fields);
+            if (!screen_state) return std::unexpected(screen_state.error());
+            auto screen_id = (*screen_state)[0U].as_int();
+            auto screen_title = (*screen_state)[1U].as_reference();
             if (!screen_id) return std::unexpected(screen_id.error());
-            if (!screen_title)
-                return std::unexpected(screen_title.error());
+            if (!screen_title) return std::unexpected(screen_title.error());
             auto encoded_title = utf8_string(machine, *screen_title);
             if (!encoded_title)
                 return std::unexpected(encoded_title.error());
@@ -4636,12 +4845,9 @@ void register_lcdui_natives(NativeMethodRegistry& registry) {
                 return fail_java("java/lang/ArrayIndexOutOfBoundsException",
                                  "TextBox destination char[] is too small");
             }
-            for (usize index = 0; index < value->size(); ++index) {
-                auto stored = machine.heap().set_element(
-                    *destination, index,
-                    Value::from_int(static_cast<i32>((*value)[index])));
-                if (!stored) return std::unexpected(stored.error());
-            }
+            auto stored = machine.heap().write_char_array(
+                *destination, 0U, *value);
+            if (!stored) return std::unexpected(stored.error());
             return std::optional<Value>(Value::from_int(
                 static_cast<i32>(value->size())));
         });
@@ -5268,20 +5474,20 @@ Status replay_current_lcdui(Machine& machine) {
     if (!shown) return std::unexpected(shown.error());
     machine.emit_ui_event(std::move(*shown));
 
-    auto is_text_box = machine.object_is_instance(
-        *current, "javax/microedition/lcdui/TextBox");
-    auto is_list = machine.object_is_instance(
-        *current, "javax/microedition/lcdui/List");
-    auto is_form = machine.object_is_instance(
-        *current, "javax/microedition/lcdui/Form");
-    auto is_alert = machine.object_is_instance(
-        *current, "javax/microedition/lcdui/Alert");
-    if (!is_text_box) return std::unexpected(is_text_box.error());
-    if (!is_list) return std::unexpected(is_list.error());
-    if (!is_form) return std::unexpected(is_form.error());
-    if (!is_alert) return std::unexpected(is_alert.error());
+    constexpr std::array<std::string_view, 4> screen_types {
+        "javax/microedition/lcdui/TextBox",
+        "javax/microedition/lcdui/List",
+        "javax/microedition/lcdui/Form",
+        "javax/microedition/lcdui/Alert",
+    };
+    auto screen_matches = instance_matches(machine, *current, screen_types);
+    if (!screen_matches) return std::unexpected(screen_matches.error());
+    const bool is_text_box = (*screen_matches)[0U];
+    const bool is_list = (*screen_matches)[1U];
+    const bool is_form = (*screen_matches)[2U];
+    const bool is_alert = (*screen_matches)[3U];
 
-    if (*is_text_box) {
+    if (is_text_box) {
         auto metadata = screen_event(machine, *current, kEventScreenUpdated);
         if (!metadata) return std::unexpected(metadata.error());
         metadata->arguments = {kScreenKindTextBox, 0, 0,
@@ -5289,7 +5495,7 @@ Status replay_current_lcdui(Machine& machine) {
         machine.emit_ui_event(std::move(*metadata));
         auto emitted = emit_text_box(machine, *current, kEventItemShown);
         if (!emitted) return emitted;
-    } else if (*is_list) {
+    } else if (is_list) {
         auto metadata = screen_event(machine, *current, kEventScreenUpdated);
         if (!metadata) return std::unexpected(metadata.error());
         metadata->arguments = {kScreenKindList, 0, 0,
@@ -5315,7 +5521,7 @@ Status replay_current_lcdui(Machine& machine) {
         });
         auto choices = emit_choice_elements(machine, *current);
         if (!choices) return choices;
-    } else if (*is_form) {
+    } else if (is_form) {
         auto count = int_field(machine, *current, kFormItemCountField);
         auto items = reference_field(machine, *current, kFormItemsField);
         if (!count) return std::unexpected(count.error());
@@ -5344,7 +5550,7 @@ Status replay_current_lcdui(Machine& machine) {
         }
     }
 
-    if (*is_alert) {
+    if (is_alert) {
         auto indicator = reference_field(machine, *current,
                                          kAlertIndicatorField);
         if (!indicator) return std::unexpected(indicator.error());
@@ -5368,13 +5574,20 @@ Status pump_lcdui_alert_timeouts(Machine& machine) {
     if (!current) return std::unexpected(current.error());
     if (*current != alert) return {};
 
-    auto shown = int_field(machine, alert, kDisplayableShownField);
-    auto timeout = int_field(machine, alert, kAlertTimeoutField);
-    auto command_count = int_field(machine, alert,
-                                   kDisplayableCommandCountField);
-    if (!shown) return std::unexpected(shown.error());
-    if (!timeout) return std::unexpected(timeout.error());
-    if (!command_count) return std::unexpected(command_count.error());
+    constexpr std::array<usize, 3> fields {
+        kDisplayableShownField,
+        kAlertTimeoutField,
+        kDisplayableCommandCountField,
+    };
+    auto state = field_values(machine, alert, fields);
+    if (!state) return std::unexpected(state.error());
+    auto shown = (*state)[0U].as_int();
+    auto timeout = (*state)[1U].as_int();
+    auto command_count = (*state)[2U].as_int();
+    if (!shown || !timeout || !command_count) {
+        return fail(ErrorCode::invalid_state,
+                    "LCDUI Alert timeout state is invalid");
+    }
     if (*shown == 0 || *timeout == kAlertForever || *command_count != 1) {
         return {};
     }
@@ -5551,23 +5764,25 @@ Status handle_lcdui_action(Machine& machine,
     }
 
     if (kind == 103) {
-        auto is_text_field = machine.object_is_instance(
-            *component, "javax/microedition/lcdui/TextField");
-        auto is_text_box = machine.object_is_instance(
-            *component, "javax/microedition/lcdui/TextBox");
-        if (!is_text_field) return std::unexpected(is_text_field.error());
-        if (!is_text_box) return std::unexpected(is_text_box.error());
-        if (!*is_text_field && !*is_text_box) {
+        constexpr std::array<std::string_view, 2> text_types {
+            "javax/microedition/lcdui/TextField",
+            "javax/microedition/lcdui/TextBox",
+        };
+        auto text_matches = instance_matches(machine, *component, text_types);
+        if (!text_matches) return std::unexpected(text_matches.error());
+        const bool is_text_field = (*text_matches)[0U];
+        const bool is_text_box = (*text_matches)[1U];
+        if (!is_text_field && !is_text_box) {
             return fail(ErrorCode::invalid_argument,
                         "LCDUI text action target is not a text control");
         }
-        const usize text_field = *is_text_box
+        const usize text_field = is_text_box
             ? kTextBoxTextField : kTextFieldTextField;
-        const usize maximum_field = *is_text_box
+        const usize maximum_field = is_text_box
             ? kTextBoxMaxSizeField : kTextFieldMaxSizeField;
-        const usize caret_field = *is_text_box
+        const usize caret_field = is_text_box
             ? kTextBoxCaretField : kTextFieldCaretField;
-        const usize constraints_field = *is_text_box
+        const usize constraints_field = is_text_box
             ? kTextBoxConstraintsField : kTextFieldConstraintsField;
         auto decoded = decode_ui_utf8(text);
         if (!decoded) return std::unexpected(decoded.error());
@@ -5592,11 +5807,11 @@ Status handle_lcdui_action(Machine& machine,
         auto caret_stored = set_int_field(machine, *component,
                                           caret_field, caret);
         if (!caret_stored) return caret_stored;
-        auto emitted = *is_text_box
+        auto emitted = is_text_box
             ? emit_text_box(machine, *component, kEventItemUpdated)
             : emit_item(machine, *component, kEventItemUpdated);
         if (!emitted) return emitted;
-        if (*is_text_field) {
+        if (is_text_field) {
             return dispatch_item_state_listener(machine, *component);
         }
         return {};

@@ -117,6 +117,10 @@ int main() {
                 (*coded_metadata)->decoded->method_id == (*coded_metadata)->id &&
                 (*coded_metadata)->decoded->instructions.size() == 2U,
             "runtime method publishes immutable decoded bytecode");
+    require((*coded_metadata)->verified_frames != nullptr &&
+                !(*coded_metadata)->verified_frames->frames.empty() &&
+                (*coded_metadata)->verified_frames->max_stack == 1U,
+            "runtime method retains immutable verifier slot/reference maps");
     require((*linked_metadata)->decoded != nullptr &&
                 (*linked_metadata)->operand_resolutions != nullptr &&
                 (*linked_metadata)->operand_resolutions->size() == 2U,

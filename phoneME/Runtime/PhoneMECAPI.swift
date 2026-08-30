@@ -9,6 +9,7 @@ private final class PhoneMEMetalFrameTexturePool: @unchecked Sendable {
     private struct TextureKey: Hashable {
         let width: Int
         let height: Int
+        let pixelFormat: UInt
     }
 
     private struct TextureSlot {
@@ -30,9 +31,17 @@ private final class PhoneMEMetalFrameTexturePool: @unchecked Sendable {
         self.maximumRetainedTextures = max(maximumRetainedTextures, 2)
     }
 
-    func acquire(width: Int, height: Int) -> PhoneMEMetalFrameTextureLease? {
+    func acquire(
+        width: Int,
+        height: Int,
+        pixelFormat: MTLPixelFormat
+    ) -> PhoneMEMetalFrameTextureLease? {
         guard width > 0, height > 0 else { return nil }
-        let key = TextureKey(width: width, height: height)
+        let key = TextureKey(
+            width: width,
+            height: height,
+            pixelFormat: pixelFormat.rawValue
+        )
 
         lock.lock()
         if var bucket = available[key], let slot = bucket.popLast() {
@@ -57,7 +66,7 @@ private final class PhoneMEMetalFrameTexturePool: @unchecked Sendable {
         lock.unlock()
 
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .rgba8Unorm,
+            pixelFormat: pixelFormat,
             width: width,
             height: height,
             mipmapped: false
@@ -107,7 +116,11 @@ private final class PhoneMEMetalFrameTexturePool: @unchecked Sendable {
             lock.unlock()
             return
         }
-        let key = TextureKey(width: width, height: height)
+        let key = TextureKey(
+            width: width,
+            height: height,
+            pixelFormat: texture.pixelFormat.rawValue
+        )
         available[key, default: []].append(TextureSlot(
             texture: texture,
             generation: epoch == currentEpoch ? generation : 0,
@@ -531,7 +544,13 @@ final class PhoneMECAPI: @unchecked Sendable {
         JITStatus(rawValue: phoneme_jit_status()) ?? .unavailable
     }
 
-    static var jitEnabledByDefault: Bool { true }
+    static var jitEnabledByDefault: Bool {
+#if PHONEME_INTERPRETER_ONLY
+        false
+#else
+        true
+#endif
+    }
 
     static var isTrollStoreJITBuild: Bool {
         Bundle.main.object(forInfoDictionaryKey: trollStoreBuildInfoKey)
@@ -1390,6 +1409,7 @@ final class PhoneMECAPI: @unchecked Sendable {
         var width: Int32 = 0
         var height: Int32 = 0
         var generation: UInt64 = 0
+        var pixelFormat: Int32 = 0
         var damageCount: Int32 = 0
         let maximumDamageRegions = 32
         var currentDamageRegions: [PhoneMEFrameDamage]?
@@ -1397,12 +1417,13 @@ final class PhoneMECAPI: @unchecked Sendable {
             of: PhoneMEFrameDamageRegion.self,
             capacity: maximumDamageRegions
         ) { storage in
-            let acquired = phoneme_acquire_current_frame_rgba_regions_since(
+            let acquired = phoneme_acquire_current_frame_native_regions_since(
                 runtime.rawValue,
                 previousGeneration,
                 &width,
                 &height,
                 &generation,
+                &pixelFormat,
                 storage.baseAddress,
                 Int32(storage.count),
                 &damageCount
@@ -1429,17 +1450,27 @@ final class PhoneMECAPI: @unchecked Sendable {
         guard let pixels else {
             return nil
         }
-        defer { phoneme_release_frame_rgba(runtime.rawValue) }
 
         let frameWidth = Int(width)
         let frameHeight = Int(height)
+        let metalPixelFormat: MTLPixelFormat
+        switch pixelFormat {
+        case Int32(PHONEME_FRAME_PIXEL_BGRA8.rawValue):
+            metalPixelFormat = .bgra8Unorm
+        case Int32(PHONEME_FRAME_PIXEL_RGBA8.rawValue):
+            metalPixelFormat = .rgba8Unorm
+        default:
+            phoneme_release_frame_rgba(runtime.rawValue)
+            return nil
+        }
         guard
             width > 0,
             height > 0,
             generation != previousGeneration,
             let lease = metalFrameTexturePool.acquire(
                 width: frameWidth,
-                height: frameHeight
+                height: frameHeight,
+                pixelFormat: metalPixelFormat
             )
         else {
             return nil
@@ -1454,12 +1485,61 @@ final class PhoneMECAPI: @unchecked Sendable {
             height: frameHeight
         )
         let bytesPerRow = frameWidth * 4
+
+        // The Core framebuffer lease holds its producer mutex. For larger
+        // games, keeping that lock across MTLTexture.replace() can stall the
+        // Java paint thread behind the host upload and show up as a periodic
+        // hitch. Stage only large frames, and only the bytes that Metal will
+        // actually upload. Small classic 240x320 frames keep the zero-copy path
+        // to preserve the low-power behavior.
+        let shouldStageBeforeMetalUpload = frameWidth * frameHeight >= 128 * 1024
+        var stagedPixels: PhoneMEPixelBufferLease?
+        var framebufferLeaseReleased = false
+        var uploadPixels = UnsafeRawPointer(pixels)
+        if shouldStageBeforeMetalUpload {
+            let stage = frameBufferPool.acquire(
+                minimumCapacity: frameWidth * frameHeight * 4
+            )
+            switch uploadPlan {
+            case .full:
+                memcpy(
+                    stage.pointer,
+                    pixels,
+                    frameWidth * frameHeight * 4
+                )
+            case .regions(let regions):
+                for region in regions {
+                    let rowBytes = region.width * 4
+                    for row in 0..<region.height {
+                        let byteOffset = (
+                            (region.y + row) * frameWidth + region.x
+                        ) * 4
+                        memcpy(
+                            stage.pointer.advanced(by: byteOffset),
+                            pixels.advanced(by: byteOffset),
+                            rowBytes
+                        )
+                    }
+                }
+            }
+            phoneme_release_frame_rgba(runtime.rawValue)
+            framebufferLeaseReleased = true
+            stagedPixels = stage
+            uploadPixels = UnsafeRawPointer(stage.pointer)
+        }
+        defer {
+            _ = stagedPixels
+            if !framebufferLeaseReleased {
+                phoneme_release_frame_rgba(runtime.rawValue)
+            }
+        }
+
         switch uploadPlan {
         case .full:
             lease.texture.replace(
                 region: MTLRegionMake2D(0, 0, frameWidth, frameHeight),
                 mipmapLevel: 0,
-                withBytes: pixels,
+                withBytes: uploadPixels,
                 bytesPerRow: bytesPerRow
             )
         case .regions(let regions):
@@ -1473,7 +1553,7 @@ final class PhoneMECAPI: @unchecked Sendable {
                         region.height
                     ),
                     mipmapLevel: 0,
-                    withBytes: pixels.advanced(by: byteOffset),
+                    withBytes: uploadPixels.advanced(by: byteOffset),
                     bytesPerRow: bytesPerRow
                 )
             }

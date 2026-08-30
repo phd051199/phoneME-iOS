@@ -219,13 +219,18 @@ final class EmbeddedPhoneMEEngine: NSObject {
     private final class PollContext: @unchecked Sendable {
         var visibleScreen: VisibleScreen?
         var didReportRuntimeExit = false
-        var consecutiveIdleNativePolls = 0
-        var usesIdleNativeCadence = false
 
         let frameIntervalNanoseconds: UInt64
         let idleNativePollIntervalNanoseconds: UInt64 = 100_000_000
+        let idleCanvasPollIntervalNanoseconds: UInt64
         let idleNativePollThreshold: Int
+        let idleCanvasPollThreshold: Int
 
+        private let cadenceLock = NSLock()
+        private var consecutiveIdleNativePolls = 0
+        private var consecutiveIdleCanvasPolls = 0
+        private var usesIdleNativeCadence = false
+        private var usesIdleCanvasCadence = false
         private let framesPerSecond: UInt64
         private let wholeFrameIntervalNanoseconds: UInt64
         private let frameIntervalRemainder: UInt64
@@ -244,26 +249,87 @@ final class EmbeddedPhoneMEEngine: NSObject {
             frameIntervalNanoseconds = (
                 1_000_000_000 + UInt64(normalizedFrameRate / 2)
             ) / UInt64(normalizedFrameRate)
+            idleCanvasPollIntervalNanoseconds = max(
+                frameIntervalNanoseconds * 2,
+                50_000_000
+            )
             idleNativePollThreshold = max(normalizedFrameRate / 2, 1)
+            idleCanvasPollThreshold = max(normalizedFrameRate, 1)
         }
 
         var pollLeewayNanoseconds: UInt64 {
+            cadenceLock.lock()
+            defer { cadenceLock.unlock() }
             if usesIdleNativeCadence {
-                return 4_000_000
+                return 10_000_000
+            }
+            if usesIdleCanvasCadence {
+                return 6_000_000
             }
             return min(
-                max(frameIntervalNanoseconds / 32, 100_000),
-                500_000
+                max(frameIntervalNanoseconds / 16, 500_000),
+                2_000_000
             )
         }
 
+        func updateNativeIdle(_ isIdle: Bool) {
+            cadenceLock.lock()
+            if isIdle {
+                consecutiveIdleNativePolls += 1
+                if consecutiveIdleNativePolls >= idleNativePollThreshold {
+                    usesIdleNativeCadence = true
+                }
+                consecutiveIdleCanvasPolls = 0
+                usesIdleCanvasCadence = false
+            } else {
+                consecutiveIdleNativePolls = 0
+                usesIdleNativeCadence = false
+            }
+            cadenceLock.unlock()
+        }
+
+        func noteCanvasFrameOutcome(producedFrame: Bool) {
+            cadenceLock.lock()
+            if producedFrame {
+                consecutiveIdleCanvasPolls = 0
+                usesIdleCanvasCadence = false
+                nextActiveDeadlineNanoseconds = 0
+                remainderAccumulator = 0
+            } else if !usesIdleNativeCadence {
+                consecutiveIdleCanvasPolls += 1
+                if consecutiveIdleCanvasPolls >= idleCanvasPollThreshold {
+                    usesIdleCanvasCadence = true
+                }
+            }
+            cadenceLock.unlock()
+        }
+
+        func noteHostActivity() {
+            cadenceLock.lock()
+            consecutiveIdleCanvasPolls = 0
+            usesIdleCanvasCadence = false
+            nextActiveDeadlineNanoseconds = 0
+            remainderAccumulator = 0
+            cadenceLock.unlock()
+        }
+
         func nextPollDeadline(after nowNanoseconds: UInt64) -> DispatchTime {
+            cadenceLock.lock()
+            defer { cadenceLock.unlock() }
             if usesIdleNativeCadence {
                 nextActiveDeadlineNanoseconds = 0
                 remainderAccumulator = 0
                 return DispatchTime(
                     uptimeNanoseconds: nowNanoseconds
                         + idleNativePollIntervalNanoseconds
+                )
+            }
+            if usesIdleCanvasCadence {
+                nextActiveDeadlineNanoseconds = 0
+                remainderAccumulator = 0
+                return DispatchTime(
+                    uptimeNanoseconds: nowNanoseconds
+                        + idleCanvasPollIntervalNanoseconds
                 )
             }
 
@@ -376,6 +442,9 @@ final class EmbeddedPhoneMEEngine: NSObject {
     )
     private let pollQueue = DispatchQueue(
         label: "com.phoneme.runtime.lcdui-poll",
+        // This queue drives presentation cadence. Utility QoS can be delayed
+        // several milliseconds under load, which is visible as uneven frame
+        // delivery in heavy games even when the VM itself finishes on time.
         qos: .userInitiated
     )
     private let renderQueue = DispatchQueue(
@@ -391,6 +460,8 @@ final class EmbeddedPhoneMEEngine: NSObject {
     private var launchToken = LaunchToken()
     private var pollTimer: DispatchSourceTimer?
     private var pollTimerIsSuspended = false
+    private let activePollContextLock = NSLock()
+    private var activePollContext: PollContext?
     private var runtimeIsSuspended = false
     private var runtimeSuspensionRequested = false
     private var shouldRunInForeground = true
@@ -1740,8 +1811,27 @@ final class EmbeddedPhoneMEEngine: NSObject {
             .uptimeNanoseconds
     }
 
+    private func wakeCanvasPollingForHostActivity() {
+        activePollContextLock.lock()
+        let context = activePollContext
+        activePollContextLock.unlock()
+        guard let context else { return }
+        context.noteHostActivity()
+        pollQueue.async { [weak self] in
+            guard let self, let pollTimer = self.pollTimer,
+                  !self.pollTimerIsSuspended else {
+                return
+            }
+            pollTimer.schedule(
+                deadline: .now(),
+                leeway: .milliseconds(1)
+            )
+        }
+    }
+
     func sendKey(_ key: J2MEKey, pressed: Bool) {
         guard foregroundAppID != nil, let api, let runtime else { return }
+        wakeCanvasPollingForHostActivity()
         inputQueue.async {
             api.sendKey(runtime, key: key, pressed: pressed)
         }
@@ -1749,6 +1839,7 @@ final class EmbeddedPhoneMEEngine: NSObject {
 
     func sendPointer(x: Int32, y: Int32, action: Int32) {
         guard foregroundAppID != nil, let api, let runtime else { return }
+        wakeCanvasPollingForHostActivity()
 
         // Drag motion is a latest-value signal. Queueing every intermediate
         // coordinate can delay the eventual pointer-up and all LCDUI actions
@@ -1933,6 +2024,9 @@ final class EmbeddedPhoneMEEngine: NSObject {
         let context = PollContext(
             framesPerSecond: framePollingFramesPerSecond
         )
+        activePollContextLock.lock()
+        activePollContext = context
+        activePollContextLock.unlock()
         let renderBuffer = renderRequestBuffer
         let renderQueue = renderQueue
         let timer = DispatchSource.makeTimerSource(queue: pollQueue)
@@ -2052,17 +2146,7 @@ final class EmbeddedPhoneMEEngine: NSObject {
             let isIdleNativeScreen =
                 resolvedVisibleScreen?.usesNativeLCDUI == true
                 && lcdUIEvents.isEmpty
-            if isIdleNativeScreen {
-                context.consecutiveIdleNativePolls += 1
-                if !context.usesIdleNativeCadence,
-                   context.consecutiveIdleNativePolls
-                    >= context.idleNativePollThreshold {
-                    context.usesIdleNativeCadence = true
-                }
-            } else {
-                context.consecutiveIdleNativePolls = 0
-                context.usesIdleNativeCadence = false
-            }
+            context.updateNativeIdle(isIdleNativeScreen)
 
             if !lcdUIEvents.isEmpty {
                 DispatchQueue.main.async {
@@ -2114,6 +2198,12 @@ final class EmbeddedPhoneMEEngine: NSObject {
                             after: snapshot.previousFrameGeneration
                         )
                         : nil
+                    if snapshot.wantsFrame,
+                       snapshot.visibleScreen?.usesNativeLCDUI != true {
+                        context.noteCanvasFrameOutcome(
+                            producedFrame: frame != nil
+                        )
+                    }
                     if let frame {
                         renderBuffer.updateFrameGeneration(frame.generation)
                     }
@@ -2300,6 +2390,9 @@ final class EmbeddedPhoneMEEngine: NSObject {
         }
         pollTimer = nil
         pollTimerIsSuspended = false
+        activePollContextLock.lock()
+        activePollContext = nil
+        activePollContextLock.unlock()
         continuousInputBuffer.reset()
         renderRequestBuffer = RenderRequestBuffer()
         fpsFrameCount = 0
@@ -2322,6 +2415,9 @@ final class EmbeddedPhoneMEEngine: NSObject {
         }
         pollTimer = nil
         pollTimerIsSuspended = false
+        activePollContextLock.lock()
+        activePollContext = nil
+        activePollContextLock.unlock()
         runtimeIsSuspended = false
         runtimeSuspensionRequested = false
         continuousInputBuffer.reset()

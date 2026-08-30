@@ -5,6 +5,10 @@
 #include <cstdlib>
 #include <string_view>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 namespace phoneme::runtime {
 namespace {
 

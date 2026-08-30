@@ -210,6 +210,8 @@ public:
         std::span<u8> destination) const noexcept;
     [[nodiscard]] std::optional<FrameReadView> acquire_current_frame_rgba_since(
         u64 previous_generation) noexcept;
+    [[nodiscard]] std::optional<FrameReadView> acquire_current_frame_native_since(
+        u64 previous_generation) noexcept;
     void release_current_frame_rgba() noexcept;
     [[nodiscard]] u64 storage_generation() noexcept;
     [[nodiscard]] FrameMetadata copy_lcdui_image_rgba(

@@ -15,11 +15,7 @@ constexpr usize kGraphicsStorageLimit = std::numeric_limits<usize>::max();
 #endif
 
 [[nodiscard]] usize image_storage_bytes(const Image& image) noexcept {
-    const usize pixel_count = image.pixels().size();
-    if (pixel_count > std::numeric_limits<usize>::max() / sizeof(Pixel)) {
-        return std::numeric_limits<usize>::max();
-    }
-    return pixel_count * sizeof(Pixel);
+    return image.storage_bytes();
 }
 
 [[nodiscard]] usize saturated_add(usize left, usize right) noexcept {

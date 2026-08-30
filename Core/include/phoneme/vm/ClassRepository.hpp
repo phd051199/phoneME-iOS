@@ -55,6 +55,81 @@ public:
     void clear() noexcept;
 
 private:
+    struct StringHash final {
+        using is_transparent = void;
+
+        [[nodiscard]] usize operator()(std::string_view value) const noexcept {
+            return std::hash<std::string_view>{}(value);
+        }
+        [[nodiscard]] usize operator()(const std::string& value) const noexcept {
+            return (*this)(std::string_view(value));
+        }
+    };
+
+    struct StringEqual final {
+        using is_transparent = void;
+
+        [[nodiscard]] bool operator()(std::string_view left,
+                                      std::string_view right) const noexcept {
+            return left == right;
+        }
+    };
+
+    struct MethodCacheKey final {
+        std::string owner;
+        std::string name;
+        std::string descriptor;
+    };
+
+    struct MethodCacheKeyView final {
+        std::string_view owner;
+        std::string_view name;
+        std::string_view descriptor;
+    };
+
+    struct MethodCacheKeyHash final {
+        using is_transparent = void;
+        [[nodiscard]] usize operator()(const MethodCacheKey& key) const noexcept;
+        [[nodiscard]] usize operator()(MethodCacheKeyView key) const noexcept;
+    };
+
+    struct MethodCacheKeyEqual final {
+        using is_transparent = void;
+        [[nodiscard]] bool operator()(const MethodCacheKey& left,
+                                      const MethodCacheKey& right) const noexcept;
+        [[nodiscard]] bool operator()(const MethodCacheKey& left,
+                                      MethodCacheKeyView right) const noexcept;
+        [[nodiscard]] bool operator()(MethodCacheKeyView left,
+                                      const MethodCacheKey& right) const noexcept;
+    };
+
+    struct AssignabilityCacheKey final {
+        std::string source;
+        std::string target;
+    };
+
+    struct AssignabilityCacheKeyView final {
+        std::string_view source;
+        std::string_view target;
+    };
+
+    struct AssignabilityCacheKeyHash final {
+        using is_transparent = void;
+        [[nodiscard]] usize operator()(
+            const AssignabilityCacheKey& key) const noexcept;
+        [[nodiscard]] usize operator()(AssignabilityCacheKeyView key) const noexcept;
+    };
+
+    struct AssignabilityCacheKeyEqual final {
+        using is_transparent = void;
+        [[nodiscard]] bool operator()(const AssignabilityCacheKey& left,
+                                      const AssignabilityCacheKey& right) const noexcept;
+        [[nodiscard]] bool operator()(const AssignabilityCacheKey& left,
+                                      AssignabilityCacheKeyView right) const noexcept;
+        [[nodiscard]] bool operator()(AssignabilityCacheKeyView left,
+                                      const AssignabilityCacheKey& right) const noexcept;
+    };
+
     struct ClasspathArchive final {
         std::string path;
         archive::ZipArchive archive;
@@ -76,10 +151,21 @@ private:
     mutable std::mutex mutex_;
     std::vector<ClasspathArchive> archives_;
     std::unordered_map<std::string,
-                       std::shared_ptr<const classfile::ClassFile>> cache_;
-    std::unordered_map<std::string, ResolvedMethod> method_cache_;
-    std::unordered_map<std::string, ResolvedMethod> declared_method_cache_;
-    std::unordered_map<std::string, bool> assignability_cache_;
+                       std::shared_ptr<const classfile::ClassFile>,
+                       StringHash,
+                       StringEqual> cache_;
+    std::unordered_map<MethodCacheKey,
+                       ResolvedMethod,
+                       MethodCacheKeyHash,
+                       MethodCacheKeyEqual> method_cache_;
+    std::unordered_map<MethodCacheKey,
+                       ResolvedMethod,
+                       MethodCacheKeyHash,
+                       MethodCacheKeyEqual> declared_method_cache_;
+    std::unordered_map<AssignabilityCacheKey,
+                       bool,
+                       AssignabilityCacheKeyHash,
+                       AssignabilityCacheKeyEqual> assignability_cache_;
     RuntimeMetadata metadata_;
 };
 

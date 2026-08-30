@@ -122,13 +122,13 @@ template <ImageAlphaKind AlphaKind>
     Pixel source,
     Pixel& destination) noexcept {
     if constexpr (AlphaKind == ImageAlphaKind::opaque) {
-        const Pixel composited = rgb565_roundtrip(source);
+        const Pixel composited = source;
         if (composited == destination) return false;
         destination = composited;
         return true;
     } else if constexpr (AlphaKind == ImageAlphaKind::binary) {
         if ((source & 0xFF000000U) == 0U) return false;
-        const Pixel composited = rgb565_roundtrip(source);
+        const Pixel composited = source;
         if (composited == destination) return false;
         destination = composited;
         return true;
@@ -1080,12 +1080,18 @@ Status draw_image(Image& target,
     }
     auto target_pixels = target.mutable_pixels();
     const auto source_pixels = source.pixels();
+    const auto source_device_pixels = source.device_pixels();
     const usize target_stride = static_cast<usize>(target.width());
     const usize source_stride = static_cast<usize>(source.width());
     const usize visible_width = static_cast<usize>(visible.width);
+    const ImageAlphaKind alpha_kind = needs_snapshot
+        ? ImageAlphaKind::translucent
+        : source.alpha_kind();
     const std::span<const Pixel> blit_source = needs_snapshot
         ? std::span<const Pixel>(snapshot)
-        : source_pixels;
+        : (alpha_kind == ImageAlphaKind::translucent
+            ? source_pixels
+            : source_device_pixels);
     const usize blit_source_stride = needs_snapshot
         ? visible_width
         : source_stride;
@@ -1095,9 +1101,6 @@ Status draw_image(Image& target,
     const usize blit_source_y = needs_snapshot
         ? 0U
         : static_cast<usize>(first_source_y);
-    const ImageAlphaKind alpha_kind = needs_snapshot
-        ? ImageAlphaKind::translucent
-        : source.alpha_kind();
     const bool changed = [&]() noexcept {
         switch (alpha_kind) {
         case ImageAlphaKind::opaque:
@@ -1215,13 +1218,20 @@ Status draw_region(Image& target,
     }
     auto target_pixels = target.mutable_pixels();
     const auto source_pixels = source.pixels();
+    const auto source_device_pixels = source.device_pixels();
     const usize target_stride = static_cast<usize>(target.width());
     const i64 source_stride = needs_snapshot
         ? static_cast<i64>(width)
         : static_cast<i64>(source.width());
+    const ImageAlphaKind alpha_kind = needs_snapshot
+        ? ImageAlphaKind::translucent
+        : source.alpha_kind();
+    const auto strided_source = alpha_kind == ImageAlphaKind::translucent
+        ? source_pixels
+        : source_device_pixels;
     const Pixel* source_base = needs_snapshot
         ? snapshot.data()
-        : source_pixels.data() +
+        : strided_source.data() +
             static_cast<usize>(source_y) * static_cast<usize>(source.width()) +
             static_cast<usize>(source_x);
 
@@ -1243,9 +1253,6 @@ Status draw_region(Image& target,
         static_cast<i64>(steps.row_y) * source_stride + steps.row_x;
     const i64 first_source_index =
         first_source_y * source_stride + first_source_x;
-    const ImageAlphaKind alpha_kind = needs_snapshot
-        ? ImageAlphaKind::translucent
-        : source.alpha_kind();
     const bool changed = [&]() noexcept {
         switch (alpha_kind) {
         case ImageAlphaKind::opaque:

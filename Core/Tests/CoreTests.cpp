@@ -29,10 +29,12 @@
 #include "phoneme/vm/ClassLayout.hpp"
 #include "phoneme/vm/ClassRepository.hpp"
 #include "phoneme/vm/Descriptor.hpp"
+#include "phoneme/vm/ExecutionContext.hpp"
 #include "phoneme/vm/Heap.hpp"
 #include "phoneme/vm/Interpreter.hpp"
 #include "phoneme/vm/Machine.hpp"
 #include "phoneme/vm/MonitorTable.hpp"
+#include "phoneme/vm/NativeMethodRegistry.hpp"
 #include "phoneme/vm/PerformanceCounters.hpp"
 #include "phoneme/vm/SlotStorage.hpp"
 #include "phoneme/vm/Verifier.hpp"
@@ -53,6 +55,15 @@ void write_performance_snapshot() {
     if (output_path == nullptr || *output_path == '\0') return;
 
     const auto snapshot = phoneme::vm::PerformanceCounters::snapshot();
+    const auto locked_cross = [&snapshot](
+        phoneme::vm::LockedHeapCallerDomain domain,
+        phoneme::vm::LockedHeapOperationKind kind) -> phoneme::u64 {
+        const phoneme::usize kinds = static_cast<phoneme::usize>(
+            phoneme::vm::LockedHeapOperationKind::count);
+        const phoneme::usize index = static_cast<phoneme::usize>(domain) * kinds +
+            static_cast<phoneme::usize>(kind);
+        return snapshot.locked_heap_operations_by_domain_and_kind[index];
+    };
     const std::filesystem::path path(output_path);
     std::error_code directory_error;
     if (path.has_parent_path()) {
@@ -73,11 +84,87 @@ void write_performance_snapshot() {
            << "    \"native_invocations\": " << snapshot.native_invocations << ",\n"
            << "    \"maximum_java_call_depth\": "
            << snapshot.maximum_java_call_depth << ",\n"
+           << "    \"invocation_argument_overflows\": "
+           << snapshot.invocation_argument_overflows << ",\n"
+           << "    \"maximum_invocation_argument_values\": "
+           << snapshot.maximum_invocation_argument_values << ",\n"
+           << "    \"oversized_execution_frames\": "
+           << snapshot.oversized_execution_frames << ",\n"
+           << "    \"local_slot_storage_fallbacks\": "
+           << snapshot.local_slot_storage_fallbacks << ",\n"
+           << "    \"operand_slot_storage_fallbacks\": "
+           << snapshot.operand_slot_storage_fallbacks << ",\n"
+           << "    \"maximum_frame_local_slots\": "
+           << snapshot.maximum_frame_local_slots << ",\n"
+           << "    \"maximum_frame_operand_slots\": "
+           << snapshot.maximum_frame_operand_slots << ",\n"
+           << "    \"execution_frame_stack_growths\": "
+           << snapshot.execution_frame_stack_growths << ",\n"
+           << "    \"maximum_execution_frame_stack_capacity\": "
+           << snapshot.maximum_execution_frame_stack_capacity << ",\n"
+           << "    \"execution_frame_stack_pool_misses\": "
+           << snapshot.execution_frame_stack_pool_misses << ",\n"
+           << "    \"execution_root_publications\": "
+           << snapshot.execution_root_publications << ",\n"
+           << "    \"execution_root_copy_publications\": "
+           << snapshot.execution_root_copy_publications << ",\n"
+           << "    \"execution_root_exchange_publications\": "
+           << snapshot.execution_root_exchange_publications << ",\n"
+           << "    \"execution_roots_published\": "
+           << snapshot.execution_roots_published << ",\n"
+           << "    \"maximum_execution_roots_per_publication\": "
+           << snapshot.maximum_execution_roots_per_publication << ",\n"
+           << "    \"verified_root_map_hits\": "
+           << snapshot.verified_root_map_hits << ",\n"
+           << "    \"verified_root_map_partial_hits\": "
+           << snapshot.verified_root_map_partial_hits << ",\n"
+           << "    \"verified_root_map_fallbacks\": "
+           << snapshot.verified_root_map_fallbacks << ",\n"
+           << "    \"verified_root_slots_visited\": "
+           << snapshot.verified_root_slots_visited << ",\n"
+           << "    \"verified_root_slots_avoided\": "
+           << snapshot.verified_root_slots_avoided << ",\n"
+           << "    \"fallback_root_slots_scanned\": "
+           << snapshot.fallback_root_slots_scanned << ",\n"
            << "    \"exception_dispatches\": " << snapshot.exception_dispatches << ",\n"
            << "    \"class_initializations\": " << snapshot.class_initializations << ",\n"
            << "    \"instruction_budget_exits\": "
            << snapshot.instruction_budget_exits << ",\n"
-           << "    \"scheduler_quanta\": " << snapshot.scheduler_quanta << "\n"
+           << "    \"scheduler_quanta\": " << snapshot.scheduler_quanta << ",\n"
+           << "    \"jit_runtime_operation_calls\": [";
+    for (phoneme::usize index = 0U;
+         index < snapshot.jit_runtime_operation_calls.size();
+         ++index) {
+        if (index != 0U) output << ',';
+        output << snapshot.jit_runtime_operation_calls[index];
+    }
+    output << "],\n"
+           << "    \"jit_runtime_safepoint_calls\": [";
+    for (phoneme::usize index = 0U;
+         index < snapshot.jit_runtime_safepoint_calls.size();
+         ++index) {
+        if (index != 0U) output << ',';
+        output << snapshot.jit_runtime_safepoint_calls[index];
+    }
+    output << "],\n"
+           << "    \"jit_call_operand_decodes\": "
+           << snapshot.jit_call_operand_decodes << ",\n"
+           << "    \"jit_call_operand_overflows\": "
+           << snapshot.jit_call_operand_overflows << ",\n"
+           << "    \"maximum_jit_call_operand_values\": "
+           << snapshot.maximum_jit_call_operand_values << ",\n"
+           << "    \"jit_root_stages\": "
+           << snapshot.jit_root_stages << ",\n"
+           << "    \"jit_root_stage_commits\": "
+           << snapshot.jit_root_stage_commits << ",\n"
+           << "    \"jit_staged_root_materializations\": "
+           << snapshot.jit_staged_root_materializations << ",\n"
+           << "    \"jit_staged_roots_materialized\": "
+           << snapshot.jit_staged_roots_materialized << ",\n"
+           << "    \"jit_staged_reference_slots_deferred\": "
+           << snapshot.jit_staged_reference_slots_deferred << ",\n"
+           << "    \"jit_staged_reference_slots_scanned\": "
+           << snapshot.jit_staged_reference_slots_scanned << "\n"
            << "  },\n"
            << "  \"metadata\": {\n"
            << "    \"class_cache_hits\": " << snapshot.class_cache_hits << ",\n"
@@ -137,6 +224,171 @@ void write_performance_snapshot() {
            << "    \"failed_allocations\": " << snapshot.failed_allocations << ",\n"
            << "    \"public_locked_operations\": "
            << snapshot.public_locked_heap_operations << ",\n"
+           << "    \"locked_allocation_operations\": "
+           << snapshot.locked_heap_operations_by_kind[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapOperationKind::allocation)] << ",\n"
+           << "    \"locked_field_operations\": "
+           << snapshot.locked_heap_operations_by_kind[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapOperationKind::field)] << ",\n"
+           << "    \"locked_array_element_read_operations\": "
+           << snapshot.locked_heap_operations_by_kind[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapOperationKind::array_element_read)] << ",\n"
+           << "    \"locked_array_element_write_operations\": "
+           << snapshot.locked_heap_operations_by_kind[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapOperationKind::array_element_write)] << ",\n"
+           << "    \"locked_array_element_snapshot_operations\": "
+           << snapshot.locked_heap_operations_by_kind[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapOperationKind::array_element_snapshot)] << ",\n"
+           << "    \"locked_array_element_checked_operations\": "
+           << snapshot.locked_heap_operations_by_kind[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapOperationKind::array_element_checked)] << ",\n"
+           << "    \"locked_array_metadata_operations\": "
+           << snapshot.locked_heap_operations_by_kind[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapOperationKind::array_metadata)] << ",\n"
+           << "    \"locked_array_bulk_operations\": "
+           << snapshot.locked_heap_operations_by_kind[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapOperationKind::array_bulk)] << ",\n"
+           << "    \"locked_class_name_operations\": "
+           << snapshot.locked_heap_operations_by_kind[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapOperationKind::class_name)] << ",\n"
+           << "    \"locked_string_operations\": "
+           << snapshot.locked_heap_operations_by_kind[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapOperationKind::string)] << ",\n"
+           << "    \"locked_reference_operations\": "
+           << snapshot.locked_heap_operations_by_kind[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapOperationKind::reference)] << ",\n"
+           << "    \"locked_gc_operations\": "
+           << snapshot.locked_heap_operations_by_kind[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapOperationKind::garbage_collection)] << ",\n"
+           << "    \"locked_domain_java_util\": "
+           << snapshot.locked_heap_operations_by_domain[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapCallerDomain::java_util)] << ",\n"
+           << "    \"locked_domain_java_lang\": "
+           << snapshot.locked_heap_operations_by_domain[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapCallerDomain::java_lang)] << ",\n"
+           << "    \"locked_domain_io\": "
+           << snapshot.locked_heap_operations_by_domain[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapCallerDomain::io)] << ",\n"
+           << "    \"locked_domain_lcdui\": "
+           << snapshot.locked_heap_operations_by_domain[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapCallerDomain::lcdui)] << ",\n"
+           << "    \"locked_domain_graphics_3d\": "
+           << snapshot.locked_heap_operations_by_domain[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapCallerDomain::graphics_3d)] << ",\n"
+           << "    \"locked_domain_media\": "
+           << snapshot.locked_heap_operations_by_domain[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapCallerDomain::media)] << ",\n"
+           << "    \"locked_domain_other_java\": "
+           << snapshot.locked_heap_operations_by_domain[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapCallerDomain::other_java)] << ",\n"
+           << "    \"locked_domain_unknown\": "
+           << snapshot.locked_heap_operations_by_domain[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapCallerDomain::unknown)] << ",\n"
+           << "    \"locked_other_java_allocations\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::other_java,
+                           phoneme::vm::LockedHeapOperationKind::allocation) << ",\n"
+           << "    \"locked_other_java_fields\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::other_java,
+                           phoneme::vm::LockedHeapOperationKind::field) << ",\n"
+           << "    \"locked_other_java_array_reads\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::other_java,
+                           phoneme::vm::LockedHeapOperationKind::array_element_read) << ",\n"
+           << "    \"locked_other_java_array_writes\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::other_java,
+                           phoneme::vm::LockedHeapOperationKind::array_element_write) << ",\n"
+           << "    \"locked_graphics_3d_allocations\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::graphics_3d,
+                           phoneme::vm::LockedHeapOperationKind::allocation) << ",\n"
+           << "    \"locked_graphics_3d_fields\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::graphics_3d,
+                           phoneme::vm::LockedHeapOperationKind::field) << ",\n"
+           << "    \"locked_graphics_3d_array_reads\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::graphics_3d,
+                           phoneme::vm::LockedHeapOperationKind::array_element_read) << ",\n"
+           << "    \"locked_graphics_3d_array_writes\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::graphics_3d,
+                           phoneme::vm::LockedHeapOperationKind::array_element_write) << ",\n"
+           << "    \"locked_lcdui_allocations\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::lcdui,
+                           phoneme::vm::LockedHeapOperationKind::allocation) << ",\n"
+           << "    \"locked_lcdui_fields\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::lcdui,
+                           phoneme::vm::LockedHeapOperationKind::field) << ",\n"
+           << "    \"locked_lcdui_array_reads\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::lcdui,
+                           phoneme::vm::LockedHeapOperationKind::array_element_read) << ",\n"
+           << "    \"locked_lcdui_array_writes\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::lcdui,
+                           phoneme::vm::LockedHeapOperationKind::array_element_write) << ",\n"
+           << "    \"locked_java_util_allocations\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::java_util,
+                           phoneme::vm::LockedHeapOperationKind::allocation) << ",\n"
+           << "    \"locked_java_util_fields\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::java_util,
+                           phoneme::vm::LockedHeapOperationKind::field) << ",\n"
+           << "    \"locked_java_util_array_reads\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::java_util,
+                           phoneme::vm::LockedHeapOperationKind::array_element_read) << ",\n"
+           << "    \"locked_java_util_array_writes\": "
+           << locked_cross(phoneme::vm::LockedHeapCallerDomain::java_util,
+                           phoneme::vm::LockedHeapOperationKind::array_element_write) << ",\n"
+           << "    \"locked_io_byte_array_input\": "
+           << snapshot.locked_heap_io_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapIoOwnerKind::byte_array_input)] << ",\n"
+           << "    \"locked_io_byte_array_output\": "
+           << snapshot.locked_heap_io_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapIoOwnerKind::byte_array_output)] << ",\n"
+           << "    \"locked_io_data_input\": "
+           << snapshot.locked_heap_io_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapIoOwnerKind::data_input)] << ",\n"
+           << "    \"locked_io_data_output\": "
+           << snapshot.locked_heap_io_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapIoOwnerKind::data_output)] << ",\n"
+           << "    \"locked_io_input_stream_reader\": "
+           << snapshot.locked_heap_io_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapIoOwnerKind::input_stream_reader)] << ",\n"
+           << "    \"locked_io_output_stream_writer\": "
+           << snapshot.locked_heap_io_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapIoOwnerKind::output_stream_writer)] << ",\n"
+           << "    \"locked_io_buffered_reader\": "
+           << snapshot.locked_heap_io_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapIoOwnerKind::buffered_reader)] << ",\n"
+           << "    \"locked_io_buffered_output\": "
+           << snapshot.locked_heap_io_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapIoOwnerKind::buffered_output)] << ",\n"
+           << "    \"locked_io_reader\": "
+           << snapshot.locked_heap_io_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapIoOwnerKind::reader)] << ",\n"
+           << "    \"locked_io_writer\": "
+           << snapshot.locked_heap_io_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapIoOwnerKind::writer)] << ",\n"
+           << "    \"locked_io_other\": "
+           << snapshot.locked_heap_io_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapIoOwnerKind::other)] << ",\n"
+           << "    \"locked_3d_m3g_geometry\": "
+           << snapshot.locked_heap_graphics_3d_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapGraphics3dOwnerKind::m3g_geometry)] << ",\n"
+           << "    \"locked_3d_m3g_graphics\": "
+           << snapshot.locked_heap_graphics_3d_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapGraphics3dOwnerKind::m3g_graphics)] << ",\n"
+           << "    \"locked_3d_m3g_other\": "
+           << snapshot.locked_heap_graphics_3d_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapGraphics3dOwnerKind::m3g_other)] << ",\n"
+           << "    \"locked_3d_micro_math\": "
+           << snapshot.locked_heap_graphics_3d_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapGraphics3dOwnerKind::micro3d_math)] << ",\n"
+           << "    \"locked_3d_micro_graphics\": "
+           << snapshot.locked_heap_graphics_3d_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapGraphics3dOwnerKind::micro3d_graphics)] << ",\n"
+           << "    \"locked_3d_micro_resource\": "
+           << snapshot.locked_heap_graphics_3d_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapGraphics3dOwnerKind::micro3d_resource)] << ",\n"
+           << "    \"locked_3d_micro_state\": "
+           << snapshot.locked_heap_graphics_3d_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapGraphics3dOwnerKind::micro3d_state)] << ",\n"
+           << "    \"locked_3d_micro_other\": "
+           << snapshot.locked_heap_graphics_3d_operations_by_owner[static_cast<phoneme::usize>(
+                  phoneme::vm::LockedHeapGraphics3dOwnerKind::micro3d_other)] << ",\n"
            << "    \"vm_fast_operations\": "
            << snapshot.vm_fast_heap_operations << ",\n"
            << "    \"gc_count\": " << snapshot.gc_count << ",\n"
@@ -396,6 +648,61 @@ void test_heap_generation_and_collection() {
     require(replacement.has_value(), "reuse a free heap slot");
     require(replacement->bits != child->bits,
             "reused slot receives a new generation");
+
+    phoneme::vm::Heap text_heap(8);
+    const std::array<phoneme::vm::Value, 1> text_defaults {
+        phoneme::vm::Value::from_int(17),
+    };
+    auto text_object = text_heap.allocate_text_object(
+        "java/lang/StringBuilder",
+        text_defaults,
+        std::u16string(u"abc"));
+    require(text_object.has_value(),
+            "allocate text object with defaults and payload in one heap operation");
+    auto text_field = text_heap.field(*text_object, 0U);
+    auto text_length = text_heap.string_length(*text_object);
+    auto text_character = text_heap.string_character(*text_object, 1U);
+    require(text_field.has_value() && text_field->as_int().value_or(-1) == 17 &&
+                text_length.has_value() && *text_length == 3U &&
+                text_character.has_value() && *text_character ==
+                    static_cast<phoneme::u16>(u'b'),
+            "combined text allocation preserves field defaults and UTF-16 payload");
+}
+
+void test_execution_context_root_exchange() {
+    using phoneme::vm::ExecutionContext;
+    using phoneme::vm::ObjectRef;
+
+    ExecutionContext context(7U);
+    const std::array<ObjectRef, 2U> previous {
+        ObjectRef::make(1U, 2U),
+        ObjectRef::make(3U, 4U),
+    };
+    context.publish_roots(11U, previous);
+
+    std::vector<ObjectRef> next {
+        ObjectRef::make(5U, 6U),
+        ObjectRef::make(7U, 8U),
+        ObjectRef::make(9U, 10U),
+    };
+    context.exchange_roots(11U, next);
+
+    require(next.size() == previous.size() &&
+                next[0] == previous[0] && next[1] == previous[1],
+            "execution root exchange returns the previous publication buffer");
+
+    std::vector<ObjectRef> published;
+    context.append_reference_roots(published);
+    require(published.size() == 3U &&
+                published[0] == ObjectRef::make(5U, 6U) &&
+                published[1] == ObjectRef::make(7U, 8U) &&
+                published[2] == ObjectRef::make(9U, 10U),
+            "execution root exchange publishes the replacement roots");
+
+    context.clear_roots(11U);
+    published.clear();
+    context.append_reference_roots(published);
+    require(published.empty(), "execution root clear removes exchanged roots");
 }
 
 void test_descriptors_and_slots() {
@@ -460,7 +767,13 @@ void test_descriptors_and_slots() {
     local_roots.clear();
     locals.append_reference_roots(local_roots);
     require(local_roots.size() == 1U && local_roots.front() == second_reference,
-            "overwriting a reference removes it from the compact root index");
+            "overwriting a reference removes it from compact root scanning");
+    const std::array<phoneme::usize, 1U> exact_local_slots {3U};
+    local_roots.clear();
+    require(locals.append_reference_roots_at_slots(exact_local_slots, local_roots) &&
+                local_roots.size() == 1U &&
+                local_roots.front() == second_reference,
+            "verified local root slots read only requested references");
 
     phoneme::vm::OperandStack root_stack(3);
     require(root_stack.push(
@@ -472,6 +785,158 @@ void test_descriptors_and_slots() {
     root_stack.append_reference_roots(stack_roots);
     require(stack_roots.size() == 1U && stack_roots.front() == first_reference,
             "operand root scan extracts references without checked conversions");
+
+    phoneme::vm::OperandStack exact_root_stack(5);
+    require(exact_root_stack.push_long(123).has_value() &&
+                exact_root_stack.push_reference(second_reference).has_value() &&
+                exact_root_stack.push_double(2.0).has_value(),
+            "build category-two operand layout for exact root slots");
+    const std::array<phoneme::usize, 1U> exact_stack_slots {8U};
+    stack_roots.clear();
+    require(exact_root_stack.append_reference_roots_at_physical_slots(
+                exact_stack_slots, 6U, stack_roots) &&
+                stack_roots.size() == 1U &&
+                stack_roots.front() == second_reference,
+            "verified operand root slots account for category-two physical slots");
+    const std::array<phoneme::usize, 1U> continuation_slot {7U};
+    stack_roots.clear();
+    require(!exact_root_stack.append_reference_roots_at_physical_slots(
+                continuation_slot, 6U, stack_roots) && stack_roots.empty(),
+            "verified operand root slots reject category-two continuation slots");
+
+    // Exercise the FastVM-style typed path in vector-backed mode as well as the
+    // small inline path above. These operations must not construct a generic
+    // Value merely to move an int/reference between verified VM slots.
+    phoneme::vm::OperandStack compact_stack(24);
+    require(compact_stack.push_int(-123).has_value(),
+            "typed int push works in compact overflow storage");
+    require(compact_stack.push_long(-9876543210LL).has_value(),
+            "typed long push works in compact overflow storage");
+    require(compact_stack.push_float(3.25F).has_value(),
+            "typed float push works in compact overflow storage");
+    require(compact_stack.push_double(-7.5).has_value(),
+            "typed double push works in compact overflow storage");
+    require(compact_stack.push_reference(second_reference).has_value(),
+            "typed reference push works in compact overflow storage");
+    auto compact_reference = compact_stack.pop_reference();
+    auto compact_double = compact_stack.pop_double();
+    auto compact_float = compact_stack.pop_float();
+    auto compact_long = compact_stack.pop_long();
+    auto compact_integer = compact_stack.pop_int();
+    require(compact_reference.has_value() &&
+                *compact_reference == second_reference &&
+                compact_double.has_value() && *compact_double == -7.5 &&
+                compact_float.has_value() && *compact_float == 3.25F &&
+                compact_long.has_value() && *compact_long == -9876543210LL &&
+                compact_integer.has_value() && *compact_integer == -123,
+            "typed compact stack round-trip preserves payloads");
+
+    phoneme::vm::LocalVariables compact_locals(24);
+    require(compact_locals.set_int(17, -456).has_value() &&
+                compact_locals.set_reference(18, first_reference).has_value() &&
+                compact_locals.set_long(20, -1234567890123LL).has_value() &&
+                compact_locals.set_float(22, 1.5F).has_value() &&
+                compact_locals.set_double(0, 9.25).has_value(),
+            "typed compact locals store all primitive/reference payloads");
+    auto compact_local_int = compact_locals.get_int(17);
+    auto compact_local_ref = compact_locals.get_reference(18);
+    auto compact_local_long = compact_locals.get_long(20);
+    auto compact_local_float = compact_locals.get_float(22);
+    auto compact_local_double = compact_locals.get_double(0);
+    require(compact_local_int.has_value() && *compact_local_int == -456 &&
+                compact_local_ref.has_value() &&
+                *compact_local_ref == first_reference &&
+                compact_local_long.has_value() &&
+                *compact_local_long == -1234567890123LL &&
+                compact_local_float.has_value() &&
+                *compact_local_float == 1.5F &&
+                compact_local_double.has_value() &&
+                *compact_local_double == 9.25,
+            "typed compact locals round-trip without Value conversion");
+    std::vector<phoneme::vm::ObjectRef> compact_roots;
+    compact_locals.append_reference_roots(compact_roots);
+    require(compact_roots.size() == 1U &&
+                compact_roots.front() == first_reference,
+            "typed compact locals remain visible to GC root enumeration");
+
+    const std::array<phoneme::vm::Value, 3> small_arguments {
+        phoneme::vm::Value::from_int(1),
+        phoneme::vm::Value::from_reference(first_reference),
+        phoneme::vm::Value::from_long(3),
+    };
+    phoneme::vm::InvocationArguments inline_arguments {
+        std::span<const phoneme::vm::Value>(small_arguments)};
+    require(inline_arguments.inline_mode() && inline_arguments.size() == 3U &&
+                inline_arguments.kind(0U) == phoneme::vm::ValueKind::int32 &&
+                inline_arguments.raw_bits(1U) == first_reference.bits &&
+                inline_arguments[1].reference_unchecked() == first_reference,
+            "ordinary invocation arguments stay in compact inline storage");
+    std::vector<phoneme::vm::ObjectRef> invocation_roots;
+    inline_arguments.append_reference_roots(invocation_roots);
+    require(invocation_roots.size() == 1U &&
+                invocation_roots.front() == first_reference,
+            "compact invocation arguments enumerate reference roots directly");
+    std::array<phoneme::vm::Value, 3> rematerialized_arguments {};
+    inline_arguments.materialize(rematerialized_arguments);
+    require(rematerialized_arguments[0].as_int().value_or(-1) == 1 &&
+                rematerialized_arguments[1].reference_unchecked() ==
+                    first_reference &&
+                rematerialized_arguments[2].as_long().value_or(-1) == 3,
+            "compact invocation arguments materialize only at compatibility boundaries");
+
+    std::array<phoneme::vm::Value,
+               phoneme::vm::kInlineInvocationArgumentCapacity + 1U>
+        large_arguments {};
+    large_arguments[0] = phoneme::vm::Value::from_int(99);
+    phoneme::vm::InvocationArguments overflow_invocation_arguments {
+        std::span<const phoneme::vm::Value>(large_arguments)};
+    require(!overflow_invocation_arguments.inline_mode() &&
+                overflow_invocation_arguments.size() == large_arguments.size() &&
+                overflow_invocation_arguments.front().as_int().value() == 99,
+            "large invocation signatures preserve split-vector fallback");
+}
+
+void test_native_registry_dispatch_batch() {
+    phoneme::vm::NativeMethodRegistry registry;
+    const auto no_result = [](phoneme::vm::Machine&,
+                              std::span<const phoneme::vm::Value>)
+        -> phoneme::Result<std::optional<phoneme::vm::Value>> {
+        return std::optional<phoneme::vm::Value>{};
+    };
+
+    registry.begin_registration_batch();
+    require(registry.register_method("test/Native", "first", "()V",
+                                     no_result)
+                .has_value(),
+            "batch-register first native");
+    require(registry.register_method("test/Native", "second", "()V",
+                                     no_result,
+                                     phoneme::vm::NativeJitPolicy::synchronous_bounded)
+                .has_value(),
+            "batch-register second native");
+    const auto first = registry.resolve_binding("test/Native", "first", "()V");
+    const auto second = registry.resolve_binding("test/Native", "second", "()V");
+    require(first.id.valid() && second.id.valid() && first.id != second.id,
+            "batched native IDs resolve before snapshot publication");
+    registry.end_registration_batch();
+
+    auto registered = registry.registered_methods();
+    require(registered.size() == 2U,
+            "registration batch publishes one complete dispatch snapshot");
+    require(registry.jit_policy(second.id) ==
+                phoneme::vm::NativeJitPolicy::synchronous_bounded,
+            "published native snapshot preserves JIT policy");
+
+    require(registry.register_method("test/Native", "late", "()V", no_result)
+                .has_value(),
+            "late native registration succeeds");
+    registered = registry.registered_methods();
+    require(registered.size() == 3U,
+            "late native registration publishes immediately outside batch");
+
+    registry.clear();
+    require(registry.registered_methods().empty(),
+            "clearing native registry publishes an empty snapshot");
 }
 
 void test_bytecode_structure_verifier() {
@@ -2962,7 +3427,7 @@ void test_baseline_jit(const std::string& fixture_jar) {
                 synchronized_add->completed_normally() &&
                 synchronized_add->return_value.has_value() &&
                 synchronized_add->return_value->as_int().value_or(0) == 42,
-            "JIT executes monitorenter/monitorexit for synchronized blocks");
+            "JIT-enabled execution preserves synchronized-block semantics");
     auto monitor_after_return = machine.monitors().snapshot(*jit_object);
     require(monitor_after_return.has_value() &&
                 monitor_after_return->owner == 0U &&
@@ -2981,18 +3446,18 @@ void test_baseline_jit(const std::string& fixture_jar) {
     require(synchronized_throw.has_value() &&
                 !synchronized_throw->completed_normally() &&
                 synchronized_throw->throwable == divide_by_zero->throwable,
-            "JIT synchronized cleanup propagates the original throwable");
+            "JIT-enabled synchronized cleanup propagates the original throwable");
     auto monitor_after_throw = machine.monitors().snapshot(*jit_object);
     require(monitor_after_throw.has_value() &&
                 monitor_after_throw->owner == 0U &&
                 monitor_after_throw->recursion == 0U,
             "JIT releases synchronized-block monitor on exceptional exit");
     const auto monitor_statistics_after = machine.jit_statistics();
-    require(monitor_statistics_after.compiled_methods >=
-                monitor_statistics_before.compiled_methods + 2U &&
-                monitor_statistics_after.executed_methods >=
-                monitor_statistics_before.executed_methods + 2U,
-            "JIT natively executes synchronized blocks without replay");
+    const auto unsafe_side_effect_reason = static_cast<phoneme::usize>(
+        phoneme::vm::JitRejectReason::unsafe_side_effect);
+    require(monitor_statistics_after.reject_reasons[unsafe_side_effect_reason] >=
+                monitor_statistics_before.reject_reasons[unsafe_side_effect_reason] + 2U,
+            "JIT keeps explicit monitor bytecodes on the correctness-first interpreter path");
 
     phoneme::vm::ClassRepository allocation_gc_classes;
     require(allocation_gc_classes.add_archive(fixture_jar).has_value(),
@@ -9272,6 +9737,42 @@ void test_framebuffer_sizes() {
                     lease->damage_regions()[1].y == 239,
                 "batched framebuffer damage islands reach display readers");
     }
+
+    phoneme::runtime::Framebuffer bgra_framebuffer;
+    constexpr std::array<phoneme::u8, 4> native_bgra_pixel {
+        3U, 2U, 1U, 4U,
+    };
+    require(bgra_framebuffer.replace(
+                {1, 1},
+                native_bgra_pixel,
+                phoneme::runtime::FramePixelFormat::bgra8).has_value(),
+            "publish native BGRA framebuffer storage");
+    const auto bgra_generation = bgra_framebuffer.metadata().generation;
+    const auto bgra_snapshot = bgra_framebuffer.snapshot();
+    require(bgra_snapshot.rgba ==
+                std::vector<phoneme::u8>({1U, 2U, 3U, 4U}),
+            "RGBA snapshot converts native BGRA storage on demand");
+    {
+        auto native_lease = bgra_framebuffer.acquire_native_since(0U);
+        require(native_lease.has_value() &&
+                    native_lease->metadata().pixel_format ==
+                        phoneme::runtime::FramePixelFormat::bgra8 &&
+                    native_lease->pixels().size() == 4U &&
+                    native_lease->pixels()[0] == 3U &&
+                    native_lease->pixels()[2] == 1U,
+                "native framebuffer lease preserves BGRA bytes without shuffle");
+    }
+    {
+        auto rgba_lease = bgra_framebuffer.acquire_rgba_since(0U);
+        require(rgba_lease.has_value() &&
+                    rgba_lease->metadata().pixel_format ==
+                        phoneme::runtime::FramePixelFormat::rgba8 &&
+                    rgba_lease->pixels().size() == 4U &&
+                    rgba_lease->pixels()[0] == 1U &&
+                    rgba_lease->pixels()[2] == 3U &&
+                    rgba_lease->metadata().generation == bgra_generation,
+                "legacy RGBA lease converts BGRA storage without changing generation");
+    }
     require(!framebuffer.resize({0, 240}).has_value(),
             "reject zero framebuffer width");
 }
@@ -9422,7 +9923,9 @@ int main(int argc, char** argv) {
     test_builtin_boot_classes();
     test_class_layout(fixture_jar);
     test_heap_generation_and_collection();
+    test_execution_context_root_exchange();
     test_descriptors_and_slots();
+    test_native_registry_dispatch_batch();
     test_bytecode_structure_verifier();
     test_type_state_verifier();
     test_monitor_table();

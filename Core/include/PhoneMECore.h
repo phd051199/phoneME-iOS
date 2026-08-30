@@ -412,6 +412,10 @@ typedef struct {
     int32_t width;
     int32_t height;
 } PhoneMEFrameDamageRegion;
+typedef enum {
+    PHONEME_FRAME_PIXEL_RGBA8 = 0,
+    PHONEME_FRAME_PIXEL_BGRA8 = 1,
+} PhoneMEFramePixelFormat;
 /* Zero-copy display path. The returned pointer remains valid until
  * phoneme_release_frame_rgba() and must not be retained after that call. */
 const uint8_t* phoneme_acquire_frame_rgba_since(PhoneMERuntimeRef runtime,
@@ -438,6 +442,20 @@ const uint8_t* phoneme_acquire_current_frame_rgba_regions_since(
     int32_t* width,
     int32_t* height,
     uint64_t* generation,
+    PhoneMEFrameDamageRegion* regions,
+    int32_t region_capacity,
+    int32_t* region_count);
+/* Native-format zero-copy display path. Unlike the RGBA API this exposes the
+ * framebuffer's actual packed format and reports it through pixel_format.
+ * iOS uses BGRA8 so Metal can upload Java ARGB Pixel rows without a channel
+ * shuffle. The lease is released with phoneme_release_frame_rgba(). */
+const uint8_t* phoneme_acquire_current_frame_native_regions_since(
+    PhoneMERuntimeRef runtime,
+    uint64_t previous_generation,
+    int32_t* width,
+    int32_t* height,
+    uint64_t* generation,
+    int32_t* pixel_format,
     PhoneMEFrameDamageRegion* regions,
     int32_t region_capacity,
     int32_t* region_count);

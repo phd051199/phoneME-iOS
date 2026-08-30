@@ -21,6 +21,9 @@ public:
 
     void publish_roots(u32 invocation_depth,
                        std::span<const ObjectRef> roots);
+    std::span<const ObjectRef> exchange_roots(
+        u32 invocation_depth,
+        std::vector<ObjectRef>& roots);
     void clear_roots(u32 invocation_depth) noexcept;
     void append_reference_roots(std::vector<ObjectRef>& roots) const;
 

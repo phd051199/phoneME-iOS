@@ -108,6 +108,64 @@ void add(NativeMethodRegistry& registry,
     return value->as_int();
 }
 
+template <usize N>
+[[nodiscard]] Result<std::array<Value, N>> field_values(
+    Machine& machine,
+    ObjectRef object,
+    const std::array<usize, N>& indices) {
+    std::array<Value, N> values {};
+    auto read = machine.heap().read_fields(object, indices, values);
+    if (!read) return std::unexpected(read.error());
+    return values;
+}
+
+template <usize N>
+[[nodiscard]] Status set_field_values(
+    Machine& machine,
+    ObjectRef object,
+    const std::array<usize, N>& indices,
+    const std::array<Value, N>& values) {
+    return machine.heap().write_fields(object, indices, values);
+}
+
+struct OptionalState final {
+    ObjectRef value {};
+    bool present {false};
+};
+
+[[nodiscard]] Result<OptionalState> optional_state(Machine& machine,
+                                                   ObjectRef object) {
+    constexpr std::array<usize, 2> fields {
+        kOptionalValueField,
+        kOptionalPresentField,
+    };
+    auto state = field_values(machine, object, fields);
+    if (!state) return std::unexpected(state.error());
+    auto value = (*state)[0U].as_reference();
+    auto present = (*state)[1U].as_int();
+    if (!value) return std::unexpected(value.error());
+    if (!present) return std::unexpected(present.error());
+    return OptionalState {
+        .value = *value,
+        .present = *present != 0,
+    };
+}
+
+[[nodiscard]] Status set_optional_state(Machine& machine,
+                                        ObjectRef object,
+                                        ObjectRef value,
+                                        bool present) {
+    constexpr std::array<usize, 2> fields {
+        kOptionalValueField,
+        kOptionalPresentField,
+    };
+    const std::array<Value, 2> state {
+        Value::from_reference(value),
+        Value::from_int(present ? 1 : 0),
+    };
+    return set_field_values(machine, object, fields, state);
+}
+
 [[nodiscard]] Status set_reference_field(Machine& machine,
                                          ObjectRef object,
                                          usize index,
@@ -312,68 +370,69 @@ void add(NativeMethodRegistry& registry,
     const usize capacity = static_cast<usize>(requested_capacity);
     auto data = allocate_object_array(machine, capacity);
     if (!data) return std::unexpected(data.error());
-    auto stored_data = set_reference_field(machine, list,
-                                           kArrayListDataField, *data);
-    auto stored_size = set_int_field(machine, list, kArrayListSizeField, 0);
-    auto stored_increment = set_int_field(
-        machine, list, kArrayListCapacityIncrementField, 0);
-    auto stored_mode = set_int_field(
-        machine, list, kArrayListMutationModeField, kArrayListMutable);
-    if (!stored_data) return stored_data;
-    if (!stored_size) return stored_size;
-    if (!stored_increment) return stored_increment;
-    return stored_mode;
+    constexpr std::array<usize, 4> fields {
+        kArrayListDataField,
+        kArrayListSizeField,
+        kArrayListCapacityIncrementField,
+        kArrayListMutationModeField,
+    };
+    const std::array<Value, 4> state {
+        Value::from_reference(*data),
+        Value::from_int(0),
+        Value::from_int(0),
+        Value::from_int(kArrayListMutable),
+    };
+    return set_field_values(machine, list, fields, state);
 }
 
-[[nodiscard]] Result<ObjectRef> array_list_data(Machine& machine,
-                                                ObjectRef list) {
-    auto data = reference_field(machine, list, kArrayListDataField);
-    if (!data) return std::unexpected(data.error());
-    if (data->is_null()) {
-        return fail(ErrorCode::invalid_state,
-                    "ArrayList data is not initialized");
-    }
-    return *data;
-}
-
-[[nodiscard]] Status ensure_array_list_capacity(Machine& machine,
-                                                ObjectRef list,
-                                                i32 minimum) {
+[[nodiscard]] Result<ObjectRef> ensure_array_list_capacity_from_state(
+    Machine& machine,
+    ObjectRef list,
+    ObjectRef data,
+    i32 size,
+    i32 minimum) {
     if (minimum < 0) {
         return fail_java("java/lang/OutOfMemoryError",
                          "ArrayList size overflow");
     }
-    auto data = array_list_data(machine, list);
-    if (!data) return std::unexpected(data.error());
-    auto length = machine.heap().array_length(*data);
+    auto length = machine.heap().array_length(data);
     if (!length) return std::unexpected(length.error());
-    if (static_cast<usize>(minimum) <= *length) return {};
+    if (static_cast<usize>(minimum) <= *length) return data;
     usize capacity = *length == 0U ? 10U : *length + (*length >> 1U);
     capacity = std::max(capacity, static_cast<usize>(minimum));
     auto replacement = allocate_object_array(machine, capacity);
     if (!replacement) return std::unexpected(replacement.error());
-    auto size = int_field(machine, list, kArrayListSizeField);
-    if (!size) return std::unexpected(size.error());
-    if (*size > 0) {
+    if (size > 0) {
         auto copied = machine.heap().copy_array_range(
-            *data, 0U, *replacement, 0U, static_cast<usize>(*size));
-        if (!copied) return copied;
+            data, 0U, *replacement, 0U, static_cast<usize>(size));
+        if (!copied) return std::unexpected(copied.error());
     }
-    return set_reference_field(machine, list, kArrayListDataField,
-                               *replacement);
+    auto stored = set_reference_field(machine, list, kArrayListDataField,
+                                      *replacement);
+    if (!stored) return std::unexpected(stored.error());
+    return *replacement;
 }
 
 [[nodiscard]] Status array_list_append(Machine& machine,
                                        ObjectRef list,
                                        ObjectRef value) {
-    auto size = int_field(machine, list, kArrayListSizeField);
-    if (!size) return std::unexpected(size.error());
-    auto ensured = ensure_array_list_capacity(machine, list, *size + 1);
-    if (!ensured) return ensured;
-    auto data = array_list_data(machine, list);
-    if (!data) return std::unexpected(data.error());
+    constexpr std::array<usize, 2> fields {
+        kArrayListDataField,
+        kArrayListSizeField,
+    };
+    auto state = field_values(machine, list, fields);
+    if (!state) return std::unexpected(state.error());
+    auto data = (*state)[0U].as_reference();
+    auto size = (*state)[1U].as_int();
+    if (!data || data->is_null() || !size || *size < 0) {
+        return fail(ErrorCode::invalid_state,
+                    "ArrayList state is invalid");
+    }
+    auto writable_data = ensure_array_list_capacity_from_state(
+        machine, list, *data, *size, *size + 1);
+    if (!writable_data) return std::unexpected(writable_data.error());
     auto stored = machine.heap().set_element(
-        *data, static_cast<usize>(*size), Value::from_reference(value));
+        *writable_data, static_cast<usize>(*size), Value::from_reference(value));
     if (!stored) return stored;
     return set_int_field(machine, list, kArrayListSizeField, *size + 1);
 }
@@ -391,24 +450,24 @@ void add(NativeMethodRegistry& registry,
     auto iterator = machine.class_states().allocate_instance(
         machine.heap(), "java/util/ArrayIterator");
     if (!iterator) return std::unexpected(iterator.error());
-    auto values_stored = set_reference_field(machine, *iterator,
-                                             kIteratorValuesField, values);
-    auto index_stored = set_int_field(machine, *iterator,
-                                     kIteratorIndexField, 0);
-    auto size_stored = set_int_field(machine, *iterator,
-                                    kIteratorSizeField, size);
-    auto owner_stored = set_reference_field(machine, *iterator,
-                                            kIteratorOwnerField, owner);
-    auto last_stored = set_int_field(machine, *iterator,
-                                     kIteratorLastReturnedField, -1);
-    auto kind_stored = set_int_field(machine, *iterator,
-                                     kIteratorRemoveKindField, remove_kind);
-    if (!values_stored) return std::unexpected(values_stored.error());
-    if (!index_stored) return std::unexpected(index_stored.error());
-    if (!size_stored) return std::unexpected(size_stored.error());
-    if (!owner_stored) return std::unexpected(owner_stored.error());
-    if (!last_stored) return std::unexpected(last_stored.error());
-    if (!kind_stored) return std::unexpected(kind_stored.error());
+    constexpr std::array<usize, 6> fields {
+        kIteratorValuesField,
+        kIteratorIndexField,
+        kIteratorSizeField,
+        kIteratorOwnerField,
+        kIteratorLastReturnedField,
+        kIteratorRemoveKindField,
+    };
+    const std::array<Value, 6> state {
+        Value::from_reference(values),
+        Value::from_int(0),
+        Value::from_int(size),
+        Value::from_reference(owner),
+        Value::from_int(-1),
+        Value::from_int(remove_kind),
+    };
+    auto stored = set_field_values(machine, *iterator, fields, state);
+    if (!stored) return std::unexpected(stored.error());
     return *iterator;
 }
 
@@ -488,22 +547,32 @@ void add(NativeMethodRegistry& registry,
                                                   ObjectRef map,
                                                   ObjectRef key,
                                                   i32 target_hash) {
-    auto size = int_field(machine, map, kHashMapSizeField);
-    auto keys = reference_field(machine, map, kHashMapKeysField);
-    auto hashes = reference_field(machine, map, kHashMapHashesField);
+    constexpr std::array<usize, 3> fields {
+        kHashMapSizeField,
+        kHashMapKeysField,
+        kHashMapHashesField,
+    };
+    auto state = field_values(machine, map, fields);
+    if (!state) return std::unexpected(state.error());
+    auto size = (*state)[0U].as_int();
+    auto keys = (*state)[1U].as_reference();
+    auto hashes = (*state)[2U].as_reference();
     if (!size || !keys || !hashes || keys->is_null() || hashes->is_null()) {
         return fail(ErrorCode::invalid_state,
                     "HashMap state is invalid");
     }
+    if (*size < 0) {
+        return fail(ErrorCode::invalid_state,
+                    "HashMap size is negative");
+    }
+    auto cached_hashes = machine.heap().read_int_array(*hashes);
+    if (!cached_hashes) return std::unexpected(cached_hashes.error());
+    if (static_cast<usize>(*size) > cached_hashes->size()) {
+        return fail(ErrorCode::invalid_state,
+                    "HashMap hash storage is shorter than its size");
+    }
     for (i32 index = 0; index < *size; ++index) {
-        auto cached_hash_value = machine.heap().element(
-            *hashes, static_cast<usize>(index));
-        if (!cached_hash_value) {
-            return std::unexpected(cached_hash_value.error());
-        }
-        auto cached_hash = cached_hash_value->as_int();
-        if (!cached_hash) return std::unexpected(cached_hash.error());
-        if (*cached_hash != target_hash) continue;
+        if ((*cached_hashes)[static_cast<usize>(index)] != target_hash) continue;
 
         auto current_value = machine.heap().element(
             *keys, static_cast<usize>(index));
@@ -536,31 +605,48 @@ void add(NativeMethodRegistry& registry,
         static_cast<usize>(requested_capacity));
     auto keys = allocate_object_array(machine, capacity);
     if (!keys) return std::unexpected(keys.error());
-    auto keys_stored = set_reference_field(machine, map, kHashMapKeysField,
-                                           *keys);
-    if (!keys_stored) return keys_stored;
+    auto keys_root = NativeRootScope::pin(machine.native_roots(), *keys);
+    if (!keys_root) return std::unexpected(keys_root.error());
     auto values = allocate_object_array(machine, capacity);
     if (!values) return std::unexpected(values.error());
-    auto values_stored = set_reference_field(machine, map,
-                                             kHashMapValuesField, *values);
-    if (!values_stored) return values_stored;
+    auto values_root = NativeRootScope::pin(machine.native_roots(), *values);
+    if (!values_root) return std::unexpected(values_root.error());
     auto hashes = allocate_int_array(machine, capacity);
     if (!hashes) return std::unexpected(hashes.error());
-    auto hashes_stored = set_reference_field(machine, map,
-                                             kHashMapHashesField, *hashes);
-    auto size_stored = set_int_field(machine, map, kHashMapSizeField, 0);
-    if (!hashes_stored) return hashes_stored;
-    return size_stored;
+    auto hashes_root = NativeRootScope::pin(machine.native_roots(), *hashes);
+    if (!hashes_root) return std::unexpected(hashes_root.error());
+    constexpr std::array<usize, 4> fields {
+        kHashMapKeysField,
+        kHashMapValuesField,
+        kHashMapSizeField,
+        kHashMapHashesField,
+    };
+    const std::array<Value, 4> values_to_store {
+        Value::from_reference(*keys),
+        Value::from_reference(*values),
+        Value::from_int(0),
+        Value::from_reference(*hashes),
+    };
+    return set_field_values(machine, map, fields, values_to_store);
 }
 
 [[nodiscard]] Status ensure_hash_map_capacity(Machine& machine,
                                               ObjectRef map,
                                               i32 minimum) {
-    auto keys = reference_field(machine, map, kHashMapKeysField);
-    auto values = reference_field(machine, map, kHashMapValuesField);
-    auto hashes = reference_field(machine, map, kHashMapHashesField);
+    constexpr std::array<usize, 4> fields {
+        kHashMapKeysField,
+        kHashMapValuesField,
+        kHashMapSizeField,
+        kHashMapHashesField,
+    };
+    auto state = field_values(machine, map, fields);
+    if (!state) return std::unexpected(state.error());
+    auto keys = (*state)[0U].as_reference();
+    auto values = (*state)[1U].as_reference();
+    auto size = (*state)[2U].as_int();
+    auto hashes = (*state)[3U].as_reference();
     if (!keys || !values || !hashes || keys->is_null() ||
-        values->is_null() || hashes->is_null()) {
+        values->is_null() || hashes->is_null() || !size || *size < 0) {
         return fail(ErrorCode::invalid_state,
                     "HashMap storage is invalid");
     }
@@ -571,23 +657,18 @@ void add(NativeMethodRegistry& registry,
         static_cast<usize>(minimum), *capacity * 2U);
     auto new_keys = allocate_object_array(machine, new_capacity);
     if (!new_keys) return std::unexpected(new_keys.error());
-    auto new_keys_stored = set_reference_field(machine, map,
-                                               kHashMapKeysField, *new_keys);
-    if (!new_keys_stored) return new_keys_stored;
+    auto new_keys_root = NativeRootScope::pin(machine.native_roots(), *new_keys);
+    if (!new_keys_root) return std::unexpected(new_keys_root.error());
     auto new_values = allocate_object_array(machine, new_capacity);
     if (!new_values) return std::unexpected(new_values.error());
-    auto new_values_stored = set_reference_field(machine, map,
-                                                 kHashMapValuesField,
-                                                 *new_values);
-    if (!new_values_stored) return new_values_stored;
+    auto new_values_root = NativeRootScope::pin(
+        machine.native_roots(), *new_values);
+    if (!new_values_root) return std::unexpected(new_values_root.error());
     auto new_hashes = allocate_int_array(machine, new_capacity);
     if (!new_hashes) return std::unexpected(new_hashes.error());
-    auto new_hashes_stored = set_reference_field(machine, map,
-                                                 kHashMapHashesField,
-                                                 *new_hashes);
-    if (!new_hashes_stored) return new_hashes_stored;
-    auto size = int_field(machine, map, kHashMapSizeField);
-    if (!size) return std::unexpected(size.error());
+    auto new_hashes_root = NativeRootScope::pin(
+        machine.native_roots(), *new_hashes);
+    if (!new_hashes_root) return std::unexpected(new_hashes_root.error());
     if (*size > 0) {
         auto copied_keys = machine.heap().copy_array_range(
             *keys, 0U, *new_keys, 0U, static_cast<usize>(*size));
@@ -599,7 +680,17 @@ void add(NativeMethodRegistry& registry,
         if (!copied_values) return copied_values;
         if (!copied_hashes) return copied_hashes;
     }
-    return {};
+    constexpr std::array<usize, 3> storage_fields {
+        kHashMapKeysField,
+        kHashMapValuesField,
+        kHashMapHashesField,
+    };
+    const std::array<Value, 3> storage_values {
+        Value::from_reference(*new_keys),
+        Value::from_reference(*new_values),
+        Value::from_reference(*new_hashes),
+    };
+    return set_field_values(machine, map, storage_fields, storage_values);
 }
 
 [[nodiscard]] Result<ObjectRef> hash_map_put(Machine& machine,
@@ -610,12 +701,12 @@ void add(NativeMethodRegistry& registry,
     if (!hash) return std::unexpected(hash.error());
     auto index = map_find_key_with_hash(machine, map, key, *hash);
     if (!index) return std::unexpected(index.error());
-    auto values = reference_field(machine, map, kHashMapValuesField);
-    if (!values || values->is_null()) {
-        return fail(ErrorCode::invalid_state,
-                    "HashMap values are invalid");
-    }
     if (*index >= 0) {
+        auto values = reference_field(machine, map, kHashMapValuesField);
+        if (!values || values->is_null()) {
+            return fail(ErrorCode::invalid_state,
+                        "HashMap values are invalid");
+        }
         auto previous_value = machine.heap().element(
             *values, static_cast<usize>(*index));
         if (!previous_value) return std::unexpected(previous_value.error());
@@ -631,9 +722,16 @@ void add(NativeMethodRegistry& registry,
     if (!size) return std::unexpected(size.error());
     auto ensured = ensure_hash_map_capacity(machine, map, *size + 1);
     if (!ensured) return std::unexpected(ensured.error());
-    auto keys = reference_field(machine, map, kHashMapKeysField);
-    values = reference_field(machine, map, kHashMapValuesField);
-    auto hashes = reference_field(machine, map, kHashMapHashesField);
+    constexpr std::array<usize, 3> storage_fields {
+        kHashMapKeysField,
+        kHashMapValuesField,
+        kHashMapHashesField,
+    };
+    auto storage = field_values(machine, map, storage_fields);
+    if (!storage) return std::unexpected(storage.error());
+    auto keys = (*storage)[0U].as_reference();
+    auto values = (*storage)[1U].as_reference();
+    auto hashes = (*storage)[2U].as_reference();
     if (!keys || !values || !hashes || keys->is_null() ||
         values->is_null() || hashes->is_null()) {
         return fail(ErrorCode::invalid_state,
@@ -660,10 +758,18 @@ void add(NativeMethodRegistry& registry,
     auto index = map_find_key(machine, map, key);
     if (!index) return std::unexpected(index.error());
     if (*index < 0) return ObjectRef {};
-    auto keys = reference_field(machine, map, kHashMapKeysField);
-    auto values = reference_field(machine, map, kHashMapValuesField);
-    auto hashes = reference_field(machine, map, kHashMapHashesField);
-    auto size = int_field(machine, map, kHashMapSizeField);
+    constexpr std::array<usize, 4> fields {
+        kHashMapKeysField,
+        kHashMapValuesField,
+        kHashMapSizeField,
+        kHashMapHashesField,
+    };
+    auto state = field_values(machine, map, fields);
+    if (!state) return std::unexpected(state.error());
+    auto keys = (*state)[0U].as_reference();
+    auto values = (*state)[1U].as_reference();
+    auto size = (*state)[2U].as_int();
+    auto hashes = (*state)[3U].as_reference();
     if (!keys || !values || !hashes || !size || keys->is_null() ||
         values->is_null() || hashes->is_null()) {
         return fail(ErrorCode::invalid_state,
@@ -674,25 +780,19 @@ void add(NativeMethodRegistry& registry,
     if (!previous_value) return std::unexpected(previous_value.error());
     auto previous = previous_value->as_reference();
     if (!previous) return std::unexpected(previous.error());
-    for (i32 current = *index; current + 1 < *size; ++current) {
-        auto next_key = machine.heap().element(
-            *keys, static_cast<usize>(current + 1));
-        auto next_value = machine.heap().element(
-            *values, static_cast<usize>(current + 1));
-        auto next_hash = machine.heap().element(
-            *hashes, static_cast<usize>(current + 1));
-        if (!next_key) return std::unexpected(next_key.error());
-        if (!next_value) return std::unexpected(next_value.error());
-        if (!next_hash) return std::unexpected(next_hash.error());
-        auto shifted_key = machine.heap().set_element(
-            *keys, static_cast<usize>(current), *next_key);
-        auto shifted_value = machine.heap().set_element(
-            *values, static_cast<usize>(current), *next_value);
-        auto shifted_hash = machine.heap().set_element(
-            *hashes, static_cast<usize>(current), *next_hash);
-        if (!shifted_key) return std::unexpected(shifted_key.error());
-        if (!shifted_value) return std::unexpected(shifted_value.error());
-        if (!shifted_hash) return std::unexpected(shifted_hash.error());
+    const usize shifted = static_cast<usize>(*size - *index - 1);
+    if (shifted != 0U) {
+        const usize source = static_cast<usize>(*index + 1);
+        const usize destination = static_cast<usize>(*index);
+        auto shifted_keys = machine.heap().copy_array_range(
+            *keys, source, *keys, destination, shifted);
+        auto shifted_values = machine.heap().copy_array_range(
+            *values, source, *values, destination, shifted);
+        auto shifted_hashes = machine.heap().copy_array_range(
+            *hashes, source, *hashes, destination, shifted);
+        if (!shifted_keys) return std::unexpected(shifted_keys.error());
+        if (!shifted_values) return std::unexpected(shifted_values.error());
+        if (!shifted_hashes) return std::unexpected(shifted_hashes.error());
     }
     auto cleared_key = machine.heap().set_element(
         *keys, static_cast<usize>(*size - 1), Value::from_reference({}));
@@ -779,6 +879,27 @@ map_entries(Machine& machine, ObjectRef source) {
     auto initialized = initialize_array_list(machine, *list, capacity);
     if (!initialized) return std::unexpected(initialized.error());
     return *list;
+}
+
+[[nodiscard]] Status array_list_copy_from_array(Machine& machine,
+                                                ObjectRef list,
+                                                ObjectRef source,
+                                                i32 size) {
+    if (size < 0) {
+        return fail(ErrorCode::invalid_state,
+                    "ArrayList snapshot size is negative");
+    }
+    auto data = reference_field(machine, list, kArrayListDataField);
+    if (!data || data->is_null()) {
+        return fail(ErrorCode::invalid_state,
+                    "ArrayList snapshot storage is invalid");
+    }
+    if (size > 0) {
+        auto copied = machine.heap().copy_array_range(
+            source, 0U, *data, 0U, static_cast<usize>(size));
+        if (!copied) return std::unexpected(copied.error());
+    }
+    return set_int_field(machine, list, kArrayListSizeField, size);
 }
 
 [[nodiscard]] Result<ObjectRef> create_hash_set(Machine& machine,
@@ -1155,8 +1276,14 @@ void register_array_iterator(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto index = int_field(machine, *object, kIteratorIndexField);
-            auto size = int_field(machine, *object, kIteratorSizeField);
+            constexpr std::array<usize, 2> fields {
+                kIteratorIndexField,
+                kIteratorSizeField,
+            };
+            auto state = field_values(machine, *object, fields);
+            if (!state) return std::unexpected(state.error());
+            auto index = (*state)[0U].as_int();
+            auto size = (*state)[1U].as_int();
             if (!index || !size) {
                 return fail(ErrorCode::invalid_state,
                             "ArrayIterator state is invalid");
@@ -1170,10 +1297,16 @@ void register_array_iterator(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto values = reference_field(machine, *object,
-                                          kIteratorValuesField);
-            auto index = int_field(machine, *object, kIteratorIndexField);
-            auto size = int_field(machine, *object, kIteratorSizeField);
+            constexpr std::array<usize, 3> fields {
+                kIteratorValuesField,
+                kIteratorIndexField,
+                kIteratorSizeField,
+            };
+            auto state = field_values(machine, *object, fields);
+            if (!state) return std::unexpected(state.error());
+            auto values = (*state)[0U].as_reference();
+            auto index = (*state)[1U].as_int();
+            auto size = (*state)[2U].as_int();
             if (!values || !index || !size || values->is_null()) {
                 return fail(ErrorCode::invalid_state,
                             "ArrayIterator state is invalid");
@@ -1185,11 +1318,16 @@ void register_array_iterator(NativeMethodRegistry& registry) {
             auto value = machine.heap().element(
                 *values, static_cast<usize>(*index));
             if (!value) return std::unexpected(value.error());
-            auto last = set_int_field(machine, *object,
-                                      kIteratorLastReturnedField, *index);
-            auto updated = set_int_field(machine, *object,
-                                         kIteratorIndexField, *index + 1);
-            if (!last) return std::unexpected(last.error());
+            constexpr std::array<usize, 2> update_fields {
+                kIteratorLastReturnedField,
+                kIteratorIndexField,
+            };
+            const std::array<Value, 2> update_values {
+                Value::from_int(*index),
+                Value::from_int(*index + 1),
+            };
+            auto updated = set_field_values(
+                machine, *object, update_fields, update_values);
             if (!updated) return std::unexpected(updated.error());
             return std::optional<Value>(*value);
         });
@@ -1198,11 +1336,18 @@ void register_array_iterator(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto kind = int_field(machine, *object, kIteratorRemoveKindField);
-            auto last = int_field(machine, *object,
-                                  kIteratorLastReturnedField);
-            auto size = int_field(machine, *object, kIteratorSizeField);
-            auto index = int_field(machine, *object, kIteratorIndexField);
+            constexpr std::array<usize, 4> state_fields {
+                kIteratorRemoveKindField,
+                kIteratorLastReturnedField,
+                kIteratorSizeField,
+                kIteratorIndexField,
+            };
+            auto state = field_values(machine, *object, state_fields);
+            if (!state) return std::unexpected(state.error());
+            auto kind = (*state)[0U].as_int();
+            auto last = (*state)[1U].as_int();
+            auto size = (*state)[2U].as_int();
+            auto index = (*state)[3U].as_int();
             if (!kind || !last || !size || !index) {
                 return fail(ErrorCode::invalid_state,
                             "ArrayIterator remove state is invalid");
@@ -1219,10 +1364,15 @@ void register_array_iterator(NativeMethodRegistry& registry) {
                 return fail_java("java/lang/UnsupportedOperationException",
                                  "iterator remove kind is unsupported");
             }
-            auto owner = reference_field(machine, *object,
-                                         kIteratorOwnerField);
-            auto values = reference_field(machine, *object,
-                                          kIteratorValuesField);
+            constexpr std::array<usize, 2> reference_fields {
+                kIteratorOwnerField,
+                kIteratorValuesField,
+            };
+            auto references = field_values(
+                machine, *object, reference_fields);
+            if (!references) return std::unexpected(references.error());
+            auto owner = (*references)[0U].as_reference();
+            auto values = (*references)[1U].as_reference();
             if (!owner || owner->is_null() || !values || values->is_null()) {
                 return fail(ErrorCode::invalid_state,
                             "ArrayList iterator owner is invalid");
@@ -1233,13 +1383,12 @@ void register_array_iterator(NativeMethodRegistry& registry) {
                 return fail_java("java/util/ConcurrentModificationException",
                                  "ArrayList changed during iteration");
             }
-            for (i32 current = *last; current + 1 < *size; ++current) {
-                auto next = machine.heap().element(
-                    *values, static_cast<usize>(current + 1));
-                if (!next) return std::unexpected(next.error());
-                auto shifted = machine.heap().set_element(
-                    *values, static_cast<usize>(current), *next);
-                if (!shifted) return std::unexpected(shifted.error());
+            const usize shifted = static_cast<usize>(*size - *last - 1);
+            if (shifted != 0U) {
+                auto copied = machine.heap().copy_array_range(
+                    *values, static_cast<usize>(*last + 1),
+                    *values, static_cast<usize>(*last), shifted);
+                if (!copied) return std::unexpected(copied.error());
             }
             auto cleared = machine.heap().set_element(
                 *values, static_cast<usize>(*size - 1),
@@ -1247,19 +1396,23 @@ void register_array_iterator(NativeMethodRegistry& registry) {
             auto owner_updated = set_int_field(machine, *owner,
                                                kArrayListSizeField,
                                                *size - 1);
-            auto size_updated = set_int_field(machine, *object,
-                                              kIteratorSizeField,
-                                              *size - 1);
-            auto index_updated = set_int_field(machine, *object,
-                                               kIteratorIndexField,
-                                               *last);
-            auto last_updated = set_int_field(machine, *object,
-                                              kIteratorLastReturnedField, -1);
+            constexpr std::array<usize, 3> update_fields {
+                kIteratorSizeField,
+                kIteratorIndexField,
+                kIteratorLastReturnedField,
+            };
+            const std::array<Value, 3> update_values {
+                Value::from_int(*size - 1),
+                Value::from_int(*last),
+                Value::from_int(-1),
+            };
+            auto iterator_updated = set_field_values(
+                machine, *object, update_fields, update_values);
             if (!cleared) return std::unexpected(cleared.error());
             if (!owner_updated) return std::unexpected(owner_updated.error());
-            if (!size_updated) return std::unexpected(size_updated.error());
-            if (!index_updated) return std::unexpected(index_updated.error());
-            if (!last_updated) return std::unexpected(last_updated.error());
+            if (!iterator_updated) {
+                return std::unexpected(iterator_updated.error());
+            }
             return std::optional<Value> {};
         });
 }
@@ -1290,10 +1443,20 @@ void register_array_list_extensions(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto data = array_list_data(machine, *object);
-            auto size = int_field(machine, *object, kArrayListSizeField);
-            auto mode = int_field(machine, *object, kArrayListMutationModeField);
-            if (!data) return std::unexpected(data.error());
+            constexpr std::array<usize, 3> fields {
+                kArrayListDataField,
+                kArrayListSizeField,
+                kArrayListMutationModeField,
+            };
+            auto state = field_values(machine, *object, fields);
+            if (!state) return std::unexpected(state.error());
+            auto data = (*state)[0U].as_reference();
+            auto size = (*state)[1U].as_int();
+            auto mode = (*state)[2U].as_int();
+            if (!data || data->is_null()) {
+                return fail(ErrorCode::invalid_state,
+                            "ArrayList data is not initialized");
+            }
             if (!size) return std::unexpected(size.error());
             if (!mode) return std::unexpected(mode.error());
             const i32 remove_kind = *mode == kArrayListMutable
@@ -1310,9 +1473,18 @@ void register_array_list_extensions(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto data = array_list_data(machine, *object);
-            auto size = int_field(machine, *object, kArrayListSizeField);
-            if (!data) return std::unexpected(data.error());
+            constexpr std::array<usize, 2> fields {
+                kArrayListDataField,
+                kArrayListSizeField,
+            };
+            auto state = field_values(machine, *object, fields);
+            if (!state) return std::unexpected(state.error());
+            auto data = (*state)[0U].as_reference();
+            auto size = (*state)[1U].as_int();
+            if (!data || data->is_null()) {
+                return fail(ErrorCode::invalid_state,
+                            "ArrayList data is not initialized");
+            }
             if (!size) return std::unexpected(size.error());
             auto result = allocate_object_array(machine,
                                                 static_cast<usize>(*size));
@@ -1332,11 +1504,20 @@ void register_array_list_extensions(NativeMethodRegistry& registry) {
             auto supplied = reference_argument(arguments, 1U);
             if (!object) return std::unexpected(object.error());
             if (!supplied) return std::unexpected(supplied.error());
-            auto data = array_list_data(machine, *object);
-            auto size = int_field(machine, *object, kArrayListSizeField);
+            constexpr std::array<usize, 2> fields {
+                kArrayListDataField,
+                kArrayListSizeField,
+            };
+            auto state = field_values(machine, *object, fields);
+            if (!state) return std::unexpected(state.error());
+            auto data = (*state)[0U].as_reference();
+            auto size = (*state)[1U].as_int();
             auto supplied_size = machine.heap().array_length(*supplied);
             auto supplied_class = machine.heap().class_name(*supplied);
-            if (!data) return std::unexpected(data.error());
+            if (!data || data->is_null()) {
+                return fail(ErrorCode::invalid_state,
+                            "ArrayList data is not initialized");
+            }
             if (!size) return std::unexpected(size.error());
             if (!supplied_size) return std::unexpected(supplied_size.error());
             if (!supplied_class) return std::unexpected(supplied_class.error());
@@ -1528,9 +1709,14 @@ void register_hash_map(NativeMethodRegistry& registry) {
             auto target = reference_argument(arguments, 1U, true);
             if (!object) return std::unexpected(object.error());
             if (!target) return std::unexpected(target.error());
-            auto values = reference_field(machine, *object,
-                                          kHashMapValuesField);
-            auto size = int_field(machine, *object, kHashMapSizeField);
+            constexpr std::array<usize, 2> fields {
+                kHashMapValuesField,
+                kHashMapSizeField,
+            };
+            auto state = field_values(machine, *object, fields);
+            if (!state) return std::unexpected(state.error());
+            auto values = (*state)[0U].as_reference();
+            auto size = (*state)[1U].as_int();
             if (!values || !size || values->is_null()) {
                 return fail(ErrorCode::invalid_state,
                             "HashMap state is invalid");
@@ -1792,26 +1978,31 @@ void register_hash_map(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto keys = reference_field(machine, *object, kHashMapKeysField);
-            auto values = reference_field(machine, *object,
-                                          kHashMapValuesField);
-            auto hashes = reference_field(machine, *object,
-                                          kHashMapHashesField);
-            auto size = int_field(machine, *object, kHashMapSizeField);
+            constexpr std::array<usize, 4> fields {
+                kHashMapKeysField,
+                kHashMapValuesField,
+                kHashMapSizeField,
+                kHashMapHashesField,
+            };
+            auto state = field_values(machine, *object, fields);
+            if (!state) return std::unexpected(state.error());
+            auto keys = (*state)[0U].as_reference();
+            auto values = (*state)[1U].as_reference();
+            auto size = (*state)[2U].as_int();
+            auto hashes = (*state)[3U].as_reference();
             if (!keys || !values || !hashes || !size || keys->is_null() ||
                 values->is_null() || hashes->is_null()) {
                 return fail(ErrorCode::invalid_state,
                             "HashMap state is invalid");
             }
-            for (i32 index = 0; index < *size; ++index) {
-                auto key_cleared = machine.heap().set_element(
-                    *keys, static_cast<usize>(index),
-                    Value::from_reference({}));
-                auto value_cleared = machine.heap().set_element(
-                    *values, static_cast<usize>(index),
-                    Value::from_reference({}));
-                auto hash_cleared = machine.heap().set_element(
-                    *hashes, static_cast<usize>(index), Value::from_int(0));
+            if (*size > 0) {
+                const usize live = static_cast<usize>(*size);
+                auto key_cleared = machine.heap().fill_array_range(
+                    *keys, 0U, live, Value::from_reference({}));
+                auto value_cleared = machine.heap().fill_array_range(
+                    *values, 0U, live, Value::from_reference({}));
+                auto hash_cleared = machine.heap().fill_array_range(
+                    *hashes, 0U, live, Value::from_int(0));
                 if (!key_cleared) return std::unexpected(key_cleared.error());
                 if (!value_cleared) return std::unexpected(value_cleared.error());
                 if (!hash_cleared) return std::unexpected(hash_cleared.error());
@@ -1825,23 +2016,36 @@ void register_hash_map(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto size = int_field(machine, *object, kHashMapSizeField);
-            auto keys = reference_field(machine, *object, kHashMapKeysField);
+            constexpr std::array<usize, 2> fields {
+                kHashMapSizeField,
+                kHashMapKeysField,
+            };
+            auto state = field_values(machine, *object, fields);
+            if (!state) return std::unexpected(state.error());
+            auto size = (*state)[0U].as_int();
+            auto keys = (*state)[1U].as_reference();
             if (!size || !keys || keys->is_null()) {
                 return fail(ErrorCode::invalid_state,
                             "HashMap state is invalid");
+            }
+            if (*size < 0) {
+                return fail(ErrorCode::invalid_state,
+                            "HashMap size is negative");
+            }
+            auto key_values = machine.heap().read_reference_array(*keys);
+            if (!key_values) return std::unexpected(key_values.error());
+            if (static_cast<usize>(*size) > key_values->size()) {
+                return fail(ErrorCode::invalid_state,
+                            "HashMap key storage is shorter than its size");
             }
             auto set = create_hash_set(machine, *size * 2);
             if (!set) return std::unexpected(set.error());
             auto map = hash_set_map(machine, *set);
             if (!map) return std::unexpected(map.error());
             for (i32 index = 0; index < *size; ++index) {
-                auto key_value = machine.heap().element(
-                    *keys, static_cast<usize>(index));
-                if (!key_value) return std::unexpected(key_value.error());
-                auto key = key_value->as_reference();
-                if (!key) return std::unexpected(key.error());
-                auto stored = hash_map_put(machine, *map, *key, *key);
+                const ObjectRef key =
+                    (*key_values)[static_cast<usize>(index)];
+                auto stored = hash_map_put(machine, *map, key, key);
                 if (!stored) return std::unexpected(stored.error());
             }
             return std::optional<Value>(Value::from_reference(*set));
@@ -1852,24 +2056,27 @@ void register_hash_map(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto size = int_field(machine, *object, kHashMapSizeField);
-            auto values = reference_field(machine, *object,
-                                          kHashMapValuesField);
+            constexpr std::array<usize, 2> fields {
+                kHashMapSizeField,
+                kHashMapValuesField,
+            };
+            auto state = field_values(machine, *object, fields);
+            if (!state) return std::unexpected(state.error());
+            auto size = (*state)[0U].as_int();
+            auto values = (*state)[1U].as_reference();
             if (!size || !values || values->is_null()) {
                 return fail(ErrorCode::invalid_state,
                             "HashMap state is invalid");
             }
+            if (*size < 0) {
+                return fail(ErrorCode::invalid_state,
+                            "HashMap size is negative");
+            }
             auto list = create_array_list(machine, *size);
             if (!list) return std::unexpected(list.error());
-            for (i32 index = 0; index < *size; ++index) {
-                auto value = machine.heap().element(
-                    *values, static_cast<usize>(index));
-                if (!value) return std::unexpected(value.error());
-                auto reference = value->as_reference();
-                if (!reference) return std::unexpected(reference.error());
-                auto appended = array_list_append(machine, *list, *reference);
-                if (!appended) return std::unexpected(appended.error());
-            }
+            auto copied = array_list_copy_from_array(
+                machine, *list, *values, *size);
+            if (!copied) return std::unexpected(copied.error());
             return std::optional<Value>(Value::from_reference(*list));
         });
     add(registry, "java/util/HashMap", "toString", "()Ljava/lang/String;",
@@ -1877,10 +2084,16 @@ void register_hash_map(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto size = int_field(machine, *object, kHashMapSizeField);
-            auto keys = reference_field(machine, *object, kHashMapKeysField);
-            auto values = reference_field(machine, *object,
-                                          kHashMapValuesField);
+            constexpr std::array<usize, 3> fields {
+                kHashMapSizeField,
+                kHashMapKeysField,
+                kHashMapValuesField,
+            };
+            auto state = field_values(machine, *object, fields);
+            if (!state) return std::unexpected(state.error());
+            auto size = (*state)[0U].as_int();
+            auto keys = (*state)[1U].as_reference();
+            auto values = (*state)[2U].as_reference();
             if (!size || !keys || !values || keys->is_null() || values->is_null()) {
                 return fail(ErrorCode::invalid_state,
                             "HashMap state is invalid");
@@ -2035,27 +2248,38 @@ void register_hash_set(NativeMethodRegistry& registry) {
             if (!object) return std::unexpected(object.error());
             auto map = hash_set_map(machine, *object);
             if (!map) return std::unexpected(map.error());
-            auto keys = reference_field(machine, *map, kHashMapKeysField);
-            auto values = reference_field(machine, *map, kHashMapValuesField);
-            auto hashes = reference_field(machine, *map, kHashMapHashesField);
-            auto size = int_field(machine, *map, kHashMapSizeField);
+            constexpr std::array<usize, 4> fields {
+                kHashMapKeysField,
+                kHashMapValuesField,
+                kHashMapHashesField,
+                kHashMapSizeField,
+            };
+            auto state = field_values(machine, *map, fields);
+            if (!state) return std::unexpected(state.error());
+            auto keys = (*state)[0U].as_reference();
+            auto values = (*state)[1U].as_reference();
+            auto hashes = (*state)[2U].as_reference();
+            auto size = (*state)[3U].as_int();
             if (!keys || !values || !hashes || !size || keys->is_null() ||
                 values->is_null() || hashes->is_null()) {
                 return fail(ErrorCode::invalid_state,
                             "HashSet state is invalid");
             }
-            for (i32 index = 0; index < *size; ++index) {
-                auto key_cleared = machine.heap().set_element(
-                    *keys, static_cast<usize>(index),
-                    Value::from_reference({}));
-                auto value_cleared = machine.heap().set_element(
-                    *values, static_cast<usize>(index),
-                    Value::from_reference({}));
-                auto hash_cleared = machine.heap().set_element(
-                    *hashes, static_cast<usize>(index), Value::from_int(0));
-                if (!key_cleared) return std::unexpected(key_cleared.error());
-                if (!value_cleared) return std::unexpected(value_cleared.error());
-                if (!hash_cleared) return std::unexpected(hash_cleared.error());
+            if (*size > 0) {
+                const usize live = static_cast<usize>(*size);
+                auto keys_cleared = machine.heap().fill_array_range(
+                    *keys, 0U, live, Value::from_reference({}));
+                auto values_cleared = machine.heap().fill_array_range(
+                    *values, 0U, live, Value::from_reference({}));
+                auto hashes_cleared = machine.heap().fill_array_range(
+                    *hashes, 0U, live, Value::from_int(0));
+                if (!keys_cleared) return std::unexpected(keys_cleared.error());
+                if (!values_cleared) {
+                    return std::unexpected(values_cleared.error());
+                }
+                if (!hashes_cleared) {
+                    return std::unexpected(hashes_cleared.error());
+                }
             }
             auto reset = set_int_field(machine, *map, kHashMapSizeField, 0);
             if (!reset) return std::unexpected(reset.error());
@@ -2072,8 +2296,14 @@ void register_hash_set(NativeMethodRegistry& registry) {
                 if (!object) return std::unexpected(object.error());
                 auto map = hash_set_map(machine, *object);
                 if (!map) return std::unexpected(map.error());
-                auto size = int_field(machine, *map, kHashMapSizeField);
-                auto keys = reference_field(machine, *map, kHashMapKeysField);
+                constexpr std::array<usize, 2> fields {
+                    kHashMapSizeField,
+                    kHashMapKeysField,
+                };
+                auto state = field_values(machine, *map, fields);
+                if (!state) return std::unexpected(state.error());
+                auto size = (*state)[0U].as_int();
+                auto keys = (*state)[1U].as_reference();
                 if (!size || !keys || keys->is_null()) {
                     return fail(ErrorCode::invalid_state,
                                 "HashSet state is invalid");
@@ -2107,8 +2337,14 @@ void register_hash_set(NativeMethodRegistry& registry) {
             if (!supplied) return std::unexpected(supplied.error());
             auto map = hash_set_map(machine, *object);
             if (!map) return std::unexpected(map.error());
-            auto size = int_field(machine, *map, kHashMapSizeField);
-            auto keys = reference_field(machine, *map, kHashMapKeysField);
+            constexpr std::array<usize, 2> fields {
+                kHashMapSizeField,
+                kHashMapKeysField,
+            };
+            auto state = field_values(machine, *map, fields);
+            if (!state) return std::unexpected(state.error());
+            auto size = (*state)[0U].as_int();
+            auto keys = (*state)[1U].as_reference();
             auto supplied_size = machine.heap().array_length(*supplied);
             auto supplied_class = machine.heap().class_name(*supplied);
             if (!size || !keys || keys->is_null() || !supplied_size ||
@@ -3058,12 +3294,8 @@ void register_optional(NativeMethodRegistry& registry) {
         if (!optional) return std::unexpected(optional.error());
         auto pinned = NativeRootScope::pin(machine.native_roots(), *optional);
         if (!pinned) return std::unexpected(pinned.error());
-        auto stored_value = set_reference_field(
-            machine, *optional, kOptionalValueField, value);
-        auto stored_present = set_int_field(
-            machine, *optional, kOptionalPresentField, present ? 1 : 0);
-        if (!stored_value) return std::unexpected(stored_value.error());
-        if (!stored_present) return std::unexpected(stored_present.error());
+        auto stored = set_optional_state(machine, *optional, value, present);
+        if (!stored) return std::unexpected(stored.error());
         return *optional;
     };
 
@@ -3077,12 +3309,9 @@ void register_optional(NativeMethodRegistry& registry) {
             if (!object) return std::unexpected(object.error());
             if (!value) return std::unexpected(value.error());
             if (!present) return std::unexpected(present.error());
-            auto stored_value = set_reference_field(
-                machine, *object, kOptionalValueField, *value);
-            auto stored_present = set_int_field(
-                machine, *object, kOptionalPresentField, *present != 0 ? 1 : 0);
-            if (!stored_value) return std::unexpected(stored_value.error());
-            if (!stored_present) return std::unexpected(stored_present.error());
+            auto stored = set_optional_state(
+                machine, *object, *value, *present != 0);
+            if (!stored) return std::unexpected(stored.error());
             return std::optional<Value> {};
         });
     add(registry, "java/util/Optional", "empty", "()Ljava/util/Optional;",
@@ -3126,15 +3355,13 @@ void register_optional(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto present = int_field(machine, *object, kOptionalPresentField);
-            if (!present) return std::unexpected(present.error());
-            if (*present == 0) {
+            auto state = optional_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (!state->present) {
                 return fail_java("java/util/NoSuchElementException",
                                  "No value present");
             }
-            auto value = reference_field(machine, *object, kOptionalValueField);
-            if (!value) return std::unexpected(value.error());
-            return std::optional<Value>(Value::from_reference(*value));
+            return std::optional<Value>(Value::from_reference(state->value));
         });
     add(registry, "java/util/Optional", "ifPresent",
         "(Ljava/util/function/Consumer;)V",
@@ -3144,16 +3371,14 @@ void register_optional(NativeMethodRegistry& registry) {
             auto consumer = reference_argument(arguments, 1U, true);
             if (!object) return std::unexpected(object.error());
             if (!consumer) return std::unexpected(consumer.error());
-            auto present = int_field(machine, *object, kOptionalPresentField);
-            if (!present) return std::unexpected(present.error());
-            if (*present == 0) return std::optional<Value> {};
+            auto state = optional_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (!state->present) return std::optional<Value> {};
             if (consumer->is_null()) {
                 return fail_java("java/lang/NullPointerException",
                                  "Optional consumer is null");
             }
-            auto value = reference_field(machine, *object, kOptionalValueField);
-            if (!value) return std::unexpected(value.error());
-            const Value callback_argument = Value::from_reference(*value);
+            const Value callback_argument = Value::from_reference(state->value);
             auto invoked = invoke_checked(
                 machine, *consumer, "java/util/function/Consumer", "accept",
                 "(Ljava/lang/Object;)V",
@@ -3169,14 +3394,12 @@ void register_optional(NativeMethodRegistry& registry) {
             auto predicate = reference_argument(arguments, 1U);
             if (!object) return std::unexpected(object.error());
             if (!predicate) return std::unexpected(predicate.error());
-            auto present = int_field(machine, *object, kOptionalPresentField);
-            if (!present) return std::unexpected(present.error());
-            if (*present == 0) {
+            auto state = optional_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (!state->present) {
                 return std::optional<Value>(Value::from_reference(*object));
             }
-            auto value = reference_field(machine, *object, kOptionalValueField);
-            if (!value) return std::unexpected(value.error());
-            const Value callback_argument = Value::from_reference(*value);
+            const Value callback_argument = Value::from_reference(state->value);
             auto matched = invoke_checked(
                 machine, *predicate, "java/util/function/Predicate", "test",
                 "(Ljava/lang/Object;)Z",
@@ -3203,16 +3426,14 @@ void register_optional(NativeMethodRegistry& registry) {
             auto mapper = reference_argument(arguments, 1U);
             if (!object) return std::unexpected(object.error());
             if (!mapper) return std::unexpected(mapper.error());
-            auto present = int_field(machine, *object, kOptionalPresentField);
-            if (!present) return std::unexpected(present.error());
-            if (*present == 0) {
+            auto state = optional_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (!state->present) {
                 auto empty = make_optional(machine, {}, false);
                 if (!empty) return std::unexpected(empty.error());
                 return std::optional<Value>(Value::from_reference(*empty));
             }
-            auto value = reference_field(machine, *object, kOptionalValueField);
-            if (!value) return std::unexpected(value.error());
-            const Value callback_argument = Value::from_reference(*value);
+            const Value callback_argument = Value::from_reference(state->value);
             auto mapped = invoke_checked(
                 machine, *mapper, "java/util/function/Function", "apply",
                 "(Ljava/lang/Object;)Ljava/lang/Object;",
@@ -3237,14 +3458,12 @@ void register_optional(NativeMethodRegistry& registry) {
             auto mapper = reference_argument(arguments, 1U);
             if (!object) return std::unexpected(object.error());
             if (!mapper) return std::unexpected(mapper.error());
-            auto present = int_field(machine, *object, kOptionalPresentField);
-            if (!present) return std::unexpected(present.error());
-            if (*present == 0) {
+            auto state = optional_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (!state->present) {
                 return std::optional<Value>(Value::from_reference(*object));
             }
-            auto value = reference_field(machine, *object, kOptionalValueField);
-            if (!value) return std::unexpected(value.error());
-            const Value callback_argument = Value::from_reference(*value);
+            const Value callback_argument = Value::from_reference(state->value);
             auto mapped = invoke_checked(
                 machine, *mapper, "java/util/function/Function", "apply",
                 "(Ljava/lang/Object;)Ljava/lang/Object;",
@@ -3279,14 +3498,12 @@ void register_optional(NativeMethodRegistry& registry) {
             auto fallback = reference_argument(arguments, 1U, true);
             if (!object) return std::unexpected(object.error());
             if (!fallback) return std::unexpected(fallback.error());
-            auto present = int_field(machine, *object, kOptionalPresentField);
-            if (!present) return std::unexpected(present.error());
-            if (*present == 0) {
+            auto state = optional_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (!state->present) {
                 return std::optional<Value>(Value::from_reference(*fallback));
             }
-            auto value = reference_field(machine, *object, kOptionalValueField);
-            if (!value) return std::unexpected(value.error());
-            return std::optional<Value>(Value::from_reference(*value));
+            return std::optional<Value>(Value::from_reference(state->value));
         });
     add(registry, "java/util/Optional", "orElseGet",
         "(Ljava/util/function/Supplier;)Ljava/lang/Object;",
@@ -3296,13 +3513,10 @@ void register_optional(NativeMethodRegistry& registry) {
             auto supplier = reference_argument(arguments, 1U, true);
             if (!object) return std::unexpected(object.error());
             if (!supplier) return std::unexpected(supplier.error());
-            auto present = int_field(machine, *object, kOptionalPresentField);
-            if (!present) return std::unexpected(present.error());
-            if (*present != 0) {
-                auto value = reference_field(machine, *object,
-                                             kOptionalValueField);
-                if (!value) return std::unexpected(value.error());
-                return std::optional<Value>(Value::from_reference(*value));
+            auto state = optional_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (state->present) {
+                return std::optional<Value>(Value::from_reference(state->value));
             }
             if (supplier->is_null()) {
                 return fail_java("java/lang/NullPointerException",
@@ -3326,13 +3540,10 @@ void register_optional(NativeMethodRegistry& registry) {
             auto supplier = reference_argument(arguments, 1U, true);
             if (!object) return std::unexpected(object.error());
             if (!supplier) return std::unexpected(supplier.error());
-            auto present = int_field(machine, *object, kOptionalPresentField);
-            if (!present) return std::unexpected(present.error());
-            if (*present != 0) {
-                auto value = reference_field(machine, *object,
-                                             kOptionalValueField);
-                if (!value) return std::unexpected(value.error());
-                return std::optional<Value>(Value::from_reference(*value));
+            auto state = optional_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (state->present) {
+                return std::optional<Value>(Value::from_reference(state->value));
             }
             if (supplier->is_null()) {
                 return fail_java("java/lang/NullPointerException",
@@ -3396,23 +3607,17 @@ void register_optional(NativeMethodRegistry& registry) {
             if (*other_class != "java/util/Optional") {
                 return std::optional<Value>(Value::from_int(0));
             }
-            auto present = int_field(machine, *object, kOptionalPresentField);
-            auto other_present = int_field(machine, *other,
-                                           kOptionalPresentField);
-            if (!present) return std::unexpected(present.error());
-            if (!other_present) return std::unexpected(other_present.error());
-            if ((*present != 0) != (*other_present != 0)) {
+            auto state = optional_state(machine, *object);
+            auto other_state = optional_state(machine, *other);
+            if (!state) return std::unexpected(state.error());
+            if (!other_state) return std::unexpected(other_state.error());
+            if (state->present != other_state->present) {
                 return std::optional<Value>(Value::from_int(0));
             }
-            if (*present == 0) {
+            if (!state->present) {
                 return std::optional<Value>(Value::from_int(1));
             }
-            auto value = reference_field(machine, *object, kOptionalValueField);
-            auto other_value = reference_field(machine, *other,
-                                               kOptionalValueField);
-            if (!value) return std::unexpected(value.error());
-            if (!other_value) return std::unexpected(other_value.error());
-            auto equal = values_equal(machine, *value, *other_value);
+            auto equal = values_equal(machine, state->value, other_state->value);
             if (!equal) return std::unexpected(equal.error());
             return std::optional<Value>(Value::from_int(*equal ? 1 : 0));
         });
@@ -3421,14 +3626,12 @@ void register_optional(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto present = int_field(machine, *object, kOptionalPresentField);
-            if (!present) return std::unexpected(present.error());
-            if (*present == 0) {
+            auto state = optional_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (!state->present) {
                 return std::optional<Value>(Value::from_int(0));
             }
-            auto value = reference_field(machine, *object, kOptionalValueField);
-            if (!value) return std::unexpected(value.error());
-            auto hash = invoke_checked(machine, *value, "java/lang/Object",
+            auto hash = invoke_checked(machine, state->value, "java/lang/Object",
                                        "hashCode", "()I");
             if (!hash) return std::unexpected(hash.error());
             if (!hash->has_value()) {
@@ -3442,16 +3645,13 @@ void register_optional(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments);
             if (!object) return std::unexpected(object.error());
-            auto present = int_field(machine, *object, kOptionalPresentField);
-            if (!present) return std::unexpected(present.error());
+            auto state = optional_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
             std::u16string text;
-            if (*present == 0) {
+            if (!state->present) {
                 text = u"Optional.empty";
             } else {
-                auto value = reference_field(machine, *object,
-                                             kOptionalValueField);
-                if (!value) return std::unexpected(value.error());
-                auto rendered = value_text(machine, *value, *object,
+                auto rendered = value_text(machine, state->value, *object,
                                            u"(this Optional)");
                 if (!rendered) return std::unexpected(rendered.error());
                 text = u"Optional[";

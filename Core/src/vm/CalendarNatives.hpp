@@ -9,6 +9,7 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "phoneme/vm/Machine.hpp"
 #include "phoneme/vm/NativeMethodRegistry.hpp"
@@ -178,8 +179,15 @@ struct Arrays final {
 
 [[nodiscard]] inline Result<Arrays> arrays(Machine& machine,
                                            ObjectRef calendar) {
-    auto fields = reference_field(machine, calendar, kFieldsField);
-    auto is_set = reference_field(machine, calendar, kIsSetField);
+    constexpr std::array<usize, 2> indices {
+        kFieldsField,
+        kIsSetField,
+    };
+    std::array<Value, indices.size()> values {};
+    auto loaded = machine.heap().read_fields(calendar, indices, values);
+    if (!loaded) return std::unexpected(loaded.error());
+    auto fields = values[0U].as_reference();
+    auto is_set = values[1U].as_reference();
     if (!fields || !is_set) {
         return fail(ErrorCode::invalid_state,
                     "Calendar field arrays are unavailable");
@@ -189,6 +197,31 @@ struct Arrays final {
                     "Calendar field arrays are null");
     }
     return Arrays {*fields, *is_set};
+}
+
+[[nodiscard]] inline Result<std::vector<i32>> calendar_fields_snapshot(
+    Machine& machine,
+    const Arrays& storage) {
+    auto fields = machine.heap().read_int_array(storage.fields);
+    if (!fields) return std::unexpected(fields.error());
+    if (fields->size() < static_cast<usize>(kFieldCount)) {
+        return fail(ErrorCode::invalid_state,
+                    "Calendar fields array is shorter than FIELD_COUNT");
+    }
+    return fields;
+}
+
+[[nodiscard]] inline Status store_calendar_fields(
+    Machine& machine,
+    const Arrays& storage,
+    std::span<const i32> fields) {
+    if (fields.size() < static_cast<usize>(kFieldCount)) {
+        return fail(ErrorCode::invalid_state,
+                    "Calendar field snapshot is shorter than FIELD_COUNT");
+    }
+    return machine.heap().write_int_array(
+        storage.fields, 0U,
+        fields.first(static_cast<usize>(kFieldCount)));
 }
 
 [[nodiscard]] inline Result<i32> array_int(Machine& machine,
@@ -260,8 +293,7 @@ struct Arrays final {
     return day + (day < 0 ? 7 + kSunday : kSunday);
 }
 
-[[nodiscard]] inline Status time_to_fields(Machine& machine,
-                                           const Arrays& storage,
+[[nodiscard]] inline Status time_to_fields(std::vector<i32>& fields,
                                            i64 time) {
     i32 day_of_year = 0;
     i32 raw_year = 1970;
@@ -283,10 +315,8 @@ struct Arrays final {
         }
         leap = (raw_year & 3) == 0 &&
                (raw_year % 100 != 0 || raw_year % 400 == 0);
-        auto stored = set_calendar_field(
-            machine, storage, kDayOfWeek,
-            static_cast<i32>((epoch_day + 1) % 7));
-        if (!stored) return stored;
+        fields[static_cast<usize>(kDayOfWeek)] =
+            static_cast<i32>((epoch_day + 1) % 7);
     } else {
         const i64 epoch_day = millis_to_julian_day(time) -
                               (kJanuaryOneYearOneJulianDay - 2);
@@ -296,10 +326,8 @@ struct Arrays final {
                                 floor_divide(raw_year - 1, 4);
         day_of_year = static_cast<i32>(epoch_day - january_one);
         leap = (raw_year & 3) == 0;
-        auto stored = set_calendar_field(
-            machine, storage, kDayOfWeek,
-            static_cast<i32>((epoch_day - 1) % 7));
-        if (!stored) return stored;
+        fields[static_cast<usize>(kDayOfWeek)] =
+            static_cast<i32>((epoch_day - 1) % 7);
     }
 
     i32 correction = 0;
@@ -310,9 +338,8 @@ struct Arrays final {
         (leap ? kLeapDaysBeforeMonth[static_cast<usize>(month)]
               : kDaysBeforeMonth[static_cast<usize>(month)]) + 1;
 
-    auto dow = calendar_field(machine, storage, kDayOfWeek);
-    if (!dow) return std::unexpected(dow.error());
-    const i32 normalized_dow = *dow + (*dow < 0 ? kSunday + 7 : kSunday);
+    const i32 dow = fields[static_cast<usize>(kDayOfWeek)];
+    const i32 normalized_dow = dow + (dow < 0 ? kSunday + 7 : kSunday);
     const i32 visible_year = raw_year < 1 ? 1 - raw_year : raw_year;
     for (const auto [field, value] : std::array<std::pair<i32, i32>, 4> {{
              {kDayOfWeek, normalized_dow},
@@ -320,8 +347,7 @@ struct Arrays final {
              {kMonth, month},
              {kDate, date},
          }}) {
-        auto stored = set_calendar_field(machine, storage, field, value);
-        if (!stored) return stored;
+        fields[static_cast<usize>(field)] = value;
     }
     return {};
 }
@@ -334,6 +360,8 @@ struct Arrays final {
     if (!storage) return std::unexpected(storage.error());
     if (!time) return std::unexpected(time.error());
     if (!offset) return std::unexpected(offset.error());
+    auto fields = calendar_fields_snapshot(machine, *storage);
+    if (!fields) return std::unexpected(fields.error());
 
     i64 local = wrapping_add(*time, static_cast<i64>(*offset));
     if (*time > 0 && local < 0 && *offset > 0) {
@@ -341,7 +369,7 @@ struct Arrays final {
     } else if (*time < 0 && local > 0 && *offset < 0) {
         local = std::numeric_limits<i64>::min();
     }
-    auto date_fields = time_to_fields(machine, *storage, local);
+    auto date_fields = time_to_fields(*fields, local);
     if (!date_fields) return date_fields;
 
     const i64 days = local / kOneDay;
@@ -361,7 +389,7 @@ struct Arrays final {
         } else if (local < 0 && dst_millis > 0 && dst_offset < 0) {
             dst_millis = std::numeric_limits<i64>::min();
         }
-        auto adjusted = time_to_fields(machine, *storage, dst_millis);
+        auto adjusted = time_to_fields(*fields, dst_millis);
         if (!adjusted) return adjusted;
     }
 
@@ -380,10 +408,9 @@ struct Arrays final {
              {kAmPm, hour_of_day / 12},
              {kHour, hour_of_day % 12},
          }}) {
-        auto stored = set_calendar_field(machine, *storage, field, value);
-        if (!stored) return stored;
+        (*fields)[static_cast<usize>(field)] = value;
     }
-    return {};
+    return store_calendar_fields(machine, *storage, *fields);
 }
 
 [[nodiscard]] inline Result<i64> calculate_julian_day(
@@ -583,16 +610,20 @@ struct Arrays final {
         "[Z", static_cast<usize>(kFieldCount), Value::from_int(0));
     if (!fields) return std::unexpected(fields.error());
     if (!is_set) return std::unexpected(is_set.error());
-    auto zone_stored = set_reference_field(machine, calendar, kZoneField, zone);
-    auto fields_stored = set_reference_field(
-        machine, calendar, kFieldsField, *fields);
-    auto flags_stored = set_reference_field(
-        machine, calendar, kIsSetField, *is_set);
-    auto time_flag = set_int_field(machine, calendar, kIsTimeSetField, 1);
-    if (!zone_stored) return zone_stored;
-    if (!fields_stored) return fields_stored;
-    if (!flags_stored) return flags_stored;
-    if (!time_flag) return time_flag;
+    constexpr std::array<usize, 4> indices {
+        kZoneField,
+        kFieldsField,
+        kIsSetField,
+        kIsTimeSetField,
+    };
+    const std::array<Value, indices.size()> values {
+        Value::from_reference(zone),
+        Value::from_reference(*fields),
+        Value::from_reference(*is_set),
+        Value::from_int(1),
+    };
+    auto initialized = machine.heap().write_fields(calendar, indices, values);
+    if (!initialized) return initialized;
     return set_time_in_millis(machine, calendar, millis);
 }
 
@@ -872,13 +903,14 @@ inline void register_natives(NativeMethodRegistry& registry) {
             if (!calendar) return std::unexpected(calendar.error());
             auto storage = arrays(machine, *calendar);
             if (!storage) return std::unexpected(storage.error());
-            for (i32 field = 0; field < kFieldCount; ++field) {
-                auto value = set_calendar_field(machine, *storage, field, 0);
-                auto flag = set_calendar_is_set(
-                    machine, *storage, field, false);
-                if (!value) return std::unexpected(value.error());
-                if (!flag) return std::unexpected(flag.error());
-            }
+            auto fields_cleared = machine.heap().fill_array_range(
+                storage->fields, 0U, static_cast<usize>(kFieldCount),
+                Value::from_int(0));
+            auto flags_cleared = machine.heap().fill_array_range(
+                storage->is_set, 0U, static_cast<usize>(kFieldCount),
+                Value::from_int(0));
+            if (!fields_cleared) return std::unexpected(fields_cleared.error());
+            if (!flags_cleared) return std::unexpected(flags_cleared.error());
             auto invalid = set_int_field(
                 machine, *calendar, kIsTimeSetField, 0);
             if (!invalid) return std::unexpected(invalid.error());

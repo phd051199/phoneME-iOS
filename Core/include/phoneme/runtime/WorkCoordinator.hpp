@@ -47,6 +47,7 @@ public:
 
     [[nodiscard]] ThermalPressure thermal_pressure() const noexcept;
     [[nodiscard]] FramePressure frame_pressure() const noexcept;
+    [[nodiscard]] bool frame_boost_active() const noexcept;
     [[nodiscard]] u32 active_frame_jobs() const noexcept;
     [[nodiscard]] u32 active_background_jobs() const noexcept;
 
@@ -55,6 +56,7 @@ private:
         static_cast<u8>(ThermalPressure::nominal)};
     std::atomic<u8> frame_pressure_ {
         static_cast<u8>(FramePressure::normal)};
+    std::atomic<u8> frame_boost_frames_ {0U};
     std::atomic<u32> active_frame_jobs_ {0U};
     std::atomic<u32> active_background_jobs_ {0U};
 };

@@ -5,6 +5,7 @@ import process from "node:process";
 
 const root = path.resolve(import.meta.dirname, "..");
 const customJarPath = process.argv[2];
+const extraJarPaths = process.argv.slice(3).map((value) => path.resolve(value));
 const websocketProxyUrl = process.env.PHONEME_WEBSOCKET_PROXY_URL?.trim() || "";
 const holdMilliseconds = Math.max(0, Number.parseInt(process.env.PHONEME_SMOKE_HOLD_MS ?? "0", 10) || 0);
 const skipReload = process.env.PHONEME_SMOKE_SKIP_RELOAD === "1";
@@ -34,6 +35,7 @@ const externalBaseUrl = process.env.PHONEME_SMOKE_BASE_URL?.trim() || "";
 const baseUrl = externalBaseUrl || `http://127.0.0.1:${port}`;
 
 await access(jarPath);
+for (const extraJarPath of extraJarPaths) await access(extraJarPath);
 await access(chromePath);
 
 const preview = externalBaseUrl ? null : spawn(
@@ -189,12 +191,12 @@ try {
   if (!inputNode.nodeId) throw new Error("JAR file input not found");
   console.log("[smoke] selecting JAR");
   await command("DOM.setFileInputFiles", {
-    files: [jarPath],
+    files: [jarPath, ...extraJarPaths],
     nodeId: inputNode.nodeId
   });
 
   console.log("[smoke] waiting for installation");
-  await waitForExpression("Boolean(document.querySelector('.game-row'))", 30_000);
+  await waitForExpression(`document.querySelectorAll('.game-row').length >= ${1 + extraJarPaths.length}`, 60_000);
   console.log("[smoke] installed");
   const installedTitle = await evaluate(`(() => {
     const row = document.querySelector('.game-row');
@@ -271,7 +273,7 @@ try {
       return { status: 'lcdui', body };
     }
     return null;
-  })()`, 30_000);
+  })()`, 120_000);
 
   if (result.status === "error") {
     throw new Error(`MIDlet launch failed:\n${result.body}`);

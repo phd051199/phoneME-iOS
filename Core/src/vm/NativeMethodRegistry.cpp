@@ -58,13 +58,25 @@ public:
         }
     }
 
-    void record(const NativeMethodSignature& signature) {
+    [[nodiscard]] bool enabled() const noexcept {
+        return !output_path_.empty();
+    }
+
+    void merge(std::span<const NativeMethodInvocationCount> counts) {
         if (output_path_.empty()) return;
         std::scoped_lock lock(mutex_);
-        auto& count = counts_[std::tuple {
-            signature.owner, signature.name, signature.descriptor,
-        }];
-        if (count != std::numeric_limits<std::size_t>::max()) ++count;
+        for (const NativeMethodInvocationCount& invocation : counts) {
+            if (invocation.count == 0U) continue;
+            const NativeMethodSignature& signature = invocation.signature;
+            auto& count = counts_[std::tuple {
+                signature.owner, signature.name, signature.descriptor,
+            }];
+            if (invocation.count > std::numeric_limits<std::size_t>::max() - count) {
+                count = std::numeric_limits<std::size_t>::max();
+            } else {
+                count += invocation.count;
+            }
+        }
     }
 
 private:
@@ -91,6 +103,66 @@ ProcessNativeCoverage& process_native_coverage() {
 
 } // namespace
 
+NativeMethodRegistry::NativeMethodRegistry() {
+    publish_dispatch_table_locked();
+}
+
+NativeMethodRegistry::~NativeMethodRegistry() {
+    ProcessNativeCoverage& coverage = process_native_coverage();
+    if (coverage.enabled()) coverage.merge(invocation_counts());
+}
+
+void NativeMethodRegistry::publish_dispatch_table_locked() {
+    auto snapshot = std::make_unique<const DispatchTable>(entries_);
+    const DispatchTable* published = snapshot.get();
+    dispatch_snapshots_.push_back(std::move(snapshot));
+    dispatch_table_.store(published, std::memory_order_release);
+}
+
+void NativeMethodRegistry::begin_registration_batch() noexcept {
+    std::scoped_lock lock(mutex_);
+    if (registration_batch_depth_ != std::numeric_limits<u32>::max()) {
+        ++registration_batch_depth_;
+    }
+}
+
+void NativeMethodRegistry::end_registration_batch() noexcept {
+    std::scoped_lock lock(mutex_);
+    if (registration_batch_depth_ == 0U) return;
+    --registration_batch_depth_;
+    if (registration_batch_depth_ == 0U) {
+        publish_dispatch_table_locked();
+    }
+}
+
+void NativeMethodRegistry::advance_generation_locked() noexcept {
+    const u64 current = generation_.load(std::memory_order_relaxed);
+    generation_.store(
+        current == std::numeric_limits<u64>::max() ? 1U : current + 1U,
+        std::memory_order_release);
+}
+
+usize NativeMethodRegistry::NativeLookupKeyHash::operator()(
+    NativeLookupKey key) const noexcept {
+    const usize owner_hash = std::hash<std::string_view>{}(key.owner);
+    const usize name_hash = std::hash<std::string_view>{}(key.name);
+    const usize descriptor_hash = std::hash<std::string_view>{}(key.descriptor);
+    usize result = owner_hash;
+    result ^= name_hash + static_cast<usize>(0x9E3779B9U) +
+              (result << 6U) + (result >> 2U);
+    result ^= descriptor_hash + static_cast<usize>(0x9E3779B9U) +
+              (result << 6U) + (result >> 2U);
+    return result;
+}
+
+bool NativeMethodRegistry::NativeLookupKeyEqual::operator()(
+    NativeLookupKey left,
+    NativeLookupKey right) const noexcept {
+    return left.owner == right.owner &&
+           left.name == right.name &&
+           left.descriptor == right.descriptor;
+}
+
 Status NativeMethodRegistry::register_method(
     std::string owner,
     std::string name,
@@ -102,10 +174,13 @@ Status NativeMethodRegistry::register_method(
                     "native method registration is incomplete");
     }
 
-    PerformanceCounters::record_metadata_key_construction();
-    const std::string method_key = key(owner, name, descriptor);
     std::scoped_lock lock(mutex_);
-    if (ids_by_key_.contains(method_key)) {
+    const NativeLookupKey lookup {
+        .owner = owner,
+        .name = name,
+        .descriptor = descriptor,
+    };
+    if (ids_by_key_.contains(lookup)) {
         return fail(ErrorCode::invalid_state,
                     "native method is already registered");
     }
@@ -117,21 +192,25 @@ Status NativeMethodRegistry::register_method(
     const NativeMethodId method_id {
         static_cast<u32>(entries_.size() + 1U),
     };
-    entries_.push_back(Entry {
-        .signature = NativeMethodSignature {
-            .id = method_id,
-            .owner = std::move(owner),
-            .name = std::move(name),
-            .descriptor = std::move(descriptor),
-        },
-        .implementation = std::move(implementation),
-        .jit_policy = jit_policy,
-        .invocation_count = 0U,
-    });
-    ids_by_key_.emplace(method_key, method_id);
-    generation_ = generation_ == std::numeric_limits<u64>::max()
-        ? 1U
-        : generation_ + 1U;
+    auto entry = std::make_shared<Entry>();
+    entry->signature = NativeMethodSignature {
+        .id = method_id,
+        .owner = std::move(owner),
+        .name = std::move(name),
+        .descriptor = std::move(descriptor),
+    };
+    entry->implementation = std::move(implementation);
+    entry->jit_policy = jit_policy;
+    Entry* stable_entry = entry.get();
+    entries_.push_back(std::move(entry));
+    owners_.insert(stable_entry->signature.owner);
+    ids_by_key_.emplace(NativeLookupKey {
+        .owner = stable_entry->signature.owner,
+        .name = stable_entry->signature.name,
+        .descriptor = stable_entry->signature.descriptor,
+    }, method_id);
+    if (registration_batch_depth_ == 0U) publish_dispatch_table_locked();
+    advance_generation_locked();
     return {};
 }
 
@@ -149,18 +228,21 @@ Status NativeMethodRegistry::register_alias(
                     "native method alias registration is incomplete");
     }
 
-    PerformanceCounters::record_metadata_key_construction();
-    const std::string source_key = key(source_owner, source_name,
-                                       source_descriptor);
-    const std::string target_key = key(target_owner, target_name,
-                                       target_descriptor);
     std::scoped_lock lock(mutex_);
-    const auto source = ids_by_key_.find(source_key);
+    const auto source = ids_by_key_.find(NativeLookupKey {
+        .owner = source_owner,
+        .name = source_name,
+        .descriptor = source_descriptor,
+    });
     if (source == ids_by_key_.end()) {
         return fail(ErrorCode::class_not_found,
                     "native method alias source is not registered");
     }
-    if (ids_by_key_.contains(target_key)) {
+    if (ids_by_key_.contains(NativeLookupKey {
+            .owner = target_owner,
+            .name = target_name,
+            .descriptor = target_descriptor,
+        })) {
         return fail(ErrorCode::invalid_state,
                     "native method alias target is already registered");
     }
@@ -178,21 +260,25 @@ Status NativeMethodRegistry::register_alias(
     const NativeMethodId method_id {
         static_cast<u32>(entries_.size() + 1U),
     };
-    entries_.push_back(Entry {
-        .signature = NativeMethodSignature {
-            .id = method_id,
-            .owner = std::move(target_owner),
-            .name = std::move(target_name),
-            .descriptor = std::move(target_descriptor),
-        },
-        .implementation = entries_[source_index].implementation,
-        .jit_policy = entries_[source_index].jit_policy,
-        .invocation_count = 0U,
-    });
-    ids_by_key_.emplace(target_key, method_id);
-    generation_ = generation_ == std::numeric_limits<u64>::max()
-        ? 1U
-        : generation_ + 1U;
+    auto entry = std::make_shared<Entry>();
+    entry->signature = NativeMethodSignature {
+        .id = method_id,
+        .owner = std::move(target_owner),
+        .name = std::move(target_name),
+        .descriptor = std::move(target_descriptor),
+    };
+    entry->implementation = entries_[source_index]->implementation;
+    entry->jit_policy = entries_[source_index]->jit_policy;
+    Entry* stable_entry = entry.get();
+    entries_.push_back(std::move(entry));
+    owners_.insert(stable_entry->signature.owner);
+    ids_by_key_.emplace(NativeLookupKey {
+        .owner = stable_entry->signature.owner,
+        .name = stable_entry->signature.name,
+        .descriptor = stable_entry->signature.descriptor,
+    }, method_id);
+    if (registration_batch_depth_ == 0U) publish_dispatch_table_locked();
+    advance_generation_locked();
     return {};
 }
 
@@ -208,12 +294,21 @@ NativeMethodBinding NativeMethodRegistry::resolve_binding(
     std::string_view name,
     std::string_view descriptor) const noexcept {
     PerformanceCounters::record_native_registry_lookup();
-    PerformanceCounters::record_metadata_key_construction();
     std::scoped_lock lock(mutex_);
-    const auto found = ids_by_key_.find(key(owner, name, descriptor));
+    if (!owners_.contains(owner)) {
+        return NativeMethodBinding {
+            .id = {},
+            .generation = generation_.load(std::memory_order_acquire),
+        };
+    }
+    const auto found = ids_by_key_.find(NativeLookupKey {
+        .owner = owner,
+        .name = name,
+        .descriptor = descriptor,
+    });
     return NativeMethodBinding {
         .id = found == ids_by_key_.end() ? NativeMethodId {} : found->second,
-        .generation = generation_,
+        .generation = generation_.load(std::memory_order_acquire),
     };
 }
 
@@ -226,12 +321,14 @@ bool NativeMethodRegistry::contains(std::string_view owner,
 NativeJitPolicy NativeMethodRegistry::jit_policy(
     NativeMethodId method_id) const noexcept {
     if (!method_id.valid()) return NativeJitPolicy::conservative;
-    std::scoped_lock lock(mutex_);
+    const DispatchTable* table = dispatch_table_.load(std::memory_order_acquire);
+    if (table == nullptr) return NativeJitPolicy::conservative;
     const usize index = static_cast<usize>(method_id.value - 1U);
-    if (index >= entries_.size() || entries_[index].signature.id != method_id) {
+    if (index >= table->size() || (*table)[index] == nullptr ||
+        (*table)[index]->signature.id != method_id) {
         return NativeJitPolicy::conservative;
     }
-    return entries_[index].jit_policy;
+    return (*table)[index]->jit_policy;
 }
 
 Result<std::optional<Value>> NativeMethodRegistry::invoke(
@@ -243,31 +340,27 @@ Result<std::optional<Value>> NativeMethodRegistry::invoke(
                     "native method is not ported");
     }
 
-    NativeMethod implementation;
-    NativeMethodSignature signature;
-    {
-        std::scoped_lock lock(mutex_);
-        const usize index = static_cast<usize>(method_id.value - 1U);
-        if (index >= entries_.size() || entries_[index].signature.id != method_id) {
-            return fail(ErrorCode::unsupported_feature,
-                        "native method ID is stale or invalid");
-        }
-        Entry& entry = entries_[index];
-        implementation = entry.implementation;
-        signature = entry.signature;
-        ++entry.invocation_count;
+    const DispatchTable* table = dispatch_table_.load(std::memory_order_acquire);
+    const usize index = static_cast<usize>(method_id.value - 1U);
+    if (table == nullptr || index >= table->size() ||
+        (*table)[index] == nullptr ||
+        (*table)[index]->signature.id != method_id) {
+        return fail(ErrorCode::unsupported_feature,
+                    "native method ID is stale or invalid");
     }
+    const std::shared_ptr<Entry>& entry = (*table)[index];
+    entry->invocation_count.fetch_add(1U, std::memory_order_relaxed);
     PerformanceCounters::record_native_invocation();
-    process_native_coverage().record(signature);
-    auto result = implementation(machine, arguments);
+    auto result = entry->implementation(machine, arguments);
     if (!result) {
         Error error = result.error();
         // Java-visible exception messages are part of the language/API
         // contract. Keep them byte-for-byte intact; only internal native
         // failures receive the method context prefix used for diagnostics.
         if (error.java_exception_class.empty()) {
-            error.message = signature.owner + "." + signature.name +
-                            signature.descriptor + ": " + error.message;
+            error.message = entry->signature.owner + "." +
+                            entry->signature.name + entry->signature.descriptor +
+                            ": " + error.message;
         }
         return std::unexpected(std::move(error));
     }
@@ -291,11 +384,12 @@ Result<std::optional<Value>> NativeMethodRegistry::invoke(
 
 std::vector<NativeMethodSignature>
 NativeMethodRegistry::registered_methods() const {
-    std::scoped_lock lock(mutex_);
+    const DispatchTable* table = dispatch_table_.load(std::memory_order_acquire);
     std::vector<NativeMethodSignature> result;
-    result.reserve(entries_.size());
-    for (const Entry& entry : entries_) {
-        result.push_back(entry.signature);
+    if (table == nullptr) return result;
+    result.reserve(table->size());
+    for (const auto& entry : *table) {
+        if (entry != nullptr) result.push_back(entry->signature);
     }
     std::ranges::sort(result, {}, [](const NativeMethodSignature& signature) {
         return std::tie(signature.owner, signature.name, signature.descriptor);
@@ -305,13 +399,15 @@ NativeMethodRegistry::registered_methods() const {
 
 std::vector<NativeMethodInvocationCount>
 NativeMethodRegistry::invocation_counts() const {
-    std::scoped_lock lock(mutex_);
+    const DispatchTable* table = dispatch_table_.load(std::memory_order_acquire);
     std::vector<NativeMethodInvocationCount> result;
-    result.reserve(entries_.size());
-    for (const Entry& entry : entries_) {
+    if (table == nullptr) return result;
+    result.reserve(table->size());
+    for (const auto& entry : *table) {
+        if (entry == nullptr) continue;
         result.push_back(NativeMethodInvocationCount {
-            .signature = entry.signature,
-            .count = entry.invocation_count,
+            .signature = entry->signature,
+            .count = entry->invocation_count.load(std::memory_order_relaxed),
         });
     }
     std::ranges::sort(result, {},
@@ -324,37 +420,29 @@ NativeMethodRegistry::invocation_counts() const {
 }
 
 void NativeMethodRegistry::reset_invocation_counts() noexcept {
-    std::scoped_lock lock(mutex_);
-    for (Entry& entry : entries_) {
-        entry.invocation_count = 0U;
+    const DispatchTable* table = dispatch_table_.load(std::memory_order_acquire);
+    if (table == nullptr) return;
+    for (const auto& entry : *table) {
+        if (entry != nullptr) {
+            entry->invocation_count.store(0U, std::memory_order_relaxed);
+        }
     }
 }
 
 u64 NativeMethodRegistry::generation() const noexcept {
-    std::scoped_lock lock(mutex_);
-    return generation_;
+    return generation_.load(std::memory_order_acquire);
 }
 
 void NativeMethodRegistry::clear() noexcept {
+    ProcessNativeCoverage& coverage = process_native_coverage();
+    if (coverage.enabled()) coverage.merge(invocation_counts());
     std::scoped_lock lock(mutex_);
     ids_by_key_.clear();
+    owners_.clear();
     entries_.clear();
-    generation_ = generation_ == std::numeric_limits<u64>::max()
-        ? 1U
-        : generation_ + 1U;
-}
-
-std::string NativeMethodRegistry::key(std::string_view owner,
-                                      std::string_view name,
-                                      std::string_view descriptor) {
-    std::string result;
-    result.reserve(owner.size() + name.size() + descriptor.size() + 2);
-    result.append(owner);
-    result.push_back('#');
-    result.append(name);
-    result.push_back(':');
-    result.append(descriptor);
-    return result;
+    registration_batch_depth_ = 0U;
+    publish_dispatch_table_locked();
+    advance_generation_locked();
 }
 
 } // namespace phoneme::vm

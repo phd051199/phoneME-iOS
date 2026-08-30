@@ -261,8 +261,15 @@ struct ManagerStorage final {
 
 [[nodiscard]] Result<ManagerStorage> manager_storage(
     Machine& machine, ObjectRef manager) {
-    auto count = int_field(machine, manager, kManagerCount);
-    auto array = ref_field(machine, manager, kManagerLayers);
+    constexpr std::array<usize, 2> fields {
+        kManagerCount,
+        kManagerLayers,
+    };
+    std::array<Value, 2> values {};
+    auto snapshot = machine.heap().read_fields(manager, fields, values);
+    if (!snapshot) return std::unexpected(snapshot.error());
+    auto count = values[0].as_int();
+    auto array = values[1].as_reference();
     if (!count) return std::unexpected(count.error());
     if (!array) return std::unexpected(array.error());
     if (*count < 0 || array->is_null()) {
@@ -383,22 +390,44 @@ struct ManagerStorage final {
                                                ObjectRef sprite) {
     SpriteState state;
     state.object = sprite;
-    auto image = ref_field(machine, sprite, kSpriteImage);
-    auto x = int_field(machine, sprite, kLayerX);
-    auto y = int_field(machine, sprite, kLayerY);
-    auto visible = int_field(machine, sprite, kLayerVisible);
-    auto frame_width = int_field(machine, sprite, kSpriteFrameWidth);
-    auto frame_height = int_field(machine, sprite, kSpriteFrameHeight);
-    auto raw_count = int_field(machine, sprite, kSpriteRawFrameCount);
-    auto sequence = ref_field(machine, sprite, kSpriteFrameSequence);
-    auto sequence_index = int_field(machine, sprite, kSpriteSequenceIndex);
-    auto transform_value = int_field(machine, sprite, kSpriteTransform);
-    auto reference_x = int_field(machine, sprite, kSpriteReferenceX);
-    auto reference_y = int_field(machine, sprite, kSpriteReferenceY);
-    auto collision_x = int_field(machine, sprite, kSpriteCollisionX);
-    auto collision_y = int_field(machine, sprite, kSpriteCollisionY);
-    auto collision_width = int_field(machine, sprite, kSpriteCollisionWidth);
-    auto collision_height = int_field(machine, sprite, kSpriteCollisionHeight);
+    constexpr std::array<usize, 16> fields {
+        kSpriteImage,
+        kLayerX,
+        kLayerY,
+        kLayerVisible,
+        kSpriteFrameWidth,
+        kSpriteFrameHeight,
+        kSpriteRawFrameCount,
+        kSpriteFrameSequence,
+        kSpriteSequenceIndex,
+        kSpriteTransform,
+        kSpriteReferenceX,
+        kSpriteReferenceY,
+        kSpriteCollisionX,
+        kSpriteCollisionY,
+        kSpriteCollisionWidth,
+        kSpriteCollisionHeight,
+    };
+    std::array<Value, 16> values {};
+    auto snapshot = machine.heap().read_fields(sprite, fields, values);
+    if (!snapshot) return std::unexpected(snapshot.error());
+
+    auto image = values[0].as_reference();
+    auto x = values[1].as_int();
+    auto y = values[2].as_int();
+    auto visible = values[3].as_int();
+    auto frame_width = values[4].as_int();
+    auto frame_height = values[5].as_int();
+    auto raw_count = values[6].as_int();
+    auto sequence = values[7].as_reference();
+    auto sequence_index = values[8].as_int();
+    auto transform_value = values[9].as_int();
+    auto reference_x = values[10].as_int();
+    auto reference_y = values[11].as_int();
+    auto collision_x = values[12].as_int();
+    auto collision_y = values[13].as_int();
+    auto collision_width = values[14].as_int();
+    auto collision_height = values[15].as_int();
     if (!image || !x || !y || !visible || !frame_width || !frame_height || !raw_count ||
         !sequence || !sequence_index || !transform_value || !reference_x ||
         !reference_y || !collision_x || !collision_y || !collision_width ||
@@ -454,17 +483,34 @@ struct ManagerStorage final {
                                              ObjectRef tiled) {
     TiledState state;
     state.object = tiled;
-    auto image = ref_field(machine, tiled, kTiledImage);
-    auto x = int_field(machine, tiled, kLayerX);
-    auto y = int_field(machine, tiled, kLayerY);
-    auto visible = int_field(machine, tiled, kLayerVisible);
-    auto columns = int_field(machine, tiled, kTiledColumns);
-    auto rows = int_field(machine, tiled, kTiledRows);
-    auto tile_width = int_field(machine, tiled, kTiledTileWidth);
-    auto tile_height = int_field(machine, tiled, kTiledTileHeight);
-    auto static_count = int_field(machine, tiled, kTiledStaticCount);
-    auto cells = ref_field(machine, tiled, kTiledCells);
-    auto animated = ref_field(machine, tiled, kTiledAnimated);
+    constexpr std::array<usize, 11> fields {
+        kTiledImage,
+        kLayerX,
+        kLayerY,
+        kLayerVisible,
+        kTiledColumns,
+        kTiledRows,
+        kTiledTileWidth,
+        kTiledTileHeight,
+        kTiledStaticCount,
+        kTiledCells,
+        kTiledAnimated,
+    };
+    std::array<Value, 11> values {};
+    auto snapshot = machine.heap().read_fields(tiled, fields, values);
+    if (!snapshot) return std::unexpected(snapshot.error());
+
+    auto image = values[0].as_reference();
+    auto x = values[1].as_int();
+    auto y = values[2].as_int();
+    auto visible = values[3].as_int();
+    auto columns = values[4].as_int();
+    auto rows = values[5].as_int();
+    auto tile_width = values[6].as_int();
+    auto tile_height = values[7].as_int();
+    auto static_count = values[8].as_int();
+    auto cells = values[9].as_reference();
+    auto animated = values[10].as_reference();
     if (!image || !x || !y || !visible || !columns || !rows || !tile_width ||
         !tile_height || !static_count || !cells || !animated) {
         return fail(ErrorCode::invalid_state, "TiledLayer fields are unavailable");

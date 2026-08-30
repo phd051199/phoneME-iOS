@@ -9,6 +9,15 @@ void ExecutionContext::publish_roots(u32 invocation_depth,
     published.assign(roots.begin(), roots.end());
 }
 
+std::span<const ObjectRef> ExecutionContext::exchange_roots(
+    u32 invocation_depth,
+    std::vector<ObjectRef>& roots) {
+    std::scoped_lock lock(mutex_);
+    auto& published = roots_by_depth_[invocation_depth];
+    published.swap(roots);
+    return std::span<const ObjectRef>(published.data(), published.size());
+}
+
 void ExecutionContext::clear_roots(u32 invocation_depth) noexcept {
     std::scoped_lock lock(mutex_);
     roots_by_depth_.erase(invocation_depth);

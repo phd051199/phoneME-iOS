@@ -1,8 +1,10 @@
 #include "Jdk8CompatNativesParts.hpp"
 
 #include <array>
+#include <limits>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "Jdk8CompatNativeSupport.hpp"
 
@@ -221,14 +223,30 @@ constexpr usize kEnumerationSizeField = 2U;
 [[nodiscard]] Status write_latin1(Machine& machine,
                                   ObjectRef output,
                                   std::u16string_view text) {
-    for (const char16_t value : text) {
-        const Value argument = Value::from_int(
-            static_cast<i32>(static_cast<u8>(value & 0xFFU)));
-        auto written = invoke_checked(machine, output, "java/io/OutputStream",
-                                      "write", "(I)V",
-                                      std::span<const Value>(&argument, 1U));
-        if (!written) return std::unexpected(written.error());
+    if (text.empty()) return {};
+    if (text.size() > static_cast<usize>(std::numeric_limits<i32>::max())) {
+        return fail(ErrorCode::overflow,
+                    "Properties output exceeds Java array limits");
     }
+    std::vector<u8> bytes(text.size());
+    for (usize index = 0U; index < text.size(); ++index) {
+        bytes[index] = static_cast<u8>(text[index] & 0xFFU);
+    }
+    auto array = machine.heap().allocate_array(
+        "[B", bytes.size(), Value::from_int(0));
+    if (!array) return std::unexpected(array.error());
+    auto root = machine.pin_native_root(*array);
+    if (!root) return std::unexpected(root.error());
+    auto copied = machine.heap().write_byte_array(*array, 0U, bytes);
+    if (!copied) return copied;
+    const std::array<Value, 3> arguments {
+        Value::from_reference(*array),
+        Value::from_int(0),
+        Value::from_int(static_cast<i32>(bytes.size())),
+    };
+    auto written = invoke_checked(machine, output, "java/io/OutputStream",
+                                  "write", "([BII)V", arguments);
+    if (!written) return std::unexpected(written.error());
     return {};
 }
 
@@ -240,8 +258,22 @@ constexpr usize kEnumerationSizeField = 2U;
     auto is_map = machine.object_is_instance(other, "java/util/Map");
     if (!is_map) return std::unexpected(is_map.error());
     if (!*is_map) return false;
-    auto own_size = int_field(machine, map, kMapSizeField);
-    if (!own_size) return std::unexpected(own_size.error());
+    constexpr std::array<usize, 3> fields {
+        kMapSizeField,
+        kMapKeysField,
+        kMapValuesField,
+    };
+    std::array<Value, fields.size()> state {};
+    auto loaded = machine.heap().read_fields(map, fields, state);
+    if (!loaded) return std::unexpected(loaded.error());
+    auto own_size = state[0U].as_int();
+    auto keys = state[1U].as_reference();
+    auto values = state[2U].as_reference();
+    if (!own_size || !keys || !values || *own_size < 0 || keys->is_null() ||
+        values->is_null()) {
+        return fail(ErrorCode::invalid_state,
+                    "Properties storage is invalid");
+    }
     auto other_size = invoke_checked(machine, other, "java/util/Map",
                                      "size", "()I");
     if (!other_size) return std::unexpected(other_size.error());
@@ -252,24 +284,19 @@ constexpr usize kEnumerationSizeField = 2U;
     auto size = other_size->value().as_int();
     if (!size) return std::unexpected(size.error());
     if (*size != *own_size) return false;
-    auto keys = reference_field(machine, map, kMapKeysField);
-    auto values = reference_field(machine, map, kMapValuesField);
-    if (!keys || !values || keys->is_null() || values->is_null()) {
+    auto key_values = machine.heap().read_reference_array(*keys);
+    auto own_values = machine.heap().read_reference_array(*values);
+    if (!key_values) return std::unexpected(key_values.error());
+    if (!own_values) return std::unexpected(own_values.error());
+    if (static_cast<usize>(*own_size) > key_values->size() ||
+        static_cast<usize>(*own_size) > own_values->size()) {
         return fail(ErrorCode::invalid_state,
-                    "Properties storage is invalid");
+                    "Properties storage is shorter than its size");
     }
     for (i32 index = 0; index < *own_size; ++index) {
-        auto key_value = machine.heap().element(*keys,
-                                                static_cast<usize>(index));
-        auto own_value = machine.heap().element(*values,
-                                                static_cast<usize>(index));
-        if (!key_value) return std::unexpected(key_value.error());
-        if (!own_value) return std::unexpected(own_value.error());
-        auto key = key_value->as_reference();
-        auto value = own_value->as_reference();
-        if (!key) return std::unexpected(key.error());
-        if (!value) return std::unexpected(value.error());
-        const Value argument = Value::from_reference(*key);
+        const ObjectRef key = (*key_values)[static_cast<usize>(index)];
+        const ObjectRef value = (*own_values)[static_cast<usize>(index)];
+        const Value argument = Value::from_reference(key);
         auto mapped = invoke_checked(
             machine, other, "java/util/Map", "get",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
@@ -281,10 +308,10 @@ constexpr usize kEnumerationSizeField = 2U;
         }
         auto mapped_ref = mapped->value().as_reference();
         if (!mapped_ref) return std::unexpected(mapped_ref.error());
-        auto equal = object_equals(machine, *value, *mapped_ref);
+        auto equal = object_equals(machine, value, *mapped_ref);
         if (!equal) return std::unexpected(equal.error());
         if (!*equal) return false;
-        if (value->is_null()) {
+        if (value.is_null()) {
             auto contains = invoke_checked(
                 machine, other, "java/util/Map", "containsKey",
                 "(Ljava/lang/Object;)Z",
@@ -396,38 +423,48 @@ void register_properties_methods(NativeMethodRegistry& registry) {
             if (!set) return std::unexpected(set.error());
             auto root = machine.pin_native_root(*set);
             if (!root) return std::unexpected(root.error());
-            auto size = int_field(machine, *properties, kMapSizeField);
-            auto keys = reference_field(machine, *properties, kMapKeysField);
-            auto values = reference_field(machine, *properties,
-                                          kMapValuesField);
-            if (!size || !keys || !values || keys->is_null() ||
+            constexpr std::array<usize, 3> fields {
+                kMapSizeField,
+                kMapKeysField,
+                kMapValuesField,
+            };
+            std::array<Value, fields.size()> state {};
+            auto loaded = machine.heap().read_fields(
+                *properties, fields, state);
+            if (!loaded) return std::unexpected(loaded.error());
+            auto size = state[0U].as_int();
+            auto keys = state[1U].as_reference();
+            auto values = state[2U].as_reference();
+            if (!size || !keys || !values || *size < 0 || keys->is_null() ||
                 values->is_null()) {
                 return fail(ErrorCode::invalid_state,
                             "Properties storage is invalid");
             }
+            auto key_values = machine.heap().read_reference_array(*keys);
+            auto property_values = machine.heap().read_reference_array(*values);
+            if (!key_values) return std::unexpected(key_values.error());
+            if (!property_values) {
+                return std::unexpected(property_values.error());
+            }
+            if (static_cast<usize>(*size) > key_values->size() ||
+                static_cast<usize>(*size) > property_values->size()) {
+                return fail(ErrorCode::invalid_state,
+                            "Properties storage is shorter than its size");
+            }
             for (i32 index = 0; index < *size; ++index) {
-                auto key_value = machine.heap().element(
-                    *keys, static_cast<usize>(index));
-                auto property_value = machine.heap().element(
-                    *values, static_cast<usize>(index));
-                if (!key_value) return std::unexpected(key_value.error());
-                if (!property_value) {
-                    return std::unexpected(property_value.error());
-                }
-                auto key = key_value->as_reference();
-                auto value = property_value->as_reference();
-                if (!key) return std::unexpected(key.error());
-                if (!value) return std::unexpected(value.error());
-                auto key_string = machine.object_is_instance(*key,
+                const ObjectRef key = (*key_values)[static_cast<usize>(index)];
+                const ObjectRef value =
+                    (*property_values)[static_cast<usize>(index)];
+                auto key_string = machine.object_is_instance(key,
                                                              "java/lang/String");
                 auto value_string = machine.object_is_instance(
-                    *value, "java/lang/String");
+                    value, "java/lang/String");
                 if (!key_string) return std::unexpected(key_string.error());
                 if (!value_string) {
                     return std::unexpected(value_string.error());
                 }
                 if (!*key_string || !*value_string) continue;
-                const Value argument = Value::from_reference(*key);
+                const Value argument = Value::from_reference(key);
                 auto added = invoke_checked(
                     machine, *set, "java/util/Set", "add",
                     "(Ljava/lang/Object;)Z",
@@ -442,8 +479,16 @@ void register_properties_methods(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto properties = receiver(arguments);
             if (!properties) return std::unexpected(properties.error());
-            auto size = int_field(machine, *properties, kMapSizeField);
-            auto keys = reference_field(machine, *properties, kMapKeysField);
+            constexpr std::array<usize, 2> fields {
+                kMapSizeField,
+                kMapKeysField,
+            };
+            std::array<Value, fields.size()> state {};
+            auto loaded = machine.heap().read_fields(
+                *properties, fields, state);
+            if (!loaded) return std::unexpected(loaded.error());
+            auto size = state[0U].as_int();
+            auto keys = state[1U].as_reference();
             if (!size || !keys || keys->is_null() || *size < 0) {
                 return fail(ErrorCode::invalid_state,
                             "Properties key storage is invalid");
@@ -453,25 +498,26 @@ void register_properties_methods(NativeMethodRegistry& registry) {
             if (!values) return std::unexpected(values.error());
             auto values_root = machine.pin_native_root(*values);
             if (!values_root) return std::unexpected(values_root.error());
-            for (i32 index = 0; index < *size; ++index) {
-                auto key = machine.heap().element(
-                    *keys, static_cast<usize>(index));
-                if (!key) return std::unexpected(key.error());
-                auto stored = machine.heap().set_element(
-                    *values, static_cast<usize>(index), *key);
-                if (!stored) return std::unexpected(stored.error());
+            if (*size > 0) {
+                auto copied = machine.heap().copy_array_range(
+                    *keys, 0U, *values, 0U, static_cast<usize>(*size));
+                if (!copied) return std::unexpected(copied.error());
             }
             auto enumeration = new_instance(machine, "java/util/ArrayEnumeration");
             if (!enumeration) return std::unexpected(enumeration.error());
-            auto array_stored = set_reference_field(
-                machine, *enumeration, kEnumerationArrayField, *values);
-            auto index_stored = set_int_field(
-                machine, *enumeration, kEnumerationIndexField, 0);
-            auto size_stored = set_int_field(
-                machine, *enumeration, kEnumerationSizeField, *size);
-            if (!array_stored) return std::unexpected(array_stored.error());
-            if (!index_stored) return std::unexpected(index_stored.error());
-            if (!size_stored) return std::unexpected(size_stored.error());
+            constexpr std::array<usize, 3> enumeration_fields {
+                kEnumerationArrayField,
+                kEnumerationIndexField,
+                kEnumerationSizeField,
+            };
+            const std::array<Value, enumeration_fields.size()> enumeration_state {
+                Value::from_reference(*values),
+                Value::from_int(0),
+                Value::from_int(*size),
+            };
+            auto stored = machine.heap().write_fields(
+                *enumeration, enumeration_fields, enumeration_state);
+            if (!stored) return std::unexpected(stored.error());
             return std::optional<Value>(Value::from_reference(*enumeration));
         });
     add(registry, "java/util/Properties", "equals",
@@ -496,41 +542,50 @@ void register_properties_methods(NativeMethodRegistry& registry) {
             if (!properties) return std::unexpected(properties.error());
             if (!output) return std::unexpected(output.error());
             if (!comments) return std::unexpected(comments.error());
+            std::u16string serialized;
             if (!comments->is_null()) {
                 auto text = string_value(machine, *comments);
                 if (!text) return std::unexpected(text.error());
-                std::u16string line(u"#");
-                line.append(*text);
-                line.push_back(u'\n');
-                auto written = write_latin1(machine, *output, line);
-                if (!written) return std::unexpected(written.error());
+                serialized.push_back(u'#');
+                serialized.append(*text);
+                serialized.push_back(u'\n');
             }
-            auto size = int_field(machine, *properties, kMapSizeField);
-            auto keys = reference_field(machine, *properties, kMapKeysField);
-            auto values = reference_field(machine, *properties,
-                                          kMapValuesField);
-            if (!size || !keys || !values || keys->is_null() ||
+            constexpr std::array<usize, 3> fields {
+                kMapSizeField,
+                kMapKeysField,
+                kMapValuesField,
+            };
+            std::array<Value, fields.size()> state {};
+            auto loaded = machine.heap().read_fields(
+                *properties, fields, state);
+            if (!loaded) return std::unexpected(loaded.error());
+            auto size = state[0U].as_int();
+            auto keys = state[1U].as_reference();
+            auto values = state[2U].as_reference();
+            if (!size || !keys || !values || *size < 0 || keys->is_null() ||
                 values->is_null()) {
                 return fail(ErrorCode::invalid_state,
                             "Properties storage is invalid");
             }
+            auto key_values = machine.heap().read_reference_array(*keys);
+            auto property_values = machine.heap().read_reference_array(*values);
+            if (!key_values) return std::unexpected(key_values.error());
+            if (!property_values) {
+                return std::unexpected(property_values.error());
+            }
+            if (static_cast<usize>(*size) > key_values->size() ||
+                static_cast<usize>(*size) > property_values->size()) {
+                return fail(ErrorCode::invalid_state,
+                            "Properties storage is shorter than its size");
+            }
             for (i32 index = 0; index < *size; ++index) {
-                auto key_value = machine.heap().element(
-                    *keys, static_cast<usize>(index));
-                auto property_value = machine.heap().element(
-                    *values, static_cast<usize>(index));
-                if (!key_value) return std::unexpected(key_value.error());
-                if (!property_value) {
-                    return std::unexpected(property_value.error());
-                }
-                auto key = key_value->as_reference();
-                auto value = property_value->as_reference();
-                if (!key) return std::unexpected(key.error());
-                if (!value) return std::unexpected(value.error());
-                auto key_string = machine.object_is_instance(*key,
+                const ObjectRef key = (*key_values)[static_cast<usize>(index)];
+                const ObjectRef value =
+                    (*property_values)[static_cast<usize>(index)];
+                auto key_string = machine.object_is_instance(key,
                                                              "java/lang/String");
                 auto value_string = machine.object_is_instance(
-                    *value, "java/lang/String");
+                    value, "java/lang/String");
                 if (!key_string || !value_string) {
                     return fail_java("java/lang/ClassCastException",
                                      "Properties keys and values must be strings");
@@ -539,17 +594,17 @@ void register_properties_methods(NativeMethodRegistry& registry) {
                     return fail_java("java/lang/ClassCastException",
                                      "Properties keys and values must be strings");
                 }
-                auto key_text = string_value(machine, *key);
-                auto value_text = string_value(machine, *value);
+                auto key_text = string_value(machine, key);
+                auto value_text = string_value(machine, value);
                 if (!key_text) return std::unexpected(key_text.error());
                 if (!value_text) return std::unexpected(value_text.error());
-                std::u16string line = escape_property(*key_text, true);
-                line.push_back(u'=');
-                line.append(escape_property(*value_text, false));
-                line.push_back(u'\n');
-                auto written = write_latin1(machine, *output, line);
-                if (!written) return std::unexpected(written.error());
+                serialized.append(escape_property(*key_text, true));
+                serialized.push_back(u'=');
+                serialized.append(escape_property(*value_text, false));
+                serialized.push_back(u'\n');
             }
+            auto written = write_latin1(machine, *output, serialized);
+            if (!written) return std::unexpected(written.error());
             return std::optional<Value> {};
         });
 }

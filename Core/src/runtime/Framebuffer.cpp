@@ -30,6 +30,25 @@ namespace phoneme::runtime
       return checked_multiply(*pixels, 4);
     }
 
+    void copy_to_rgba(std::span<const u8> source,
+                      FramePixelFormat format,
+                      std::span<u8> destination) noexcept
+    {
+      if (destination.size() < source.size()) return;
+      if (format == FramePixelFormat::rgba8)
+      {
+        std::copy(source.begin(), source.end(), destination.begin());
+        return;
+      }
+      for (usize offset = 0U; offset + 3U < source.size(); offset += 4U)
+      {
+        destination[offset] = source[offset + 2U];
+        destination[offset + 1U] = source[offset + 1U];
+        destination[offset + 2U] = source[offset];
+        destination[offset + 3U] = source[offset + 3U];
+      }
+    }
+
   } // namespace
 
   Status Framebuffer::resize(Dimensions dimensions)
@@ -49,6 +68,7 @@ namespace phoneme::runtime
     std::scoped_lock lock(mutex_);
     dimensions_ = dimensions;
     rgba_ = std::move(replacement);
+    pixel_format_ = FramePixelFormat::rgba8;
     damage_regions_.clear();
     damage_regions_.push_back(FrameDamageRegion {
         .x = 0,
@@ -61,23 +81,25 @@ namespace phoneme::runtime
   }
 
   Status Framebuffer::replace(Dimensions dimensions,
-                              std::span<const u8> rgba)
+                              std::span<const u8> pixels,
+                              FramePixelFormat format)
   {
     auto required = rgba_size(dimensions);
     if (!required)
     {
       return std::unexpected(required.error());
     }
-    if (rgba.size() != *required)
+    if (pixels.size() != *required)
     {
       return fail(ErrorCode::invalid_argument,
-                  "RGBA frame size does not match its dimensions");
+                  "frame byte size does not match its dimensions");
     }
 
-    std::vector<u8> replacement(rgba.begin(), rgba.end());
+    std::vector<u8> replacement(pixels.begin(), pixels.end());
     std::scoped_lock lock(mutex_);
     dimensions_ = dimensions;
     rgba_ = std::move(replacement);
+    pixel_format_ = format;
     damage_regions_.clear();
     damage_regions_.push_back(FrameDamageRegion {
         .x = 0,
@@ -90,22 +112,24 @@ namespace phoneme::runtime
   }
 
   Status Framebuffer::replace_exchange(Dimensions dimensions,
-                                       std::vector<u8>& rgba)
+                                       std::vector<u8>& pixels,
+                                       FramePixelFormat format)
   {
     auto required = rgba_size(dimensions);
     if (!required)
     {
       return std::unexpected(required.error());
     }
-    if (rgba.size() != *required)
+    if (pixels.size() != *required)
     {
       return fail(ErrorCode::invalid_argument,
-                  "RGBA frame size does not match its dimensions");
+                  "frame byte size does not match its dimensions");
     }
 
     std::scoped_lock lock(mutex_);
     dimensions_ = dimensions;
-    rgba_.swap(rgba);
+    rgba_.swap(pixels);
+    pixel_format_ = format;
     damage_regions_.clear();
     damage_regions_.push_back(FrameDamageRegion {
         .x = 0,
@@ -122,22 +146,25 @@ namespace phoneme::runtime
                                     i32 y,
                                     i32 width,
                                     i32 height,
-                                    std::span<const u8> rgba)
+                                    std::span<const u8> pixels,
+                                    FramePixelFormat format)
   {
     const FrameRegionUpdate update {
         .x = x,
         .y = y,
         .width = width,
         .height = height,
-        .rgba = rgba,
+        .rgba = pixels,
     };
     return update_regions(dimensions,
-                          std::span<const FrameRegionUpdate>(&update, 1U));
+                          std::span<const FrameRegionUpdate>(&update, 1U),
+                          format);
   }
 
   Status Framebuffer::update_regions(
       Dimensions dimensions,
-      std::span<const FrameRegionUpdate> updates)
+      std::span<const FrameRegionUpdate> updates,
+      FramePixelFormat format)
   {
     auto full_size = rgba_size(dimensions);
     if (!full_size)
@@ -171,7 +198,7 @@ namespace phoneme::runtime
     std::scoped_lock lock(mutex_);
     if (dimensions_.width != dimensions.width ||
         dimensions_.height != dimensions.height ||
-        rgba_.size() != *full_size)
+        rgba_.size() != *full_size || pixel_format_ != format)
     {
       return fail(ErrorCode::invalid_state,
                   "framebuffer dimensions changed before partial update");
@@ -217,6 +244,7 @@ namespace phoneme::runtime
         .dimensions = dimensions_,
         .generation = generation_,
         .byte_count = rgba_.size(),
+        .pixel_format = pixel_format_,
     };
   }
 
@@ -228,10 +256,11 @@ namespace phoneme::runtime
         .dimensions = dimensions_,
         .generation = generation_,
         .byte_count = rgba_.size(),
+        .pixel_format = FramePixelFormat::rgba8,
     };
     if (!rgba_.empty() && destination.size() >= rgba_.size())
     {
-      std::copy(rgba_.begin(), rgba_.end(), destination.begin());
+      copy_to_rgba(rgba_, pixel_format_, destination);
     }
     return result;
   }
@@ -249,10 +278,11 @@ namespace phoneme::runtime
         .dimensions = dimensions_,
         .generation = generation_,
         .byte_count = rgba_.size(),
+        .pixel_format = FramePixelFormat::rgba8,
     };
     if (!rgba_.empty() && destination.size() >= rgba_.size())
     {
-      std::copy(rgba_.begin(), rgba_.end(), destination.begin());
+      copy_to_rgba(rgba_, pixel_format_, destination);
     }
     return result;
   }
@@ -269,6 +299,41 @@ namespace phoneme::runtime
         .dimensions = dimensions_,
         .generation = generation_,
         .byte_count = rgba_.size(),
+        .pixel_format = FramePixelFormat::rgba8,
+    };
+    if (pixel_format_ == FramePixelFormat::bgra8)
+    {
+      std::vector<u8> converted(rgba_.size());
+      copy_to_rgba(rgba_, pixel_format_, converted);
+      return ReadLease(
+          std::move(lock),
+          metadata,
+          {},
+          std::span<const FrameDamageRegion>(
+              damage_regions_.data(), damage_regions_.size()),
+          std::move(converted));
+    }
+    return ReadLease(
+        std::move(lock),
+        metadata,
+        std::span<const u8>(rgba_.data(), rgba_.size()),
+        std::span<const FrameDamageRegion>(
+            damage_regions_.data(), damage_regions_.size()));
+  }
+
+  std::optional<Framebuffer::ReadLease> Framebuffer::acquire_native_since(
+      u64 previous_generation) const noexcept
+  {
+    std::unique_lock lock(mutex_);
+    if (generation_ == previous_generation || rgba_.empty())
+    {
+      return std::nullopt;
+    }
+    const FrameMetadata metadata{
+        .dimensions = dimensions_,
+        .generation = generation_,
+        .byte_count = rgba_.size(),
+        .pixel_format = pixel_format_,
     };
     return ReadLease(
         std::move(lock),
@@ -281,10 +346,12 @@ namespace phoneme::runtime
   FrameSnapshot Framebuffer::snapshot() const
   {
     std::scoped_lock lock(mutex_);
+    std::vector<u8> rgba(rgba_.size());
+    copy_to_rgba(rgba_, pixel_format_, rgba);
     return FrameSnapshot{
         .dimensions = dimensions_,
         .generation = generation_,
-        .rgba = rgba_,
+        .rgba = std::move(rgba),
     };
   }
 
@@ -293,6 +360,7 @@ namespace phoneme::runtime
     std::scoped_lock lock(mutex_);
     dimensions_ = {};
     rgba_.clear();
+    pixel_format_ = FramePixelFormat::rgba8;
     damage_regions_.clear();
     ++generation_;
   }

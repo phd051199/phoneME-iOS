@@ -5,6 +5,7 @@
 #include <limits>
 #include <span>
 #include <string_view>
+#include <vector>
 
 #include "M3gNativeSupport.hpp"
 #include "phoneme/graphics/Image.hpp"
@@ -429,9 +430,25 @@ void register_image2d(NativeMethodRegistry& registry) {
             -> Result<std::optional<Value>> {
             auto object = receiver(arguments, "Image2D.set");
             if (!object) return std::unexpected(object.error());
-            auto mutable_value = int_field(machine, *object, kImage2D,
-                                           "mutable", "Z");
+            static constexpr std::array<ObjectFieldSpec, 5U> kFields {{
+                {"mutable", "Z"},
+                {"width", "I"},
+                {"height", "I"},
+                {"format", "I"},
+                {"source", "Ljava/lang/Object;"},
+            }};
+            auto fields = object_fields(machine, *object, kImage2D, kFields);
+            if (!fields) return std::unexpected(fields.error());
+            auto mutable_value = (*fields)[0U].as_int();
+            auto image_width = (*fields)[1U].as_int();
+            auto image_height = (*fields)[2U].as_int();
+            auto format = (*fields)[3U].as_int();
+            auto source = (*fields)[4U].as_reference();
             if (!mutable_value) return std::unexpected(mutable_value.error());
+            if (!image_width) return std::unexpected(image_width.error());
+            if (!image_height) return std::unexpected(image_height.error());
+            if (!format) return std::unexpected(format.error());
+            if (!source) return std::unexpected(source.error());
             if (*mutable_value == 0) {
                 return fail_java("java/lang/IllegalStateException",
                                  "Image2D is immutable");
@@ -447,13 +464,6 @@ void register_image2d(NativeMethodRegistry& registry) {
             if (!width) return std::unexpected(width.error());
             if (!height) return std::unexpected(height.error());
             if (!pixels) return std::unexpected(pixels.error());
-
-            auto image_width = int_field(machine, *object, kImage2D, "width");
-            auto image_height = int_field(machine, *object, kImage2D, "height");
-            auto format = int_field(machine, *object, kImage2D, "format");
-            if (!image_width) return std::unexpected(image_width.error());
-            if (!image_height) return std::unexpected(image_height.error());
-            if (!format) return std::unexpected(format.error());
             if (*x < 0 || *y < 0 || *width <= 0 || *height <= 0 ||
                 static_cast<i64>(*x) + static_cast<i64>(*width) >
                     static_cast<i64>(*image_width) ||
@@ -467,16 +477,12 @@ void register_image2d(NativeMethodRegistry& registry) {
             auto update_size = checked_image_byte_count(*width, *height,
                                                         *components);
             if (!update_size) return std::unexpected(update_size.error());
-            auto pixel_length = machine.heap().array_length(*pixels);
-            if (!pixel_length) return std::unexpected(pixel_length.error());
-            if (*pixel_length < *update_size) {
+            auto pixel_values = machine.heap().read_byte_array(*pixels);
+            if (!pixel_values) return std::unexpected(pixel_values.error());
+            if (pixel_values->size() < *update_size) {
                 return fail_java("java/lang/IllegalArgumentException",
                                  "Image2D update array is too short");
             }
-
-            auto source = reference_field(machine, *object, kImage2D,
-                                           "source", "Ljava/lang/Object;");
-            if (!source) return std::unexpected(source.error());
             if (source->is_null()) {
                 auto full_size = checked_image_byte_count(
                     *image_width, *image_height, *components);
@@ -499,28 +505,19 @@ void register_image2d(NativeMethodRegistry& registry) {
                 return fail(ErrorCode::invalid_state,
                             "Image2D backing array is truncated");
             }
+            const usize row_bytes = static_cast<usize>(*width) * *components;
             for (i32 row = 0; row < *height; ++row) {
-                for (i32 column = 0; column < *width; ++column) {
-                    for (usize component = 0; component < *components;
-                         ++component) {
-                        const usize input_index =
-                            (static_cast<usize>(row) *
-                                 static_cast<usize>(*width) +
-                             static_cast<usize>(column)) * *components +
-                            component;
-                        const usize output_index =
-                            ((static_cast<usize>(*y + row) *
-                                  static_cast<usize>(*image_width)) +
-                             static_cast<usize>(*x + column)) * *components +
-                            component;
-                        auto value = machine.heap().element(*pixels,
-                                                            input_index);
-                        if (!value) return std::unexpected(value.error());
-                        auto stored = machine.heap().set_element(
-                            *source, output_index, *value);
-                        if (!stored) return std::unexpected(stored.error());
-                    }
-                }
+                const usize input_offset =
+                    static_cast<usize>(row) * row_bytes;
+                const usize output_offset =
+                    ((static_cast<usize>(*y + row) *
+                          static_cast<usize>(*image_width)) +
+                     static_cast<usize>(*x)) * *components;
+                auto stored = machine.heap().write_byte_array(
+                    *source, output_offset,
+                    std::span<const u8>(pixel_values->data() + input_offset,
+                                        row_bytes));
+                if (!stored) return std::unexpected(stored.error());
             }
 
             auto surface = ensure_mutable_image_surface(
@@ -538,12 +535,8 @@ void register_image2d(NativeMethodRegistry& registry) {
                                  static_cast<usize>(*width) +
                              static_cast<usize>(column)) * *components +
                             component;
-                        auto value = machine.heap().element(
-                            *pixels, input_index);
-                        if (!value) return std::unexpected(value.error());
-                        auto integer = value->as_int();
-                        if (!integer) return std::unexpected(integer.error());
-                        component_values[component] = static_cast<u8>(*integer);
+                        component_values[component] =
+                            (*pixel_values)[input_index];
                     }
                     u8 red = 255U;
                     u8 green = 255U;
@@ -757,12 +750,17 @@ void register_vertex_array(NativeMethodRegistry& registry) {
                 if (!first_vertex) return std::unexpected(first_vertex.error());
                 if (!vertex_count) return std::unexpected(vertex_count.error());
                 if (!array) return std::unexpected(array.error());
-                auto total_vertices = int_field(machine, *object, kVertexArray,
-                                                "vertexCount");
-                auto components = int_field(machine, *object, kVertexArray,
-                                            "componentCount");
-                auto data = reference_field(machine, *object, kVertexArray,
-                                            "data", "Ljava/lang/Object;");
+                static constexpr std::array<ObjectFieldSpec, 3U> kFields {{
+                    {"vertexCount", "I"},
+                    {"componentCount", "I"},
+                    {"data", "Ljava/lang/Object;"},
+                }};
+                auto fields = object_fields(
+                    machine, *object, kVertexArray, kFields);
+                if (!fields) return std::unexpected(fields.error());
+                auto total_vertices = (*fields)[0U].as_int();
+                auto components = (*fields)[1U].as_int();
+                auto data = (*fields)[2U].as_reference();
                 if (!total_vertices) return std::unexpected(total_vertices.error());
                 if (!components) return std::unexpected(components.error());
                 if (!data) return std::unexpected(data.error());
@@ -781,16 +779,12 @@ void register_vertex_array(NativeMethodRegistry& registry) {
                 }
                 const usize offset = static_cast<usize>(*first_vertex) *
                                      static_cast<usize>(*components);
-                for (usize index = 0; index < count; ++index) {
-                    auto value = into_vertex_array
-                        ? machine.heap().element(*array, index)
-                        : machine.heap().element(*data, offset + index);
-                    if (!value) return std::unexpected(value.error());
-                    auto stored = into_vertex_array
-                        ? machine.heap().set_element(*data, offset + index, *value)
-                        : machine.heap().set_element(*array, index, *value);
-                    if (!stored) return std::unexpected(stored.error());
-                }
+                auto copied = into_vertex_array
+                    ? machine.heap().copy_array_range(
+                          *array, 0U, *data, offset, count)
+                    : machine.heap().copy_array_range(
+                          *data, offset, *array, 0U, count);
+                if (!copied) return std::unexpected(copied.error());
                 return std::optional<Value> {};
             });
     };
@@ -1198,12 +1192,9 @@ void register_index_buffers(NativeMethodRegistry& registry) {
                 return fail_java("java/lang/IllegalArgumentException",
                                  "IndexBuffer destination is too short");
             }
-            for (usize index = 0; index < *count; ++index) {
-                auto value = machine.heap().element(*indices, index);
-                if (!value) return std::unexpected(value.error());
-                auto stored = machine.heap().set_element(*destination, index, *value);
-                if (!stored) return std::unexpected(stored.error());
-            }
+            auto copied = machine.heap().copy_array_range(
+                *indices, 0U, *destination, 0U, *count);
+            if (!copied) return std::unexpected(copied.error());
             return std::optional<Value> {};
         });
 
@@ -1222,24 +1213,20 @@ void register_index_buffers(NativeMethodRegistry& registry) {
                 if (!strip_lengths) {
                     return std::unexpected(strip_lengths.error());
                 }
-                auto strip_count = machine.heap().array_length(*strip_lengths);
-                if (!strip_count) return std::unexpected(strip_count.error());
-                if (*strip_count == 0U) {
+                auto strip_values = machine.heap().read_int_array(*strip_lengths);
+                if (!strip_values) return std::unexpected(strip_values.error());
+                if (strip_values->empty()) {
                     return fail_java("java/lang/IllegalArgumentException",
                                      "Triangle strip list is empty");
                 }
 
                 u64 used_index_count = 0U;
-                for (usize index = 0; index < *strip_count; ++index) {
-                    auto value = machine.heap().element(*strip_lengths, index);
-                    if (!value) return std::unexpected(value.error());
-                    auto length = value->as_int();
-                    if (!length) return std::unexpected(length.error());
-                    if (*length < 3) {
+                for (const i32 length : *strip_values) {
+                    if (length < 3) {
                         return fail_java("java/lang/IllegalArgumentException",
                                          "Triangle strip is too short");
                     }
-                    used_index_count += static_cast<u64>(*length);
+                    used_index_count += static_cast<u64>(length);
                 }
 
                 Result<ObjectRef> indices = fail(
@@ -1249,23 +1236,18 @@ void register_index_buffers(NativeMethodRegistry& registry) {
                     auto source = reference_argument(
                         arguments, 1U, operation, false);
                     if (!source) return std::unexpected(source.error());
-                    auto source_length = machine.heap().array_length(*source);
-                    if (!source_length) {
-                        return std::unexpected(source_length.error());
+                    auto source_values = machine.heap().read_int_array(*source);
+                    if (!source_values) {
+                        return std::unexpected(source_values.error());
                     }
-                    if (used_index_count > static_cast<u64>(*source_length)) {
+                    if (used_index_count >
+                        static_cast<u64>(source_values->size())) {
                         return fail_java(
                             "java/lang/IllegalArgumentException",
                             "Triangle strip lengths exceed the index array");
                     }
-                    for (usize index = 0U; index < *source_length; ++index) {
-                        auto value = machine.heap().element(*source, index);
-                        if (!value) return std::unexpected(value.error());
-                        auto vertex_index = value->as_int();
-                        if (!vertex_index) {
-                            return std::unexpected(vertex_index.error());
-                        }
-                        if (*vertex_index < 0 || *vertex_index > 65'535) {
+                    for (const i32 vertex_index : *source_values) {
+                        if (vertex_index < 0 || vertex_index > 65'535) {
                             return fail_java(
                                 "java/lang/IndexOutOfBoundsException",
                                 "Triangle strip index is outside 0..65535");
@@ -1293,13 +1275,13 @@ void register_index_buffers(NativeMethodRegistry& registry) {
                     indices = allocate_array(machine, "[I", count,
                                              Value::from_int(0));
                     if (!indices) return std::unexpected(indices.error());
+                    std::vector<i32> generated(count);
                     for (usize index = 0U; index < count; ++index) {
-                        auto stored = machine.heap().set_element(
-                            *indices, index,
-                            Value::from_int(
-                                *first + static_cast<i32>(index)));
-                        if (!stored) return std::unexpected(stored.error());
+                        generated[index] = *first + static_cast<i32>(index);
                     }
+                    auto stored = machine.heap().write_int_array(
+                        *indices, 0U, generated);
+                    if (!stored) return std::unexpected(stored.error());
                 }
                 if (!indices) return std::unexpected(indices.error());
 

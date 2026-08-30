@@ -13,6 +13,7 @@
 #include "phoneme/vm/DecodedMethod.hpp"
 #include "phoneme/vm/Descriptor.hpp"
 #include "phoneme/vm/MetadataId.hpp"
+#include "phoneme/vm/Verifier.hpp"
 
 namespace phoneme::vm {
 
@@ -114,6 +115,19 @@ struct RuntimeMethod final {
     std::shared_ptr<const CachedMethodDescriptor> descriptor;
     std::shared_ptr<const DecodedMethod> decoded;
     std::shared_ptr<OperandResolutionTable> operand_resolutions;
+    std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames;
+    // Decoded instruction index -> verified frame index. Unreachable decoded
+    // instructions retain kInvalidDecodedIndex. This avoids a binary search by
+    // bytecode PC at every interpreter safepoint.
+    std::vector<u32> verified_frame_index_by_instruction;
+
+    // Native/HLE binding is logically derived metadata. Cache both hits and
+    // misses directly on the immutable RuntimeMethod identity so steady-state
+    // invocation does not take Machine's native-binding mutex merely to read
+    // a dense MethodId slot. Publish the id before the generation; readers
+    // acquire the generation and can then consume the matching id lock-free.
+    mutable std::atomic<u32> cached_native_method_id {0U};
+    mutable std::atomic<u64> cached_native_generation {0U};
 };
 
 struct RuntimeMetadataDiagnostics final {
@@ -202,15 +216,11 @@ private:
                        TransparentStringEqual> classes_by_name_;
     std::unordered_map<const classfile::ClassFile*,
                        std::shared_ptr<const RuntimeClass>> classes_by_pointer_;
-    std::unordered_map<ClassId,
-                       std::shared_ptr<const RuntimeClass>,
-                       MetadataIdHash<ClassId>> classes_by_id_;
+    std::vector<std::shared_ptr<const RuntimeClass>> classes_by_id_;
     std::unordered_map<MethodPointerKey,
                        std::shared_ptr<const RuntimeMethod>,
                        MethodPointerKeyHash> methods_;
-    std::unordered_map<MethodId,
-                       std::shared_ptr<const RuntimeMethod>,
-                       MetadataIdHash<MethodId>> methods_by_id_;
+    std::vector<std::shared_ptr<const RuntimeMethod>> methods_by_id_;
     std::unordered_map<std::string,
                        std::shared_ptr<const CachedMethodDescriptor>,
                        TransparentStringHash,

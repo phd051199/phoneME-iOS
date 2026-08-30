@@ -30,6 +30,7 @@ struct FieldLocation final {
 struct ClassLayout final {
     std::string class_name;
     std::string super_name;
+    bool instantiable {true};
     usize instance_field_slots {0};
     std::unordered_map<std::string, usize> instance_fields;
     std::vector<Value> instance_defaults;
@@ -50,12 +51,75 @@ public:
     [[nodiscard]] Result<ObjectRef> allocate_instance(
         Heap& heap,
         std::string_view class_name);
+    [[nodiscard]] Result<ObjectRef> allocate_text_instance(
+        Heap& heap,
+        std::string_view class_name,
+        std::u16string text);
     [[nodiscard]] Result<Value> static_field(const FieldLocation& field);
+    [[nodiscard]] Result<Value> static_field(FieldId field_id) const;
     [[nodiscard]] Status set_static_field(const FieldLocation& field, Value value);
+    [[nodiscard]] Status set_static_field(FieldId field_id,
+                                          ValueKind expected_kind,
+                                          Value value);
     void append_reference_roots(std::vector<ObjectRef>& roots) const;
     void clear() noexcept;
 
 private:
+    struct StringHash final {
+        using is_transparent = void;
+
+        [[nodiscard]] usize operator()(std::string_view value) const noexcept {
+            return std::hash<std::string_view>{}(value);
+        }
+        [[nodiscard]] usize operator()(const std::string& value) const noexcept {
+            return (*this)(std::string_view(value));
+        }
+    };
+
+    struct StringEqual final {
+        using is_transparent = void;
+
+        [[nodiscard]] bool operator()(std::string_view left,
+                                      std::string_view right) const noexcept {
+            return left == right;
+        }
+    };
+
+    struct FieldResolutionKey final {
+        std::string owner;
+        std::string name;
+        std::string descriptor;
+        bool require_static {false};
+    };
+
+    struct FieldResolutionKeyView final {
+        std::string_view owner;
+        std::string_view name;
+        std::string_view descriptor;
+        bool require_static {false};
+    };
+
+    struct FieldResolutionKeyHash final {
+        using is_transparent = void;
+        [[nodiscard]] usize operator()(
+            const FieldResolutionKey& key) const noexcept;
+        [[nodiscard]] usize operator()(
+            FieldResolutionKeyView key) const noexcept;
+    };
+
+    struct FieldResolutionKeyEqual final {
+        using is_transparent = void;
+        [[nodiscard]] bool operator()(
+            const FieldResolutionKey& left,
+            const FieldResolutionKey& right) const noexcept;
+        [[nodiscard]] bool operator()(
+            const FieldResolutionKey& left,
+            FieldResolutionKeyView right) const noexcept;
+        [[nodiscard]] bool operator()(
+            FieldResolutionKeyView left,
+            const FieldResolutionKey& right) const noexcept;
+    };
+
     [[nodiscard]] Result<std::shared_ptr<const ClassLayout>> build_layout(
         std::string class_name);
     [[nodiscard]] static Result<Value> default_value(
@@ -67,10 +131,16 @@ private:
 
     ClassRepository& classes_;
     mutable std::mutex mutex_;
-    std::unordered_map<std::string, std::shared_ptr<const ClassLayout>> layouts_;
-    std::unordered_map<std::string, FieldLocation> resolved_fields_;
+    std::unordered_map<std::string,
+                       std::shared_ptr<const ClassLayout>,
+                       StringHash,
+                       StringEqual> layouts_;
+    std::unordered_map<FieldResolutionKey,
+                       FieldLocation,
+                       FieldResolutionKeyHash,
+                       FieldResolutionKeyEqual> resolved_fields_;
     std::unordered_map<std::string, FieldId> field_ids_;
-    std::unordered_map<FieldId, Value, MetadataIdHash<FieldId>> static_fields_;
+    std::vector<std::optional<Value>> static_fields_;
     u32 next_field_id_ {1U};
 };
 

@@ -252,7 +252,10 @@ Result<std::shared_ptr<const RuntimeClass>> RuntimeMetadata::publish_class(
     });
     classes_by_pointer_.emplace(runtime_class->class_file.get(), runtime_class);
     classes_by_name_.emplace(runtime_class->class_file->name(), runtime_class);
-    classes_by_id_.emplace(runtime_class->id, runtime_class);
+    const usize class_slot = static_cast<usize>(runtime_class->id.value);
+    if (class_slot >= classes_by_id_.size())
+        classes_by_id_.resize(class_slot + 1U);
+    classes_by_id_[class_slot] = runtime_class;
     return runtime_class;
 }
 
@@ -279,6 +282,8 @@ Result<std::shared_ptr<const RuntimeMethod>> RuntimeMetadata::publish_method(
     const MethodId method_id {next_method_id_};
     std::shared_ptr<const DecodedMethod> decoded;
     std::shared_ptr<OperandResolutionTable> operand_resolutions;
+    std::shared_ptr<const VerifiedMethodReferenceMaps> verified_frames;
+    std::vector<u32> verified_frame_index_by_instruction;
     if (method.code.has_value()) {
         auto decoded_method = decode_method(method_id, method);
         if (!decoded_method) {
@@ -287,19 +292,56 @@ Result<std::shared_ptr<const RuntimeMethod>> RuntimeMetadata::publish_method(
         decoded = std::make_shared<const DecodedMethod>(
             std::move(*decoded_method));
         operand_resolutions = std::make_shared<OperandResolutionTable>(*decoded);
+        // ClassRepository verifies archive methods before publishing them, and
+        // builtin methods are verified lazily by the same verifier on demand.
+        // Keep the exact physical slot/reference maps with RuntimeMethod so
+        // JIT, interpreter safepoints and GC do not independently rebuild the
+        // same immutable type-state graph.
+        auto maps = verified_reference_maps(*owner, method);
+        if (maps) {
+            verified_frames =
+                std::make_shared<const VerifiedMethodReferenceMaps>(
+                    std::move(*maps));
+            verified_frame_index_by_instruction.assign(
+                decoded->instructions.size(), kInvalidDecodedIndex);
+            for (u32 frame_index = 0U;
+                 frame_index < verified_frames->frames.size();
+                 ++frame_index) {
+                const auto& frame = verified_frames->frames[frame_index];
+                if (frame.bytecode_pc > std::numeric_limits<u32>::max()) {
+                    continue;
+                }
+                const u32 instruction_index = decoded->instruction_index_for_bci(
+                    static_cast<u32>(frame.bytecode_pc));
+                if (instruction_index != kInvalidDecodedIndex &&
+                    instruction_index < verified_frame_index_by_instruction.size()) {
+                    verified_frame_index_by_instruction[instruction_index] = frame_index;
+                }
+            }
+        }
     }
     ++next_method_id_;
-    auto runtime_method = std::make_shared<const RuntimeMethod>(RuntimeMethod {
-        .id = method_id,
-        .declaring_class = (*runtime_class)->id,
-        .owner = owner,
-        .method = &method,
-        .descriptor = std::move(*descriptor),
-        .decoded = std::move(decoded),
-        .operand_resolutions = std::move(operand_resolutions),
-    });
+    // RuntimeMethod contains mutable atomic derived caches, so build it in
+    // place rather than materializing/moving an aggregate temporary (atomics
+    // are deliberately non-copyable/non-movable).
+    auto mutable_runtime_method = std::make_shared<RuntimeMethod>();
+    mutable_runtime_method->id = method_id;
+    mutable_runtime_method->declaring_class = (*runtime_class)->id;
+    mutable_runtime_method->owner = owner;
+    mutable_runtime_method->method = &method;
+    mutable_runtime_method->descriptor = std::move(*descriptor);
+    mutable_runtime_method->decoded = std::move(decoded);
+    mutable_runtime_method->operand_resolutions = std::move(operand_resolutions);
+    mutable_runtime_method->verified_frames = std::move(verified_frames);
+    mutable_runtime_method->verified_frame_index_by_instruction =
+        std::move(verified_frame_index_by_instruction);
+    std::shared_ptr<const RuntimeMethod> runtime_method =
+        std::move(mutable_runtime_method);
     methods_.emplace(key, runtime_method);
-    methods_by_id_.emplace(runtime_method->id, runtime_method);
+    const usize method_slot = static_cast<usize>(runtime_method->id.value);
+    if (method_slot >= methods_by_id_.size())
+        methods_by_id_.resize(method_slot + 1U);
+    methods_by_id_[method_slot] = runtime_method;
     return runtime_method;
 }
 
@@ -339,8 +381,8 @@ std::shared_ptr<const RuntimeClass> RuntimeMetadata::find_class(
     ClassId id) const noexcept {
     if (!id.valid()) return nullptr;
     std::scoped_lock lock(mutex_);
-    const auto found = classes_by_id_.find(id);
-    return found == classes_by_id_.end() ? nullptr : found->second;
+    const usize slot = static_cast<usize>(id.value);
+    return slot < classes_by_id_.size() ? classes_by_id_[slot] : nullptr;
 }
 
 std::shared_ptr<const RuntimeMethod> RuntimeMetadata::find_method(
@@ -358,8 +400,8 @@ std::shared_ptr<const RuntimeMethod> RuntimeMetadata::find_method(
     MethodId id) const noexcept {
     if (!id.valid()) return nullptr;
     std::scoped_lock lock(mutex_);
-    const auto found = methods_by_id_.find(id);
-    return found == methods_by_id_.end() ? nullptr : found->second;
+    const usize slot = static_cast<usize>(id.value);
+    return slot < methods_by_id_.size() ? methods_by_id_[slot] : nullptr;
 }
 
 u64 RuntimeMetadata::generation() const noexcept {

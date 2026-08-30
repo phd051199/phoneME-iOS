@@ -259,10 +259,18 @@ std::unordered_map<DepthKey, DepthSurface, DepthKeyHash> g_depth_surfaces;
     Machine& machine,
     ObjectRef graphics3d,
     const BoundRenderTarget& target) {
-    auto x = int_field(machine, graphics3d, kGraphics3D, "viewportX");
-    auto y = int_field(machine, graphics3d, kGraphics3D, "viewportY");
-    auto width = int_field(machine, graphics3d, kGraphics3D, "viewportWidth");
-    auto height = int_field(machine, graphics3d, kGraphics3D, "viewportHeight");
+    static constexpr std::array<ObjectFieldSpec, 4U> kFields {{
+        {"viewportX", "I"},
+        {"viewportY", "I"},
+        {"viewportWidth", "I"},
+        {"viewportHeight", "I"},
+    }};
+    auto fields = object_fields(machine, graphics3d, kGraphics3D, kFields);
+    if (!fields) return std::unexpected(fields.error());
+    auto x = (*fields)[0U].as_int();
+    auto y = (*fields)[1U].as_int();
+    auto width = (*fields)[2U].as_int();
+    auto height = (*fields)[3U].as_int();
     if (!x) return std::unexpected(x.error());
     if (!y) return std::unexpected(y.error());
     if (!width) return std::unexpected(width.error());
@@ -330,22 +338,29 @@ void erase_depth_surface(Machine& machine, ObjectRef graphics3d) {
         return fail_java("java/lang/NullPointerException",
                          std::string(operation) + " array is null");
     }
-    auto class_name = machine.heap().class_name(array);
-    auto length = machine.heap().array_length(array);
-    if (!class_name) return std::unexpected(class_name.error());
-    if (!length) return std::unexpected(length.error());
-    if (*class_name != "[I") {
+    auto result = machine.heap().read_int_array(array);
+    if (!result && result.error().code == ErrorCode::invalid_argument) {
         return fail_java("java/lang/IllegalArgumentException",
                          std::string(operation) + " expects int[]");
     }
-    std::vector<i32> result(*length);
-    for (usize index = 0U; index < *length; ++index) {
-        auto value = machine.heap().element(array, index);
-        if (!value) return std::unexpected(value.error());
-        auto integer = value->as_int();
-        if (!integer) return std::unexpected(integer.error());
-        result[index] = *integer;
+    if (!result) return std::unexpected(result.error());
+    return result;
+}
+
+[[nodiscard]] Result<std::vector<ObjectRef>> read_reference_array(
+    Machine& machine,
+    ObjectRef array,
+    std::string_view operation) {
+    if (array.is_null()) {
+        return fail_java("java/lang/NullPointerException",
+                         std::string(operation) + " array is null");
     }
+    auto result = machine.heap().read_reference_array(array);
+    if (!result && result.error().code == ErrorCode::invalid_argument) {
+        return fail_java("java/lang/IllegalArgumentException",
+                         std::string(operation) + " expects an object array");
+    }
+    if (!result) return std::unexpected(result.error());
     return result;
 }
 
@@ -354,22 +369,12 @@ void erase_depth_surface(Machine& machine, ObjectRef graphics3d) {
     ObjectRef array,
     std::string_view operation) {
     if (array.is_null()) return std::vector<u8> {};
-    auto class_name = machine.heap().class_name(array);
-    auto length = machine.heap().array_length(array);
-    if (!class_name) return std::unexpected(class_name.error());
-    if (!length) return std::unexpected(length.error());
-    if (*class_name != "[B") {
+    auto result = machine.heap().read_byte_array(array);
+    if (!result && result.error().code == ErrorCode::invalid_argument) {
         return fail_java("java/lang/IllegalArgumentException",
                          std::string(operation) + " expects byte[]");
     }
-    std::vector<u8> result(*length);
-    for (usize index = 0U; index < *length; ++index) {
-        auto value = machine.heap().element(array, index);
-        if (!value) return std::unexpected(value.error());
-        auto integer = value->as_int();
-        if (!integer) return std::unexpected(integer.error());
-        result[index] = static_cast<u8>(*integer & 0xFF);
-    }
+    if (!result) return std::unexpected(result.error());
     return result;
 }
 
@@ -377,13 +382,18 @@ void erase_depth_surface(Machine& machine, ObjectRef graphics3d) {
     Machine& machine,
     ObjectRef array,
     std::string_view operation) {
-    auto count = int_field(machine, array, kVertexArray, "vertexCount");
-    auto components = int_field(machine, array, kVertexArray,
-                                "componentCount");
-    auto component_size = int_field(machine, array, kVertexArray,
-                                    "componentSize");
-    auto data = reference_field(machine, array, kVertexArray,
-                                "data", "Ljava/lang/Object;");
+    static constexpr std::array<ObjectFieldSpec, 4U> kFields {{
+        {"vertexCount", "I"},
+        {"componentCount", "I"},
+        {"componentSize", "I"},
+        {"data", "Ljava/lang/Object;"},
+    }};
+    auto fields = object_fields(machine, array, kVertexArray, kFields);
+    if (!fields) return std::unexpected(fields.error());
+    auto count = (*fields)[0U].as_int();
+    auto components = (*fields)[1U].as_int();
+    auto component_size = (*fields)[2U].as_int();
+    auto data = (*fields)[3U].as_reference();
     if (!count) return std::unexpected(count.error());
     if (!components) return std::unexpected(components.error());
     if (!component_size) return std::unexpected(component_size.error());
@@ -395,24 +405,27 @@ void erase_depth_surface(Machine& machine, ObjectRef graphics3d) {
     }
     const usize value_count = static_cast<usize>(*count) *
                               static_cast<usize>(*components);
-    auto length = machine.heap().array_length(*data);
-    if (!length) return std::unexpected(length.error());
-    if (*length < value_count) {
-        return fail(ErrorCode::invalid_state,
-                    std::string(operation) + " vertex data is truncated");
-    }
     std::vector<float> values(value_count);
-    for (usize index = 0U; index < value_count; ++index) {
-        auto value = machine.heap().element(*data, index);
-        if (!value) return std::unexpected(value.error());
-        auto integer = value->as_int();
-        if (!integer) return std::unexpected(integer.error());
-        if (*component_size == 1) {
+    if (*component_size == 1) {
+        auto source = machine.heap().read_byte_array(*data);
+        if (!source) return std::unexpected(source.error());
+        if (source->size() < value_count) {
+            return fail(ErrorCode::invalid_state,
+                        std::string(operation) + " vertex data is truncated");
+        }
+        for (usize index = 0U; index < value_count; ++index) {
             values[index] = static_cast<float>(
-                static_cast<std::int8_t>(*integer & 0xFF));
-        } else {
-            values[index] = static_cast<float>(
-                static_cast<std::int16_t>(*integer & 0xFFFF));
+                static_cast<std::int8_t>((*source)[index]));
+        }
+    } else {
+        auto source = machine.heap().read_short_array(*data);
+        if (!source) return std::unexpected(source.error());
+        if (source->size() < value_count) {
+            return fail(ErrorCode::invalid_state,
+                        std::string(operation) + " vertex data is truncated");
+        }
+        for (usize index = 0U; index < value_count; ++index) {
+            values[index] = static_cast<float>((*source)[index]);
         }
     }
     return VertexArrayData {
@@ -433,12 +446,16 @@ void erase_depth_surface(Machine& machine, ObjectRef graphics3d) {
 [[nodiscard]] Result<std::vector<Position>> positions(
     Machine& machine,
     ObjectRef vertex_buffer) {
-    auto array = reference_field(machine, vertex_buffer, kVertexBuffer,
-        "positions", "Ljavax/microedition/m3g/VertexArray;");
-    auto scale = float_field(machine, vertex_buffer, kVertexBuffer,
-                             "positionScale");
-    auto bias = reference_field(machine, vertex_buffer, kVertexBuffer,
-                                "positionBias", "[F");
+    static constexpr std::array<ObjectFieldSpec, 3U> kFields {{
+        {"positions", "Ljavax/microedition/m3g/VertexArray;"},
+        {"positionScale", "F"},
+        {"positionBias", "[F"},
+    }};
+    auto fields = object_fields(machine, vertex_buffer, kVertexBuffer, kFields);
+    if (!fields) return std::unexpected(fields.error());
+    auto array = (*fields)[0U].as_reference();
+    auto scale = (*fields)[1U].as_float();
+    auto bias = (*fields)[2U].as_reference();
     if (!array) return std::unexpected(array.error());
     if (!scale) return std::unexpected(scale.error());
     if (!bias) return std::unexpected(bias.error());
@@ -469,49 +486,63 @@ void erase_depth_surface(Machine& machine, ObjectRef graphics3d) {
     return result;
 }
 
-[[nodiscard]] Result<std::vector<TexCoord>> texture_coordinates(
+struct TextureCoordinateState final {
+    std::vector<ObjectRef> arrays;
+    std::vector<float> scales;
+    std::vector<ObjectRef> biases;
+};
+
+[[nodiscard]] Result<TextureCoordinateState> texture_coordinate_state(
     Machine& machine,
-    ObjectRef vertex_buffer,
-    usize vertex_count,
-    usize unit = 0U) {
-    auto arrays = reference_field(machine, vertex_buffer, kVertexBuffer,
-        "texCoords", "[Ljavax/microedition/m3g/VertexArray;");
-    auto scales = reference_field(machine, vertex_buffer, kVertexBuffer,
-                                   "texScales", "[F");
-    auto biases = reference_field(machine, vertex_buffer, kVertexBuffer,
-                                   "texBiases", "[[F");
+    ObjectRef vertex_buffer) {
+    static constexpr std::array<ObjectFieldSpec, 3U> kFields {{
+        {"texCoords", "[Ljavax/microedition/m3g/VertexArray;"},
+        {"texScales", "[F"},
+        {"texBiases", "[[F"},
+    }};
+    auto fields = object_fields(machine, vertex_buffer, kVertexBuffer, kFields);
+    if (!fields) return std::unexpected(fields.error());
+    auto arrays = (*fields)[0U].as_reference();
+    auto scales = (*fields)[1U].as_reference();
+    auto biases = (*fields)[2U].as_reference();
     if (!arrays) return std::unexpected(arrays.error());
     if (!scales) return std::unexpected(scales.error());
     if (!biases) return std::unexpected(biases.error());
+    TextureCoordinateState state;
+    if (arrays->is_null()) return state;
+    auto array_values = read_reference_array(
+        machine, *arrays, "VertexBuffer texture coordinates");
+    auto scale_values = read_float_array(
+        machine, *scales, "VertexBuffer texture scales");
+    auto bias_values = read_reference_array(
+        machine, *biases, "VertexBuffer texture biases");
+    if (!array_values) return std::unexpected(array_values.error());
+    if (!scale_values) return std::unexpected(scale_values.error());
+    if (!bias_values) return std::unexpected(bias_values.error());
+    state.arrays = std::move(*array_values);
+    state.scales = std::move(*scale_values);
+    state.biases = std::move(*bias_values);
+    return state;
+}
+
+[[nodiscard]] Result<std::vector<TexCoord>> texture_coordinates_from_state(
+    Machine& machine,
+    const TextureCoordinateState& state,
+    usize vertex_count,
+    usize unit) {
     std::vector<TexCoord> result(vertex_count);
-    if (unit >= kTextureUnitCount || arrays->is_null()) return result;
-    auto array_length = machine.heap().array_length(*arrays);
-    auto scale_length = machine.heap().array_length(*scales);
-    auto bias_length = machine.heap().array_length(*biases);
-    if (!array_length) return std::unexpected(array_length.error());
-    if (!scale_length) return std::unexpected(scale_length.error());
-    if (!bias_length) return std::unexpected(bias_length.error());
-    if (unit >= *array_length || unit >= *scale_length ||
-        unit >= *bias_length) {
+    if (unit >= kTextureUnitCount || unit >= state.arrays.size() ||
+        unit >= state.scales.size() || unit >= state.biases.size()) {
         return result;
     }
-    auto array_value = machine.heap().element(*arrays, unit);
-    auto scale_value = machine.heap().element(*scales, unit);
-    auto bias_value = machine.heap().element(*biases, unit);
-    if (!array_value) return std::unexpected(array_value.error());
-    if (!scale_value) return std::unexpected(scale_value.error());
-    if (!bias_value) return std::unexpected(bias_value.error());
-    auto array = array_value->as_reference();
-    auto scale = scale_value->as_float();
-    auto bias = bias_value->as_reference();
-    if (!array) return std::unexpected(array.error());
-    if (!scale) return std::unexpected(scale.error());
-    if (!bias) return std::unexpected(bias.error());
-    if (array->is_null()) return result;
-    auto source = vertex_array_data(machine, *array,
+    const ObjectRef array = state.arrays[unit];
+    const float scale = state.scales[unit];
+    const ObjectRef bias = state.biases[unit];
+    if (array.is_null()) return result;
+    auto source = vertex_array_data(machine, array,
                                     "VertexBuffer texture coordinates");
     if (!source) return std::unexpected(source.error());
-    auto offsets = nullable_float_array(machine, *bias,
+    auto offsets = nullable_float_array(machine, bias,
                                         "VertexBuffer texture bias");
     if (!offsets) return std::unexpected(offsets.error());
     const usize count = std::min(vertex_count,
@@ -519,9 +550,9 @@ void erase_depth_surface(Machine& machine, ObjectRef graphics3d) {
     for (usize vertex = 0U; vertex < count; ++vertex) {
         const usize base = vertex *
                            static_cast<usize>(source->component_count);
-        const float u = source->values[base] * *scale +
+        const float u = source->values[base] * scale +
                         (offsets->empty() ? 0.0F : (*offsets)[0U]);
-        const float v = source->values[base + 1U] * *scale +
+        const float v = source->values[base + 1U] * scale +
                         (offsets->size() < 2U ? 0.0F : (*offsets)[1U]);
         result[vertex] = TexCoord {u, v};
     }
@@ -535,10 +566,12 @@ using TextureCoordinateSets =
     Machine& machine,
     ObjectRef vertex_buffer,
     usize vertex_count) {
+    auto state = texture_coordinate_state(machine, vertex_buffer);
+    if (!state) return std::unexpected(state.error());
     TextureCoordinateSets result;
     for (usize unit = 0U; unit < kTextureUnitCount; ++unit) {
-        auto coordinates = texture_coordinates(
-            machine, vertex_buffer, vertex_count, unit);
+        auto coordinates = texture_coordinates_from_state(
+            machine, *state, vertex_count, unit);
         if (!coordinates) return std::unexpected(coordinates.error());
         result[unit] = std::move(*coordinates);
     }
@@ -637,22 +670,32 @@ using TextureCoordinateSets =
     Machine& machine,
     ObjectRef vertex_buffer,
     usize vertex_count) {
-    auto default_color = int_field(machine, vertex_buffer, kVertexBuffer,
-                                   "defaultColor");
-    auto array = reference_field(machine, vertex_buffer, kVertexBuffer,
-        "colors", "Ljavax/microedition/m3g/VertexArray;");
+    static constexpr std::array<ObjectFieldSpec, 2U> kBufferFields {{
+        {"defaultColor", "I"},
+        {"colors", "Ljavax/microedition/m3g/VertexArray;"},
+    }};
+    auto buffer_fields = object_fields(
+        machine, vertex_buffer, kVertexBuffer, kBufferFields);
+    if (!buffer_fields) return std::unexpected(buffer_fields.error());
+    auto default_color = (*buffer_fields)[0U].as_int();
+    auto array = (*buffer_fields)[1U].as_reference();
     if (!default_color) return std::unexpected(default_color.error());
     if (!array) return std::unexpected(array.error());
     std::vector<VertexColor> result(
         vertex_count, color_from_argb(*default_color));
     if (array->is_null()) return result;
-    auto components = int_field(machine, *array, kVertexArray,
-                                "componentCount");
-    auto component_size = int_field(machine, *array, kVertexArray,
-                                    "componentSize");
-    auto count = int_field(machine, *array, kVertexArray, "vertexCount");
-    auto data = reference_field(machine, *array, kVertexArray,
-                                "data", "Ljava/lang/Object;");
+    static constexpr std::array<ObjectFieldSpec, 4U> kArrayFields {{
+        {"componentCount", "I"},
+        {"componentSize", "I"},
+        {"vertexCount", "I"},
+        {"data", "Ljava/lang/Object;"},
+    }};
+    auto array_fields = object_fields(machine, *array, kVertexArray, kArrayFields);
+    if (!array_fields) return std::unexpected(array_fields.error());
+    auto components = (*array_fields)[0U].as_int();
+    auto component_size = (*array_fields)[1U].as_int();
+    auto count = (*array_fields)[2U].as_int();
+    auto data = (*array_fields)[3U].as_reference();
     if (!components) return std::unexpected(components.error());
     if (!component_size) return std::unexpected(component_size.error());
     if (!count) return std::unexpected(count.error());
@@ -663,10 +706,10 @@ using TextureCoordinateSets =
         return fail_java("java/lang/IllegalStateException",
                          "VertexBuffer colors are incompatible");
     }
-    auto length = machine.heap().array_length(*data);
-    if (!length) return std::unexpected(length.error());
+    auto color_values = machine.heap().read_byte_array(*data);
+    if (!color_values) return std::unexpected(color_values.error());
     const usize required = vertex_count * static_cast<usize>(*components);
-    if (*length < required) {
+    if (color_values->size() < required) {
         return fail(ErrorCode::invalid_state,
                     "VertexBuffer color data is truncated");
     }
@@ -676,12 +719,8 @@ using TextureCoordinateSets =
         std::array<float, 4> values {1.0F, 1.0F, 1.0F, 1.0F};
         for (usize component = 0U;
              component < static_cast<usize>(*components); ++component) {
-            auto value = machine.heap().element(*data, base + component);
-            if (!value) return std::unexpected(value.error());
-            auto integer = value->as_int();
-            if (!integer) return std::unexpected(integer.error());
             values[component] =
-                static_cast<float>(*integer & 0xFF) * scale;
+                static_cast<float>((*color_values)[base + component]) * scale;
         }
         result[vertex] = VertexColor {
             *components == 4 ? values[3U] : 1.0F,
@@ -698,32 +737,22 @@ struct DeformedGeometry final {
     TextureCoordinateSets texture_coordinates;
 };
 
-[[nodiscard]] Result<bool> has_vertex_attribute(
-    Machine& machine,
-    ObjectRef vertex_buffer,
-    std::string_view field) {
-    auto array = reference_field(machine, vertex_buffer, kVertexBuffer,
-        field, "Ljavax/microedition/m3g/VertexArray;");
-    if (!array) return std::unexpected(array.error());
-    return !array->is_null();
-}
-
-[[nodiscard]] Result<bool> has_texture_coordinates(
-    Machine& machine,
-    ObjectRef vertex_buffer,
-    usize unit) {
+[[nodiscard]] Result<std::array<bool, kTextureUnitCount>>
+texture_coordinate_presence(Machine& machine,
+                            ObjectRef vertex_buffer) {
+    std::array<bool, kTextureUnitCount> result {};
     auto arrays = reference_field(machine, vertex_buffer, kVertexBuffer,
         "texCoords", "[Ljavax/microedition/m3g/VertexArray;");
     if (!arrays) return std::unexpected(arrays.error());
-    if (unit >= kTextureUnitCount || arrays->is_null()) return false;
-    auto length = machine.heap().array_length(*arrays);
-    if (!length) return std::unexpected(length.error());
-    if (unit >= *length) return false;
-    auto value = machine.heap().element(*arrays, unit);
-    if (!value) return std::unexpected(value.error());
-    auto array = value->as_reference();
-    if (!array) return std::unexpected(array.error());
-    return !array->is_null();
+    if (arrays->is_null()) return result;
+    auto values = read_reference_array(
+        machine, *arrays, "VertexBuffer texture coordinates");
+    if (!values) return std::unexpected(values.error());
+    const usize count = std::min(values->size(), kTextureUnitCount);
+    for (usize unit = 0U; unit < count; ++unit) {
+        result[unit] = !(*values)[unit].is_null();
+    }
+    return result;
 }
 
 [[nodiscard]] Result<DeformedGeometry> morphing_geometry(
@@ -738,21 +767,32 @@ struct DeformedGeometry final {
         machine, base_vertex_buffer, base_positions->size());
     auto base_textures = all_texture_coordinates(
         machine, base_vertex_buffer, base_positions->size());
-    auto base_has_normals = has_vertex_attribute(
-        machine, base_vertex_buffer, "normals");
-    auto base_has_colors = has_vertex_attribute(
-        machine, base_vertex_buffer, "colors");
     if (!base_normals) return std::unexpected(base_normals.error());
     if (!base_colors) return std::unexpected(base_colors.error());
     if (!base_textures) return std::unexpected(base_textures.error());
-    if (!base_has_normals) return std::unexpected(base_has_normals.error());
-    if (!base_has_colors) return std::unexpected(base_has_colors.error());
-    auto targets = reference_field(
-        machine, mesh, "javax/microedition/m3g/MorphingMesh",
-        "morphTargets", "[Ljavax/microedition/m3g/VertexBuffer;");
-    auto weights = reference_field(
-        machine, mesh, "javax/microedition/m3g/MorphingMesh",
-        "weights", "[F");
+    static constexpr std::array<ObjectFieldSpec, 2U> kBasePresenceFields {{
+        {"normals", "Ljavax/microedition/m3g/VertexArray;"},
+        {"colors", "Ljavax/microedition/m3g/VertexArray;"},
+    }};
+    auto base_presence = object_fields(
+        machine, base_vertex_buffer, kVertexBuffer, kBasePresenceFields);
+    if (!base_presence) return std::unexpected(base_presence.error());
+    auto base_normals_ref = (*base_presence)[0U].as_reference();
+    auto base_colors_ref = (*base_presence)[1U].as_reference();
+    if (!base_normals_ref) return std::unexpected(base_normals_ref.error());
+    if (!base_colors_ref) return std::unexpected(base_colors_ref.error());
+    const bool base_has_normals = !base_normals_ref->is_null();
+    const bool base_has_colors = !base_colors_ref->is_null();
+
+    static constexpr std::array<ObjectFieldSpec, 2U> kMorphFields {{
+        {"morphTargets", "[Ljavax/microedition/m3g/VertexBuffer;"},
+        {"weights", "[F"},
+    }};
+    auto morph_fields = object_fields(
+        machine, mesh, "javax/microedition/m3g/MorphingMesh", kMorphFields);
+    if (!morph_fields) return std::unexpected(morph_fields.error());
+    auto targets = (*morph_fields)[0U].as_reference();
+    auto weights = (*morph_fields)[1U].as_reference();
     if (!targets) return std::unexpected(targets.error());
     if (!weights) return std::unexpected(weights.error());
     if (targets->is_null() || weights->is_null()) {
@@ -763,15 +803,17 @@ struct DeformedGeometry final {
             .texture_coordinates = std::move(*base_textures),
         };
     }
-    auto target_count = machine.heap().array_length(*targets);
+    auto target_buffers = read_reference_array(
+        machine, *targets, "MorphingMesh targets");
     auto weight_values = read_float_array(machine, *weights,
                                           "MorphingMesh weights");
-    if (!target_count) return std::unexpected(target_count.error());
+    if (!target_buffers) return std::unexpected(target_buffers.error());
     if (!weight_values) return std::unexpected(weight_values.error());
-    if (*target_count != weight_values->size()) {
+    if (target_buffers->size() != weight_values->size()) {
         return fail(ErrorCode::invalid_state,
                     "MorphingMesh target and weight counts differ");
     }
+    const usize target_count = target_buffers->size();
     float weight_sum = 0.0F;
     for (const float value : *weight_values) {
         if (!std::isfinite(value)) {
@@ -780,42 +822,44 @@ struct DeformedGeometry final {
         }
         weight_sum += value;
     }
-    std::array<bool, kTextureUnitCount> base_has_texture {};
-    for (usize unit = 0U; unit < kTextureUnitCount; ++unit) {
-        auto present = has_texture_coordinates(
-            machine, base_vertex_buffer, unit);
-        if (!present) return std::unexpected(present.error());
-        base_has_texture[unit] = *present;
+    auto base_texture_presence = texture_coordinate_presence(
+        machine, base_vertex_buffer);
+    if (!base_texture_presence) {
+        return std::unexpected(base_texture_presence.error());
     }
-    std::vector<ObjectRef> target_buffers(*target_count);
+    const auto& base_has_texture = *base_texture_presence;
     usize position_target_count = 0U;
     usize normal_target_count = 0U;
     usize color_target_count = 0U;
     std::array<usize, kTextureUnitCount> texture_target_counts {};
-    for (usize target_index = 0U; target_index < *target_count;
+    for (usize target_index = 0U; target_index < target_count;
          ++target_index) {
-        auto value = machine.heap().element(*targets, target_index);
-        if (!value) return std::unexpected(value.error());
-        auto target = value->as_reference();
-        if (!target) return std::unexpected(target.error());
-        if (target->is_null()) {
+        const ObjectRef target = (*target_buffers)[target_index];
+        if (target.is_null()) {
             return fail_java("java/lang/IllegalStateException",
                              "MorphingMesh target is null");
         }
-        target_buffers[target_index] = *target;
-        auto has_positions = has_vertex_attribute(machine, *target, "positions");
-        auto has_normals = has_vertex_attribute(machine, *target, "normals");
-        auto has_colors = has_vertex_attribute(machine, *target, "colors");
-        if (!has_positions) return std::unexpected(has_positions.error());
-        if (!has_normals) return std::unexpected(has_normals.error());
-        if (!has_colors) return std::unexpected(has_colors.error());
-        position_target_count += *has_positions ? 1U : 0U;
-        normal_target_count += *has_normals ? 1U : 0U;
-        color_target_count += *has_colors ? 1U : 0U;
+        static constexpr std::array<ObjectFieldSpec, 3U> kPresenceFields {{
+            {"positions", "Ljavax/microedition/m3g/VertexArray;"},
+            {"normals", "Ljavax/microedition/m3g/VertexArray;"},
+            {"colors", "Ljavax/microedition/m3g/VertexArray;"},
+        }};
+        auto presence_fields = object_fields(
+            machine, target, kVertexBuffer, kPresenceFields);
+        if (!presence_fields) return std::unexpected(presence_fields.error());
+        auto positions_ref = (*presence_fields)[0U].as_reference();
+        auto normals_ref = (*presence_fields)[1U].as_reference();
+        auto colors_ref = (*presence_fields)[2U].as_reference();
+        if (!positions_ref) return std::unexpected(positions_ref.error());
+        if (!normals_ref) return std::unexpected(normals_ref.error());
+        if (!colors_ref) return std::unexpected(colors_ref.error());
+        position_target_count += positions_ref->is_null() ? 0U : 1U;
+        normal_target_count += normals_ref->is_null() ? 0U : 1U;
+        color_target_count += colors_ref->is_null() ? 0U : 1U;
+        auto texture_presence = texture_coordinate_presence(machine, target);
+        if (!texture_presence) return std::unexpected(texture_presence.error());
         for (usize unit = 0U; unit < kTextureUnitCount; ++unit) {
-            auto present = has_texture_coordinates(machine, *target, unit);
-            if (!present) return std::unexpected(present.error());
-            texture_target_counts[unit] += *present ? 1U : 0U;
+            texture_target_counts[unit] += (*texture_presence)[unit] ? 1U : 0U;
         }
     }
     const auto validate_target_attribute = [target_count](
@@ -824,20 +868,20 @@ struct DeformedGeometry final {
         const char* name) -> Result<bool> {
         if ((!base_present && present_count != 0U) ||
             (base_present && present_count != 0U &&
-             present_count != *target_count)) {
+             present_count != target_count)) {
             return fail_java(
                 "java/lang/IllegalStateException",
                 std::string("MorphingMesh ") + name +
                     " arrays are incompatible");
         }
-        return base_present && present_count == *target_count;
+        return base_present && present_count == target_count;
     };
     auto morph_positions = validate_target_attribute(
         true, position_target_count, "position");
     auto morph_normals = validate_target_attribute(
-        *base_has_normals, normal_target_count, "normal");
+        base_has_normals, normal_target_count, "normal");
     auto morph_colors = validate_target_attribute(
-        *base_has_colors, color_target_count, "color");
+        base_has_colors, color_target_count, "color");
     if (!morph_positions) return std::unexpected(morph_positions.error());
     if (!morph_normals) return std::unexpected(morph_normals.error());
     if (!morph_colors) return std::unexpected(morph_colors.error());
@@ -894,9 +938,9 @@ struct DeformedGeometry final {
             };
         }
     }
-    for (usize target_index = 0U; target_index < *target_count;
+    for (usize target_index = 0U; target_index < target_count;
          ++target_index) {
-        const ObjectRef target = target_buffers[target_index];
+        const ObjectRef target = (*target_buffers)[target_index];
         const float weight = (*weight_values)[target_index];
         if (*morph_positions) {
             auto target_positions = positions(machine, target);
@@ -949,25 +993,29 @@ struct DeformedGeometry final {
                     (*target_colors)[vertex].b * weight;
             }
         }
-        for (usize unit = 0U; unit < kTextureUnitCount; ++unit) {
-            if (!morph_textures[unit]) continue;
-            auto target_texture = texture_coordinates(
-                machine, target, result.positions.size(), unit);
-            if (!target_texture) {
-                return std::unexpected(target_texture.error());
+        if (std::any_of(morph_textures.begin(), morph_textures.end(),
+                        [](bool value) { return value; })) {
+            auto target_textures = all_texture_coordinates(
+                machine, target, result.positions.size());
+            if (!target_textures) {
+                return std::unexpected(target_textures.error());
             }
-            if (target_texture->size() !=
-                result.texture_coordinates[unit].size()) {
-                return fail_java(
-                    "java/lang/IllegalStateException",
-                    "MorphingMesh texture coordinates are incompatible");
-            }
-            for (usize vertex = 0U;
-                 vertex < result.texture_coordinates[unit].size(); ++vertex) {
-                result.texture_coordinates[unit][vertex].u +=
-                    (*target_texture)[vertex].u * weight;
-                result.texture_coordinates[unit][vertex].v +=
-                    (*target_texture)[vertex].v * weight;
+            for (usize unit = 0U; unit < kTextureUnitCount; ++unit) {
+                if (!morph_textures[unit]) continue;
+                const auto& target_texture = (*target_textures)[unit];
+                if (target_texture.size() !=
+                    result.texture_coordinates[unit].size()) {
+                    return fail_java(
+                        "java/lang/IllegalStateException",
+                        "MorphingMesh texture coordinates are incompatible");
+                }
+                for (usize vertex = 0U;
+                     vertex < result.texture_coordinates[unit].size(); ++vertex) {
+                    result.texture_coordinates[unit][vertex].u +=
+                        target_texture[vertex].u * weight;
+                    result.texture_coordinates[unit][vertex].v +=
+                        target_texture[vertex].v * weight;
+                }
             }
         }
     }
@@ -1025,9 +1073,14 @@ struct DeformedGeometry final {
     if (!weights) return std::unexpected(weights.error());
     if (!rest_transforms) return std::unexpected(rest_transforms.error());
     if (bones->is_null()) return result;
-    auto bone_count = machine.heap().array_length(*bones);
-    if (!bone_count) return std::unexpected(bone_count.error());
-    if (*bone_count == 0U) return result;
+    auto bone_values = read_reference_array(machine, *bones,
+                                            "SkinnedMesh bones");
+    auto rest_values = read_reference_array(machine, *rest_transforms,
+                                            "SkinnedMesh transforms");
+    if (!bone_values) return std::unexpected(bone_values.error());
+    if (!rest_values) return std::unexpected(rest_values.error());
+    const usize bone_count = bone_values->size();
+    if (bone_count == 0U) return result;
     auto first_values = read_int_array(machine, *first_vertices,
                                        "SkinnedMesh first vertices");
     auto count_values = read_int_array(machine, *vertex_counts,
@@ -1037,12 +1090,10 @@ struct DeformedGeometry final {
     if (!first_values) return std::unexpected(first_values.error());
     if (!count_values) return std::unexpected(count_values.error());
     if (!weight_values) return std::unexpected(weight_values.error());
-    auto transform_count = machine.heap().array_length(*rest_transforms);
-    if (!transform_count) return std::unexpected(transform_count.error());
-    if (first_values->size() != *bone_count ||
-        count_values->size() != *bone_count ||
-        weight_values->size() != *bone_count ||
-        *transform_count != *bone_count) {
+    if (first_values->size() != bone_count ||
+        count_values->size() != bone_count ||
+        weight_values->size() != bone_count ||
+        rest_values->size() != bone_count) {
         return fail(ErrorCode::invalid_state,
                     "SkinnedMesh influence arrays differ in length");
     }
@@ -1053,26 +1104,23 @@ struct DeformedGeometry final {
     std::vector<Position> accumulated(result.positions.size());
     std::vector<Vector3> accumulated_normals(result.positions.size());
     std::vector<float> accumulated_weights(result.positions.size(), 0.0F);
-    for (usize influence = 0U; influence < *bone_count; ++influence) {
-        auto bone_value = machine.heap().element(*bones, influence);
-        auto rest_value = machine.heap().element(*rest_transforms, influence);
-        if (!bone_value) return std::unexpected(bone_value.error());
-        if (!rest_value) return std::unexpected(rest_value.error());
-        auto bone = bone_value->as_reference();
-        auto rest_array = rest_value->as_reference();
-        if (!bone) return std::unexpected(bone.error());
-        if (!rest_array) return std::unexpected(rest_array.error());
-        if (bone->is_null() || rest_array->is_null()) continue;
-        auto rest_values = read_float_array(machine, *rest_array,
+    for (usize influence = 0U; influence < bone_count; ++influence) {
+        const ObjectRef bone = (*bone_values)[influence];
+        const ObjectRef rest_array = (*rest_values)[influence];
+        if (bone.is_null() || rest_array.is_null()) continue;
+        auto rest_matrix_values = read_float_array(machine, rest_array,
                                             "SkinnedMesh rest transform");
-        if (!rest_values) return std::unexpected(rest_values.error());
-        if (rest_values->size() != 16U) {
+        if (!rest_matrix_values) {
+            return std::unexpected(rest_matrix_values.error());
+        }
+        if (rest_matrix_values->size() != 16U) {
             return fail(ErrorCode::invalid_state,
                         "SkinnedMesh rest transform is truncated");
         }
         Matrix rest {};
-        std::copy(rest_values->begin(), rest_values->end(), rest.begin());
-        auto bone_world = node_composite_matrix(machine, *bone);
+        std::copy(rest_matrix_values->begin(), rest_matrix_values->end(),
+                  rest.begin());
+        auto bone_world = node_composite_matrix(machine, bone);
         if (!bone_world) return std::unexpected(bone_world.error());
         const Matrix current_bone_to_mesh = multiply(*inverse_mesh, *bone_world);
         const Matrix deformation = multiply(current_bone_to_mesh, rest);
@@ -1198,10 +1246,14 @@ struct DeformedGeometry final {
         return convert_image2d_pixels(
             (*render_surface)->pixels(), format, source_has_alpha);
     }
-    auto source = reference_field(machine, image2d, kImage2D,
-                                  "source", "Ljava/lang/Object;");
-    auto palette = reference_field(machine, image2d, kImage2D,
-                                   "palette", "[B");
+    static constexpr std::array<ObjectFieldSpec, 2U> kFields {{
+        {"source", "Ljava/lang/Object;"},
+        {"palette", "[B"},
+    }};
+    auto fields = object_fields(machine, image2d, kImage2D, kFields);
+    if (!fields) return std::unexpected(fields.error());
+    auto source = (*fields)[0U].as_reference();
+    auto palette = (*fields)[1U].as_reference();
     if (!source) return std::unexpected(source.error());
     if (!palette) return std::unexpected(palette.error());
     if (source->is_null()) return std::vector<graphics::Pixel> {};
@@ -1273,9 +1325,16 @@ struct DeformedGeometry final {
         return fail_java("java/lang/NullPointerException",
                          "Image2D is null");
     }
-    auto width = int_field(machine, image, kImage2D, "width");
-    auto height = int_field(machine, image, kImage2D, "height");
-    auto format = int_field(machine, image, kImage2D, "format");
+    static constexpr std::array<ObjectFieldSpec, 3U> kFields {{
+        {"width", "I"},
+        {"height", "I"},
+        {"format", "I"},
+    }};
+    auto fields = object_fields(machine, image, kImage2D, kFields);
+    if (!fields) return std::unexpected(fields.error());
+    auto width = (*fields)[0U].as_int();
+    auto height = (*fields)[1U].as_int();
+    auto format = (*fields)[2U].as_int();
     if (!width) return std::unexpected(width.error());
     if (!height) return std::unexpected(height.error());
     if (!format) return std::unexpected(format.error());
@@ -1291,35 +1350,28 @@ struct DeformedGeometry final {
     };
 }
 
-[[nodiscard]] Result<std::optional<TextureData>> texture_data(
+[[nodiscard]] Result<std::optional<TextureData>> texture_data_from_texture(
     Machine& machine,
-    ObjectRef appearance,
-    usize unit = 0U) {
-    if (appearance.is_null()) return std::optional<TextureData> {};
-    auto textures = reference_field(machine, appearance, kAppearance,
-        "textures", "[Ljavax/microedition/m3g/Texture2D;");
-    if (!textures) return std::unexpected(textures.error());
-    if (unit >= kTextureUnitCount || textures->is_null()) {
-        return std::optional<TextureData> {};
-    }
-    auto length = machine.heap().array_length(*textures);
-    if (!length) return std::unexpected(length.error());
-    if (unit >= *length) return std::optional<TextureData> {};
-    auto value = machine.heap().element(*textures, unit);
-    if (!value) return std::unexpected(value.error());
-    auto texture = value->as_reference();
-    if (!texture) return std::unexpected(texture.error());
-    if (texture->is_null()) return std::optional<TextureData> {};
-    auto image = reference_field(machine, *texture, kTexture2D,
-        "image", "Ljavax/microedition/m3g/Image2D;");
-    auto wrap_s = int_field(machine, *texture, kTexture2D, "wrapS");
-    auto wrap_t = int_field(machine, *texture, kTexture2D, "wrapT");
-    auto blending = int_field(machine, *texture, kTexture2D, "blending");
-    auto blend_color = int_field(machine, *texture, kTexture2D,
-                                 "blendColor");
-    auto image_filter = int_field(machine, *texture, kTexture2D,
-                                  "imageFilter");
-    auto local = local_transform(machine, *texture);
+    ObjectRef texture) {
+    if (texture.is_null()) return std::optional<TextureData> {};
+    static constexpr std::array<ObjectFieldSpec, 6U> kTextureFields {{
+        {"image", "Ljavax/microedition/m3g/Image2D;"},
+        {"wrapS", "I"},
+        {"wrapT", "I"},
+        {"blending", "I"},
+        {"blendColor", "I"},
+        {"imageFilter", "I"},
+    }};
+    auto texture_fields = object_fields(
+        machine, texture, kTexture2D, kTextureFields);
+    if (!texture_fields) return std::unexpected(texture_fields.error());
+    auto image = (*texture_fields)[0U].as_reference();
+    auto wrap_s = (*texture_fields)[1U].as_int();
+    auto wrap_t = (*texture_fields)[2U].as_int();
+    auto blending = (*texture_fields)[3U].as_int();
+    auto blend_color = (*texture_fields)[4U].as_int();
+    auto image_filter = (*texture_fields)[5U].as_int();
+    auto local = local_transform(machine, texture);
     if (!image) return std::unexpected(image.error());
     if (!wrap_s) return std::unexpected(wrap_s.error());
     if (!wrap_t) return std::unexpected(wrap_t.error());
@@ -1328,9 +1380,16 @@ struct DeformedGeometry final {
     if (!image_filter) return std::unexpected(image_filter.error());
     if (!local) return std::unexpected(local.error());
     if (image->is_null()) return std::optional<TextureData> {};
-    auto width = int_field(machine, *image, kImage2D, "width");
-    auto height = int_field(machine, *image, kImage2D, "height");
-    auto format = int_field(machine, *image, kImage2D, "format");
+    static constexpr std::array<ObjectFieldSpec, 3U> kImageFields {{
+        {"width", "I"},
+        {"height", "I"},
+        {"format", "I"},
+    }};
+    auto image_fields = object_fields(machine, *image, kImage2D, kImageFields);
+    if (!image_fields) return std::unexpected(image_fields.error());
+    auto width = (*image_fields)[0U].as_int();
+    auto height = (*image_fields)[1U].as_int();
+    auto format = (*image_fields)[2U].as_int();
     if (!width) return std::unexpected(width.error());
     if (!height) return std::unexpected(height.error());
     if (!format) return std::unexpected(format.error());
@@ -1354,11 +1413,34 @@ struct DeformedGeometry final {
     });
 }
 
+[[nodiscard]] Result<TextureUnits> all_texture_data(
+    Machine& machine,
+    ObjectRef textures) {
+    TextureUnits result;
+    if (textures.is_null()) return result;
+    auto texture_values = read_reference_array(
+        machine, textures, "Appearance textures");
+    if (!texture_values) return std::unexpected(texture_values.error());
+    const usize count = std::min(texture_values->size(), kTextureUnitCount);
+    for (usize unit = 0U; unit < count; ++unit) {
+        auto texture = texture_data_from_texture(
+            machine, (*texture_values)[unit]);
+        if (!texture) return std::unexpected(texture.error());
+        result[unit] = std::move(*texture);
+    }
+    return result;
+}
+
 [[nodiscard]] Result<Matrix> camera_projection(Machine& machine,
                                                ObjectRef camera) {
-    auto type = int_field(machine, camera, kCamera, "projectionType");
-    auto values = reference_field(machine, camera, kCamera,
-                                  "projection", "[F");
+    static constexpr std::array<ObjectFieldSpec, 2U> kFields {{
+        {"projectionType", "I"},
+        {"projection", "[F"},
+    }};
+    auto fields = object_fields(machine, camera, kCamera, kFields);
+    if (!fields) return std::unexpected(fields.error());
+    auto type = (*fields)[0U].as_int();
+    auto values = (*fields)[1U].as_reference();
     if (!type) return std::unexpected(type.error());
     if (!values) return std::unexpected(values.error());
     if (values->is_null()) {
@@ -1584,20 +1666,25 @@ struct DeformedGeometry final {
 
 [[nodiscard]] Result<MaterialState> appearance_material(
     Machine& machine,
-    ObjectRef appearance) {
+    ObjectRef material) {
     MaterialState state;
-    if (appearance.is_null()) return state;
-    auto material = reference_field(machine, appearance, kAppearance,
-        "material", "Ljavax/microedition/m3g/Material;");
-    if (!material) return std::unexpected(material.error());
-    if (material->is_null()) return state;
-    auto ambient = int_field(machine, *material, kMaterial, "ambient");
-    auto diffuse = int_field(machine, *material, kMaterial, "diffuse");
-    auto emissive = int_field(machine, *material, kMaterial, "emissive");
-    auto specular = int_field(machine, *material, kMaterial, "specular");
-    auto shininess = float_field(machine, *material, kMaterial, "shininess");
-    auto tracking = int_field(machine, *material, kMaterial,
-                              "vertexColorTracking", "Z");
+    if (material.is_null()) return state;
+    static constexpr std::array<ObjectFieldSpec, 6U> kFields {{
+        {"ambient", "I"},
+        {"diffuse", "I"},
+        {"emissive", "I"},
+        {"specular", "I"},
+        {"shininess", "F"},
+        {"vertexColorTracking", "Z"},
+    }};
+    auto fields = object_fields(machine, material, kMaterial, kFields);
+    if (!fields) return std::unexpected(fields.error());
+    auto ambient = (*fields)[0U].as_int();
+    auto diffuse = (*fields)[1U].as_int();
+    auto emissive = (*fields)[2U].as_int();
+    auto specular = (*fields)[3U].as_int();
+    auto shininess = (*fields)[4U].as_float();
+    auto tracking = (*fields)[5U].as_int();
     if (!ambient) return std::unexpected(ambient.error());
     if (!diffuse) return std::unexpected(diffuse.error());
     if (!emissive) return std::unexpected(emissive.error());
@@ -1618,18 +1705,23 @@ struct DeformedGeometry final {
 }
 
 [[nodiscard]] Result<FogState> appearance_fog(Machine& machine,
-                                               ObjectRef appearance) {
+                                               ObjectRef fog) {
     FogState state;
-    if (appearance.is_null()) return state;
-    auto fog = reference_field(machine, appearance, kAppearance,
-                               "fog", "Ljavax/microedition/m3g/Fog;");
-    if (!fog) return std::unexpected(fog.error());
-    if (fog->is_null()) return state;
-    auto mode = int_field(machine, *fog, kFog, "mode");
-    auto color = int_field(machine, *fog, kFog, "color");
-    auto density = float_field(machine, *fog, kFog, "density");
-    auto near_distance = float_field(machine, *fog, kFog, "nearDistance");
-    auto far_distance = float_field(machine, *fog, kFog, "farDistance");
+    if (fog.is_null()) return state;
+    static constexpr std::array<ObjectFieldSpec, 5U> kFields {{
+        {"mode", "I"},
+        {"color", "I"},
+        {"density", "F"},
+        {"nearDistance", "F"},
+        {"farDistance", "F"},
+    }};
+    auto fields = object_fields(machine, fog, kFog, kFields);
+    if (!fields) return std::unexpected(fields.error());
+    auto mode = (*fields)[0U].as_int();
+    auto color = (*fields)[1U].as_int();
+    auto density = (*fields)[2U].as_float();
+    auto near_distance = (*fields)[3U].as_float();
+    auto far_distance = (*fields)[4U].as_float();
     if (!mode) return std::unexpected(mode.error());
     if (!color) return std::unexpected(color.error());
     if (!density) return std::unexpected(density.error());
@@ -1669,14 +1761,23 @@ struct DeformedGeometry final {
                                             ObjectRef light,
                                             const Matrix& transform) {
     LightState state;
-    auto mode = int_field(machine, light, kLight, "mode");
     auto scope = int_field(machine, light, kNode, "scope");
-    auto color = int_field(machine, light, kLight, "color");
-    auto intensity = float_field(machine, light, kLight, "intensity");
-    auto angle = float_field(machine, light, kLight, "spotAngle");
-    auto exponent = float_field(machine, light, kLight, "spotExponent");
-    auto attenuation = reference_field(machine, light, kLight,
-                                       "attenuation", "[F");
+    static constexpr std::array<ObjectFieldSpec, 6U> kFields {{
+        {"mode", "I"},
+        {"color", "I"},
+        {"intensity", "F"},
+        {"spotAngle", "F"},
+        {"spotExponent", "F"},
+        {"attenuation", "[F"},
+    }};
+    auto fields = object_fields(machine, light, kLight, kFields);
+    if (!fields) return std::unexpected(fields.error());
+    auto mode = (*fields)[0U].as_int();
+    auto color = (*fields)[1U].as_int();
+    auto intensity = (*fields)[2U].as_float();
+    auto angle = (*fields)[3U].as_float();
+    auto exponent = (*fields)[4U].as_float();
+    auto attenuation = (*fields)[5U].as_reference();
     if (!mode) return std::unexpected(mode.error());
     if (!scope) return std::unexpected(scope.error());
     if (!color) return std::unexpected(color.error());
@@ -1725,36 +1826,46 @@ struct DeformedGeometry final {
         }
         return {};
     };
-    auto count = int_field(machine, graphics3d, kGraphics3D, "lightCount");
+    static constexpr std::array<ObjectFieldSpec, 3U> kFields {{
+        {"lightCount", "I"},
+        {"lights", "[Ljavax/microedition/m3g/Light;"},
+        {"lightTransforms", "[Ljavax/microedition/m3g/Transform;"},
+    }};
+    auto fields = object_fields(machine, graphics3d, kGraphics3D, kFields);
+    if (!fields) return std::unexpected(fields.error());
+    auto count = (*fields)[0U].as_int();
+    auto lights = (*fields)[1U].as_reference();
+    auto transforms = (*fields)[2U].as_reference();
     if (!count) return std::unexpected(count.error());
+    if (!lights) return std::unexpected(lights.error());
+    if (!transforms) return std::unexpected(transforms.error());
     if (*count > 0) {
-        auto lights = reference_field(machine, graphics3d, kGraphics3D,
-            "lights", "[Ljavax/microedition/m3g/Light;");
-        auto transforms = reference_field(machine, graphics3d, kGraphics3D,
-            "lightTransforms", "[Ljavax/microedition/m3g/Transform;");
-        if (!lights) return std::unexpected(lights.error());
-        if (!transforms) return std::unexpected(transforms.error());
         if (!lights->is_null() && !transforms->is_null()) {
+            auto light_values = read_reference_array(
+                machine, *lights, "Graphics3D lights");
+            auto transform_values = read_reference_array(
+                machine, *transforms, "Graphics3D light transforms");
+            if (!light_values) return std::unexpected(light_values.error());
+            if (!transform_values) {
+                return std::unexpected(transform_values.error());
+            }
+            const usize required = static_cast<usize>(*count);
+            if (light_values->size() < required ||
+                transform_values->size() < required) {
+                return fail(ErrorCode::invalid_state,
+                            "Graphics3D light arrays are truncated");
+            }
             for (i32 index = 0; index < *count; ++index) {
-                auto light_value = machine.heap().element(
-                    *lights, static_cast<usize>(index));
-                auto transform_value = machine.heap().element(
-                    *transforms, static_cast<usize>(index));
-                if (!light_value) return std::unexpected(light_value.error());
-                if (!transform_value) {
-                    return std::unexpected(transform_value.error());
-                }
-                auto light = light_value->as_reference();
-                auto transform = transform_value->as_reference();
-                if (!light) return std::unexpected(light.error());
-                if (!transform) return std::unexpected(transform.error());
+                const usize position = static_cast<usize>(index);
+                const ObjectRef light = (*light_values)[position];
+                const ObjectRef transform = (*transform_values)[position];
                 Matrix matrix = identity_matrix();
-                if (!transform->is_null()) {
-                    auto loaded = transform_matrix(machine, *transform);
+                if (!transform.is_null()) {
+                    auto loaded = transform_matrix(machine, transform);
                     if (!loaded) return std::unexpected(loaded.error());
                     matrix = *loaded;
                 }
-                auto appended = append_light(*light, matrix);
+                auto appended = append_light(light, matrix);
                 if (!appended) return std::unexpected(appended.error());
             }
         }
@@ -1883,21 +1994,23 @@ struct DeformedGeometry final {
 
 [[nodiscard]] Result<RenderState> appearance_render_state(
     Machine& machine,
-    ObjectRef appearance) {
+    ObjectRef polygon,
+    ObjectRef compositing) {
     RenderState state;
-    if (appearance.is_null()) return state;
-    auto polygon = reference_field(machine, appearance, kAppearance,
-        "polygonMode", "Ljavax/microedition/m3g/PolygonMode;");
-    auto compositing = reference_field(machine, appearance, kAppearance,
-        "compositingMode", "Ljavax/microedition/m3g/CompositingMode;");
-    if (!polygon) return std::unexpected(polygon.error());
-    if (!compositing) return std::unexpected(compositing.error());
-    if (!polygon->is_null()) {
-        auto culling = int_field(machine, *polygon, kPolygonMode, "culling");
-        auto winding = int_field(machine, *polygon, kPolygonMode, "winding");
-        auto shading = int_field(machine, *polygon, kPolygonMode, "shading");
-        auto two_sided = int_field(machine, *polygon, kPolygonMode,
-                                   "twoSided", "Z");
+    if (!polygon.is_null()) {
+        static constexpr std::array<ObjectFieldSpec, 4U> kPolygonFields {{
+            {"culling", "I"},
+            {"winding", "I"},
+            {"shading", "I"},
+            {"twoSided", "Z"},
+        }};
+        auto polygon_fields = object_fields(
+            machine, polygon, kPolygonMode, kPolygonFields);
+        if (!polygon_fields) return std::unexpected(polygon_fields.error());
+        auto culling = (*polygon_fields)[0U].as_int();
+        auto winding = (*polygon_fields)[1U].as_int();
+        auto shading = (*polygon_fields)[2U].as_int();
+        auto two_sided = (*polygon_fields)[3U].as_int();
         if (!culling) return std::unexpected(culling.error());
         if (!winding) return std::unexpected(winding.error());
         if (!shading) return std::unexpected(shading.error());
@@ -1907,23 +2020,30 @@ struct DeformedGeometry final {
         state.shading = *shading;
         state.two_sided_lighting = *two_sided != 0;
     }
-    if (!compositing->is_null()) {
-        auto blending = int_field(machine, *compositing,
-                                  kCompositingMode, "blending");
-        auto threshold = float_field(machine, *compositing,
-                                     kCompositingMode, "alphaThreshold");
-        auto offset_factor = float_field(
-            machine, *compositing, kCompositingMode, "depthOffsetFactor");
-        auto offset_units = float_field(
-            machine, *compositing, kCompositingMode, "depthOffsetUnits");
-        auto alpha_write = int_field(machine, *compositing,
-                                     kCompositingMode, "alphaWrite", "Z");
-        auto color_write = int_field(machine, *compositing,
-                                     kCompositingMode, "colorWrite", "Z");
-        auto depth_write = int_field(machine, *compositing,
-                                     kCompositingMode, "depthWrite", "Z");
-        auto depth_test = int_field(machine, *compositing,
-                                    kCompositingMode, "depthTest", "Z");
+    if (!compositing.is_null()) {
+        static constexpr std::array<ObjectFieldSpec, 8U> kCompositingFields {{
+            {"blending", "I"},
+            {"alphaThreshold", "F"},
+            {"depthOffsetFactor", "F"},
+            {"depthOffsetUnits", "F"},
+            {"alphaWrite", "Z"},
+            {"colorWrite", "Z"},
+            {"depthWrite", "Z"},
+            {"depthTest", "Z"},
+        }};
+        auto compositing_fields = object_fields(
+            machine, compositing, kCompositingMode, kCompositingFields);
+        if (!compositing_fields) {
+            return std::unexpected(compositing_fields.error());
+        }
+        auto blending = (*compositing_fields)[0U].as_int();
+        auto threshold = (*compositing_fields)[1U].as_float();
+        auto offset_factor = (*compositing_fields)[2U].as_float();
+        auto offset_units = (*compositing_fields)[3U].as_float();
+        auto alpha_write = (*compositing_fields)[4U].as_int();
+        auto color_write = (*compositing_fields)[5U].as_int();
+        auto depth_write = (*compositing_fields)[6U].as_int();
+        auto depth_test = (*compositing_fields)[7U].as_int();
         if (!blending) return std::unexpected(blending.error());
         if (!threshold) return std::unexpected(threshold.error());
         if (!offset_factor) return std::unexpected(offset_factor.error());
@@ -2228,10 +2348,15 @@ struct DeformedGeometry final {
         return fail(ErrorCode::invalid_state,
                     "deformed vertex normals are truncated");
     }
-    auto index_array = reference_field(machine, index_buffer, kIndexBuffer,
-                                       "indices", "[I");
-    auto strip_array = reference_field(machine, index_buffer, kIndexBuffer,
-                                       "stripLengths", "[I");
+    static constexpr std::array<ObjectFieldSpec, 2U> kIndexFields {{
+        {"indices", "[I"},
+        {"stripLengths", "[I"},
+    }};
+    auto index_fields = object_fields(
+        machine, index_buffer, kIndexBuffer, kIndexFields);
+    if (!index_fields) return std::unexpected(index_fields.error());
+    auto index_array = (*index_fields)[0U].as_reference();
+    auto strip_array = (*index_fields)[1U].as_reference();
     if (!index_array) return std::unexpected(index_array.error());
     if (!strip_array) return std::unexpected(strip_array.error());
     if (index_array->is_null()) return {};
@@ -2247,12 +2372,26 @@ struct DeformedGeometry final {
         if (!lengths) return std::unexpected(lengths.error());
         strip_lengths = std::move(*lengths);
     }
-    auto camera = reference_field(machine, graphics3d, kGraphics3D,
-        "camera", "Ljavax/microedition/m3g/Camera;");
-    auto camera_transform = reference_field(machine, graphics3d, kGraphics3D,
-        "cameraTransform", "Ljavax/microedition/m3g/Transform;");
+    static constexpr std::array<ObjectFieldSpec, 5U> kGraphicsFields {{
+        {"camera", "Ljavax/microedition/m3g/Camera;"},
+        {"cameraTransform", "Ljavax/microedition/m3g/Transform;"},
+        {"depthNear", "F"},
+        {"depthFar", "F"},
+        {"depthBuffer", "Z"},
+    }};
+    auto graphics_fields = object_fields(
+        machine, graphics3d, kGraphics3D, kGraphicsFields);
+    if (!graphics_fields) return std::unexpected(graphics_fields.error());
+    auto camera = (*graphics_fields)[0U].as_reference();
+    auto camera_transform = (*graphics_fields)[1U].as_reference();
+    auto near_range = (*graphics_fields)[2U].as_float();
+    auto far_range = (*graphics_fields)[3U].as_float();
+    auto depth_enabled = (*graphics_fields)[4U].as_int();
     if (!camera) return std::unexpected(camera.error());
     if (!camera_transform) return std::unexpected(camera_transform.error());
+    if (!near_range) return std::unexpected(near_range.error());
+    if (!far_range) return std::unexpected(far_range.error());
+    if (!depth_enabled) return std::unexpected(depth_enabled.error());
     if (camera->is_null()) {
         return fail_java("java/lang/IllegalStateException",
                          "Graphics3D has no active camera");
@@ -2273,29 +2412,53 @@ struct DeformedGeometry final {
         if (!loaded) return std::unexpected(loaded.error());
         model = *loaded;
     }
-    auto near_range = float_field(machine, graphics3d, kGraphics3D,
-                                  "depthNear");
-    auto far_range = float_field(machine, graphics3d, kGraphics3D,
-                                 "depthFar");
-    if (!near_range) return std::unexpected(near_range.error());
-    if (!far_range) return std::unexpected(far_range.error());
-    TextureUnits textures;
-    for (usize unit = 0U; unit < kTextureUnitCount; ++unit) {
-        auto texture = texture_data(machine, appearance, unit);
-        if (!texture) return std::unexpected(texture.error());
-        textures[unit] = std::move(*texture);
+    ObjectRef textures_ref {};
+    ObjectRef material_ref {};
+    ObjectRef fog_ref {};
+    ObjectRef polygon_ref {};
+    ObjectRef compositing_ref {};
+    if (!appearance.is_null()) {
+        static constexpr std::array<ObjectFieldSpec, 5U> kAppearanceFields {{
+            {"textures", "[Ljavax/microedition/m3g/Texture2D;"},
+            {"material", "Ljavax/microedition/m3g/Material;"},
+            {"fog", "Ljavax/microedition/m3g/Fog;"},
+            {"polygonMode", "Ljavax/microedition/m3g/PolygonMode;"},
+            {"compositingMode", "Ljavax/microedition/m3g/CompositingMode;"},
+        }};
+        auto appearance_fields = object_fields(
+            machine, appearance, kAppearance, kAppearanceFields);
+        if (!appearance_fields) {
+            return std::unexpected(appearance_fields.error());
+        }
+        auto textures_value = (*appearance_fields)[0U].as_reference();
+        auto material_value = (*appearance_fields)[1U].as_reference();
+        auto fog_value = (*appearance_fields)[2U].as_reference();
+        auto polygon_value = (*appearance_fields)[3U].as_reference();
+        auto compositing_value = (*appearance_fields)[4U].as_reference();
+        if (!textures_value) return std::unexpected(textures_value.error());
+        if (!material_value) return std::unexpected(material_value.error());
+        if (!fog_value) return std::unexpected(fog_value.error());
+        if (!polygon_value) return std::unexpected(polygon_value.error());
+        if (!compositing_value) {
+            return std::unexpected(compositing_value.error());
+        }
+        textures_ref = *textures_value;
+        material_ref = *material_value;
+        fog_ref = *fog_value;
+        polygon_ref = *polygon_value;
+        compositing_ref = *compositing_value;
     }
-    auto material = appearance_material(machine, appearance);
-    auto fog = appearance_fog(machine, appearance);
-    auto state = appearance_render_state(machine, appearance);
+    auto loaded_textures = all_texture_data(machine, textures_ref);
+    if (!loaded_textures) return std::unexpected(loaded_textures.error());
+    TextureUnits textures = std::move(*loaded_textures);
+    auto material = appearance_material(machine, material_ref);
+    auto fog = appearance_fog(machine, fog_ref);
+    auto state = appearance_render_state(machine, polygon_ref, compositing_ref);
     auto lights = active_lights(machine, graphics3d, object_scope, scene_lights);
     if (!material) return std::unexpected(material.error());
     if (!fog) return std::unexpected(fog.error());
     if (!state) return std::unexpected(state.error());
     if (!lights) return std::unexpected(lights.error());
-    auto depth_enabled = int_field(machine, graphics3d, kGraphics3D,
-                                   "depthBuffer", "Z");
-    if (!depth_enabled) return std::unexpected(depth_enabled.error());
     if (*depth_enabled == 0) {
         state->depth_test = false;
         state->depth_write = false;
@@ -2427,16 +2590,26 @@ struct DeformedGeometry final {
     ObjectRef background,
     BoundRenderTarget& target,
     const RenderArea& area) {
-    auto image = reference_field(machine, background, kBackground,
-        "image", "Ljavax/microedition/m3g/Image2D;");
+    static constexpr std::array<ObjectFieldSpec, 7U> kFields {{
+        {"image", "Ljavax/microedition/m3g/Image2D;"},
+        {"cropX", "I"},
+        {"cropY", "I"},
+        {"cropWidth", "I"},
+        {"cropHeight", "I"},
+        {"imageModeX", "I"},
+        {"imageModeY", "I"},
+    }};
+    auto fields = object_fields(machine, background, kBackground, kFields);
+    if (!fields) return std::unexpected(fields.error());
+    auto image = (*fields)[0U].as_reference();
+    auto crop_x = (*fields)[1U].as_int();
+    auto crop_y = (*fields)[2U].as_int();
+    auto crop_width = (*fields)[3U].as_int();
+    auto crop_height = (*fields)[4U].as_int();
+    auto mode_x = (*fields)[5U].as_int();
+    auto mode_y = (*fields)[6U].as_int();
     if (!image) return std::unexpected(image.error());
     if (image->is_null()) return {};
-    auto crop_x = int_field(machine, background, kBackground, "cropX");
-    auto crop_y = int_field(machine, background, kBackground, "cropY");
-    auto crop_width = int_field(machine, background, kBackground, "cropWidth");
-    auto crop_height = int_field(machine, background, kBackground, "cropHeight");
-    auto mode_x = int_field(machine, background, kBackground, "imageModeX");
-    auto mode_y = int_field(machine, background, kBackground, "imageModeY");
     if (!crop_x) return std::unexpected(crop_x.error());
     if (!crop_y) return std::unexpected(crop_y.error());
     if (!crop_width) return std::unexpected(crop_width.error());
@@ -2517,11 +2690,16 @@ struct DeformedGeometry final {
     bool clear_depth = true;
     graphics::Pixel color = 0xFF000000U;
     if (!background.is_null()) {
-        auto color_value = int_field(machine, background, kBackground, "color");
-        auto color_clear = int_field(machine, background, kBackground,
-                                     "colorClear", "Z");
-        auto depth_clear = int_field(machine, background, kBackground,
-                                     "depthClear", "Z");
+        static constexpr std::array<ObjectFieldSpec, 3U> kFields {{
+            {"color", "I"},
+            {"colorClear", "Z"},
+            {"depthClear", "Z"},
+        }};
+        auto fields = object_fields(machine, background, kBackground, kFields);
+        if (!fields) return std::unexpected(fields.error());
+        auto color_value = (*fields)[0U].as_int();
+        auto color_clear = (*fields)[1U].as_int();
+        auto depth_clear = (*fields)[2U].as_int();
         if (!color_value) return std::unexpected(color_value.error());
         if (!color_clear) return std::unexpected(color_clear.error());
         if (!depth_clear) return std::unexpected(depth_clear.error());
@@ -2573,7 +2751,7 @@ struct DeformedGeometry final {
     ObjectRef graphics3d,
     ObjectRef sprite,
     const Matrix& model,
-    float inherited_alpha) {
+    float node_alpha) {
     auto target = bound_render_target(machine, graphics3d);
     if (!target) return std::unexpected(target.error());
     if (!target->context.rendering_enabled) return {};
@@ -2581,18 +2759,29 @@ struct DeformedGeometry final {
     if (!area) return std::unexpected(area.error());
     if (graphics::empty(area->clip)) return {};
 
-    auto image = reference_field(machine, sprite, kSprite3D,
-        "image", "Ljavax/microedition/m3g/Image2D;");
-    auto appearance = reference_field(machine, sprite, kSprite3D,
-        "appearance", "Ljavax/microedition/m3g/Appearance;");
-    auto scaled = int_field(machine, sprite, kSprite3D, "scaled", "Z");
-    auto crop_x = int_field(machine, sprite, kSprite3D, "cropX");
-    auto crop_y = int_field(machine, sprite, kSprite3D, "cropY");
-    auto crop_width = int_field(machine, sprite, kSprite3D, "cropWidth");
-    auto crop_height = int_field(machine, sprite, kSprite3D, "cropHeight");
-    auto flip_x = int_field(machine, sprite, kSprite3D, "flipX", "Z");
-    auto flip_y = int_field(machine, sprite, kSprite3D, "flipY", "Z");
-    auto alpha_factor = float_field(machine, sprite, kNode, "alphaFactor");
+    static constexpr std::array<ObjectFieldSpec, 9U> kSpriteFields {{
+        {"image", "Ljavax/microedition/m3g/Image2D;"},
+        {"appearance", "Ljavax/microedition/m3g/Appearance;"},
+        {"scaled", "Z"},
+        {"cropX", "I"},
+        {"cropY", "I"},
+        {"cropWidth", "I"},
+        {"cropHeight", "I"},
+        {"flipX", "Z"},
+        {"flipY", "Z"},
+    }};
+    auto sprite_fields = object_fields(
+        machine, sprite, kSprite3D, kSpriteFields);
+    if (!sprite_fields) return std::unexpected(sprite_fields.error());
+    auto image = (*sprite_fields)[0U].as_reference();
+    auto appearance = (*sprite_fields)[1U].as_reference();
+    auto scaled = (*sprite_fields)[2U].as_int();
+    auto crop_x = (*sprite_fields)[3U].as_int();
+    auto crop_y = (*sprite_fields)[4U].as_int();
+    auto crop_width = (*sprite_fields)[5U].as_int();
+    auto crop_height = (*sprite_fields)[6U].as_int();
+    auto flip_x = (*sprite_fields)[7U].as_int();
+    auto flip_y = (*sprite_fields)[8U].as_int();
     if (!image) return std::unexpected(image.error());
     if (!appearance) return std::unexpected(appearance.error());
     if (!scaled) return std::unexpected(scaled.error());
@@ -2602,7 +2791,6 @@ struct DeformedGeometry final {
     if (!crop_height) return std::unexpected(crop_height.error());
     if (!flip_x) return std::unexpected(flip_x.error());
     if (!flip_y) return std::unexpected(flip_y.error());
-    if (!alpha_factor) return std::unexpected(alpha_factor.error());
     if (image->is_null() || *crop_width <= 0 || *crop_height <= 0) {
         return {};
     }
@@ -2624,12 +2812,23 @@ struct DeformedGeometry final {
     const i32 source_height = source_bottom - source_top;
     if (source_width <= 0 || source_height <= 0) return {};
 
-    auto camera = reference_field(machine, graphics3d, kGraphics3D,
-        "camera", "Ljavax/microedition/m3g/Camera;");
-    auto camera_transform = reference_field(machine, graphics3d, kGraphics3D,
-        "cameraTransform", "Ljavax/microedition/m3g/Transform;");
+    static constexpr std::array<ObjectFieldSpec, 4U> kGraphicsFields {{
+        {"camera", "Ljavax/microedition/m3g/Camera;"},
+        {"cameraTransform", "Ljavax/microedition/m3g/Transform;"},
+        {"depthNear", "F"},
+        {"depthFar", "F"},
+    }};
+    auto graphics_fields = object_fields(
+        machine, graphics3d, kGraphics3D, kGraphicsFields);
+    if (!graphics_fields) return std::unexpected(graphics_fields.error());
+    auto camera = (*graphics_fields)[0U].as_reference();
+    auto camera_transform = (*graphics_fields)[1U].as_reference();
+    auto near_range = (*graphics_fields)[2U].as_float();
+    auto far_range = (*graphics_fields)[3U].as_float();
     if (!camera) return std::unexpected(camera.error());
     if (!camera_transform) return std::unexpected(camera_transform.error());
+    if (!near_range) return std::unexpected(near_range.error());
+    if (!far_range) return std::unexpected(far_range.error());
     if (camera->is_null()) {
         return fail_java("java/lang/IllegalStateException",
                          "Graphics3D has no active camera");
@@ -2645,12 +2844,6 @@ struct DeformedGeometry final {
     auto view = inverse_matrix(camera_matrix);
     if (!view) return std::unexpected(view.error());
     const Matrix mvp = multiply(*projection, multiply(*view, model));
-    auto near_range = float_field(machine, graphics3d, kGraphics3D,
-                                  "depthNear");
-    auto far_range = float_field(machine, graphics3d, kGraphics3D,
-                                 "depthFar");
-    if (!near_range) return std::unexpected(near_range.error());
-    if (!far_range) return std::unexpected(far_range.error());
     const auto project = [&](float x, float y, float z)
         -> std::optional<ScreenVertex> {
         const auto clip = transform_point(mvp, x, y, z);
@@ -2732,8 +2925,35 @@ struct DeformedGeometry final {
         static_cast<i32>(std::ceil(draw_center_y + draw_height * 0.5F)) - 1);
     if (minimum_x > maximum_x || minimum_y > maximum_y) return {};
 
-    auto state = appearance_render_state(machine, *appearance);
-    auto fog = appearance_fog(machine, *appearance);
+    ObjectRef sprite_fog {};
+    ObjectRef sprite_polygon {};
+    ObjectRef sprite_compositing {};
+    if (!appearance->is_null()) {
+        static constexpr std::array<ObjectFieldSpec, 3U> kAppearanceFields {{
+            {"fog", "Ljavax/microedition/m3g/Fog;"},
+            {"polygonMode", "Ljavax/microedition/m3g/PolygonMode;"},
+            {"compositingMode", "Ljavax/microedition/m3g/CompositingMode;"},
+        }};
+        auto appearance_fields = object_fields(
+            machine, *appearance, kAppearance, kAppearanceFields);
+        if (!appearance_fields) {
+            return std::unexpected(appearance_fields.error());
+        }
+        auto fog_value = (*appearance_fields)[0U].as_reference();
+        auto polygon_value = (*appearance_fields)[1U].as_reference();
+        auto compositing_value = (*appearance_fields)[2U].as_reference();
+        if (!fog_value) return std::unexpected(fog_value.error());
+        if (!polygon_value) return std::unexpected(polygon_value.error());
+        if (!compositing_value) {
+            return std::unexpected(compositing_value.error());
+        }
+        sprite_fog = *fog_value;
+        sprite_polygon = *polygon_value;
+        sprite_compositing = *compositing_value;
+    }
+    auto state = appearance_render_state(
+        machine, sprite_polygon, sprite_compositing);
+    auto fog = appearance_fog(machine, sprite_fog);
     if (!state) return std::unexpected(state.error());
     if (!fog) return std::unexpected(fog.error());
     auto depth_enabled = int_field(machine, graphics3d, kGraphics3D,
@@ -2758,8 +2978,7 @@ struct DeformedGeometry final {
     auto pixels = target->image->mutable_pixels();
     const float left = draw_center_x - draw_width * 0.5F;
     const float top = draw_center_y - draw_height * 0.5F;
-    const float node_alpha = std::clamp(
-        *alpha_factor * inherited_alpha, 0.0F, 1.0F);
+    node_alpha = std::clamp(node_alpha, 0.0F, 1.0F);
     const usize sprite_width = static_cast<usize>(maximum_x - minimum_x + 1);
     const usize sprite_height = static_cast<usize>(maximum_y - minimum_y + 1);
     const auto draw_rows = [&](usize row_begin, usize row_end) {
@@ -2860,23 +3079,26 @@ struct DeformedGeometry final {
         lights.push_back(SceneLight {.light = node, .transform = model});
     }
     if (*class_name == kGroup || *class_name == kWorld) {
-        auto children = reference_field(machine, node, kGroup,
-            "children", "[Ljavax/microedition/m3g/Node;");
-        auto count = int_field(machine, node, kGroup, "childCount");
+        static constexpr std::array<ObjectFieldSpec, 2U> kGroupFields {{
+            {"children", "[Ljavax/microedition/m3g/Node;"},
+            {"childCount", "I"},
+        }};
+        auto group_fields = object_fields(
+            machine, node, kGroup, kGroupFields);
+        if (!group_fields) return std::unexpected(group_fields.error());
+        auto children = (*group_fields)[0U].as_reference();
+        auto count = (*group_fields)[1U].as_int();
         if (!children) return std::unexpected(children.error());
         if (!count) return std::unexpected(count.error());
         if (children->is_null()) return {};
-        auto length = machine.heap().array_length(*children);
-        if (!length) return std::unexpected(length.error());
+        auto child_values = read_reference_array(
+            machine, *children, "Group children");
+        if (!child_values) return std::unexpected(child_values.error());
         const usize child_count = std::min(
-            *length, static_cast<usize>(std::max(*count, 0)));
+            child_values->size(), static_cast<usize>(std::max(*count, 0)));
         for (usize index = 0U; index < child_count; ++index) {
-            auto child_value = machine.heap().element(*children, index);
-            if (!child_value) return std::unexpected(child_value.error());
-            auto child = child_value->as_reference();
-            if (!child) return std::unexpected(child.error());
             auto collected = collect_scene_lights(
-                machine, *child, model, lights, depth + 1U);
+                machine, (*child_values)[index], model, lights, depth + 1U);
             if (!collected) return collected;
         }
     }
@@ -2897,10 +3119,16 @@ struct DeformedGeometry final {
     }
     auto class_name = machine.heap().class_name(node);
     if (!class_name) return std::unexpected(class_name.error());
-    auto rendering = int_field(machine, node, kNode,
-                               "renderingEnabled", "Z");
-    auto scope = int_field(machine, node, kNode, "scope");
-    auto alpha = float_field(machine, node, kNode, "alphaFactor");
+    static constexpr std::array<ObjectFieldSpec, 3U> kNodeFields {{
+        {"renderingEnabled", "Z"},
+        {"scope", "I"},
+        {"alphaFactor", "F"},
+    }};
+    auto node_fields = object_fields(machine, node, kNode, kNodeFields);
+    if (!node_fields) return std::unexpected(node_fields.error());
+    auto rendering = (*node_fields)[0U].as_int();
+    auto scope = (*node_fields)[1U].as_int();
+    auto alpha = (*node_fields)[2U].as_float();
     if (!rendering) return std::unexpected(rendering.error());
     if (!scope) return std::unexpected(scope.error());
     if (!alpha) return std::unexpected(alpha.error());
@@ -2916,7 +3144,7 @@ struct DeformedGeometry final {
 
     if (*class_name == kSprite3D) {
         auto rendered = render_sprite(
-            machine, graphics3d, node, model, inherited_alpha);
+            machine, graphics3d, node, model, combined_alpha);
         if (!rendered) return rendered;
     }
 
@@ -2924,12 +3152,16 @@ struct DeformedGeometry final {
         *class_name == "javax/microedition/m3g/MorphingMesh" ||
         *class_name == "javax/microedition/m3g/SkinnedMesh";
     if (mesh) {
-        auto vertex_buffer = reference_field(machine, node, kMesh,
-            "vertexBuffer", "Ljavax/microedition/m3g/VertexBuffer;");
-        auto index_buffers = reference_field(machine, node, kMesh,
-            "indexBuffers", "[Ljavax/microedition/m3g/IndexBuffer;");
-        auto appearances = reference_field(machine, node, kMesh,
-            "appearances", "[Ljavax/microedition/m3g/Appearance;");
+        static constexpr std::array<ObjectFieldSpec, 3U> kMeshFields {{
+            {"vertexBuffer", "Ljavax/microedition/m3g/VertexBuffer;"},
+            {"indexBuffers", "[Ljavax/microedition/m3g/IndexBuffer;"},
+            {"appearances", "[Ljavax/microedition/m3g/Appearance;"},
+        }};
+        auto mesh_fields = object_fields(machine, node, kMesh, kMeshFields);
+        if (!mesh_fields) return std::unexpected(mesh_fields.error());
+        auto vertex_buffer = (*mesh_fields)[0U].as_reference();
+        auto index_buffers = (*mesh_fields)[1U].as_reference();
+        auto appearances = (*mesh_fields)[2U].as_reference();
         if (!vertex_buffer) return std::unexpected(vertex_buffer.error());
         if (!index_buffers) return std::unexpected(index_buffers.error());
         if (!appearances) return std::unexpected(appearances.error());
@@ -2944,31 +3176,26 @@ struct DeformedGeometry final {
             if (!loaded) return std::unexpected(loaded.error());
             deformed = std::move(*loaded);
         }
-        auto count = machine.heap().array_length(*index_buffers);
-        if (!count) return std::unexpected(count.error());
-        auto appearance_count = appearances->is_null()
-            ? Result<usize>(0U)
-            : machine.heap().array_length(*appearances);
-        if (!appearance_count) return std::unexpected(appearance_count.error());
+        auto index_values = read_reference_array(
+            machine, *index_buffers, "Mesh index buffers");
+        if (!index_values) return std::unexpected(index_values.error());
+        std::vector<ObjectRef> appearance_values;
+        if (!appearances->is_null()) {
+            auto loaded = read_reference_array(
+                machine, *appearances, "Mesh appearances");
+            if (!loaded) return std::unexpected(loaded.error());
+            appearance_values = std::move(*loaded);
+        }
         auto transform = snapshot_matrix(machine, model);
         if (!transform) return std::unexpected(transform.error());
         auto transform_root = machine.pin_native_root(*transform);
         if (!transform_root) return std::unexpected(transform_root.error());
-        for (usize index = 0U; index < *count; ++index) {
-            auto index_value = machine.heap().element(*index_buffers, index);
-            if (!index_value) return std::unexpected(index_value.error());
-            auto index_buffer = index_value->as_reference();
-            if (!index_buffer) return std::unexpected(index_buffer.error());
-            if (index_buffer->is_null()) continue;
+        for (usize index = 0U; index < index_values->size(); ++index) {
+            const ObjectRef index_buffer = (*index_values)[index];
+            if (index_buffer.is_null()) continue;
             ObjectRef appearance {};
-            if (index < *appearance_count) {
-                auto appearance_value = machine.heap().element(*appearances, index);
-                if (!appearance_value) {
-                    return std::unexpected(appearance_value.error());
-                }
-                auto reference = appearance_value->as_reference();
-                if (!reference) return std::unexpected(reference.error());
-                appearance = *reference;
+            if (index < appearance_values.size()) {
+                appearance = appearance_values[index];
             }
             const std::vector<Position>* deformed_positions =
                 deformed.has_value() ? &deformed->positions : nullptr;
@@ -2979,7 +3206,7 @@ struct DeformedGeometry final {
             const std::vector<VertexColor>* deformed_colors =
                 deformed.has_value() ? &deformed->colors : nullptr;
             auto rendered = render_geometry(
-                machine, graphics3d, *vertex_buffer, *index_buffer,
+                machine, graphics3d, *vertex_buffer, index_buffer,
                 appearance, *transform,
                 deformed_positions, deformed_texture,
                 deformed_normals, deformed_colors,
@@ -2989,23 +3216,26 @@ struct DeformedGeometry final {
     }
 
     if (*class_name == kGroup || *class_name == kWorld) {
-        auto children = reference_field(machine, node, kGroup,
-            "children", "[Ljavax/microedition/m3g/Node;");
-        auto count = int_field(machine, node, kGroup, "childCount");
+        static constexpr std::array<ObjectFieldSpec, 2U> kGroupFields {{
+            {"children", "[Ljavax/microedition/m3g/Node;"},
+            {"childCount", "I"},
+        }};
+        auto group_fields = object_fields(
+            machine, node, kGroup, kGroupFields);
+        if (!group_fields) return std::unexpected(group_fields.error());
+        auto children = (*group_fields)[0U].as_reference();
+        auto count = (*group_fields)[1U].as_int();
         if (!children) return std::unexpected(children.error());
         if (!count) return std::unexpected(count.error());
         if (children->is_null()) return {};
-        auto length = machine.heap().array_length(*children);
-        if (!length) return std::unexpected(length.error());
+        auto child_values = read_reference_array(
+            machine, *children, "Group children");
+        if (!child_values) return std::unexpected(child_values.error());
         const usize child_count = std::min(
-            *length, static_cast<usize>(std::max(*count, 0)));
+            child_values->size(), static_cast<usize>(std::max(*count, 0)));
         for (usize index = 0U; index < child_count; ++index) {
-            auto child_value = machine.heap().element(*children, index);
-            if (!child_value) return std::unexpected(child_value.error());
-            auto child = child_value->as_reference();
-            if (!child) return std::unexpected(child.error());
             auto rendered = render_scene_node(
-                machine, graphics3d, *child, model, render_scope,
+                machine, graphics3d, (*child_values)[index], model, render_scope,
                 combined_alpha, scene_lights, depth + 1U);
             if (!rendered) return rendered;
         }
@@ -3073,10 +3303,9 @@ struct DeformedGeometry final {
     if (!replacement) return std::unexpected(replacement.error());
     auto replacement_root = machine.pin_native_root(*replacement);
     if (!replacement_root) return std::unexpected(replacement_root.error());
-    for (usize index = 0U; index < *length; ++index) {
-        auto value = machine.heap().element(*array, index);
-        if (!value) return std::unexpected(value.error());
-        auto copied = machine.heap().set_element(*replacement, index, *value);
+    if (*length != 0U) {
+        auto copied = machine.heap().copy_array_range(
+            *array, 0U, *replacement, 0U, *length);
         if (!copied) return copied;
     }
     return set_reference_field(machine, graphics3d, kGraphics3D,

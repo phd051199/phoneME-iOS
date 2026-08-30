@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <thread>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 namespace phoneme::runtime {
 namespace {
 
@@ -38,7 +42,33 @@ u32 WorkCoordinator::helper_limit(WorkClass work_class,
         return background_work_allowed() ? 1U : 0U;
     }
 
-    if (thermal == ThermalPressure::serious) return 1U;
+    if (thermal == ThermalPressure::serious) {
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+        return 0U;
+#else
+        return 1U;
+#endif
+    }
+
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+    // Adaptive iPhone policy: stay single-lane while the game is meeting its
+    // frame deadline, then temporarily borrow CPU only after real missed
+    // frames. The short boost hold avoids 0/1/0/1 helper oscillation on games
+    // sitting close to the deadline.
+    if (work_class == WorkClass::frame_critical) {
+        const FramePressure pressure = frame_pressure();
+        if (pressure == FramePressure::overloaded) {
+            return std::min<u32>(available, 2U);
+        }
+        if (pressure == FramePressure::high || frame_boost_active()) {
+            return 1U;
+        }
+        return 0U;
+    }
+    if (work_class == WorkClass::interactive) {
+        return frame_boost_active() ? 1U : 0U;
+    }
+#endif
 
     // Medium jobs use one helper. Reserve two helpers for genuinely large
     // frame work where finishing sooner creates an actual idle window.
@@ -111,6 +141,20 @@ void WorkCoordinator::note_frame_interval(u64 elapsed_nanoseconds,
         pressure = FramePressure::overloaded;
     }
     frame_pressure_.store(static_cast<u8>(pressure), std::memory_order_release);
+
+    // Hold a short performance burst after a miss. This is intentionally
+    // frame-count based rather than time based: a 60 Hz game recovers quickly,
+    // while a 30 Hz game gets a slightly longer wall-clock recovery window.
+    u8 boost = frame_boost_frames_.load(std::memory_order_acquire);
+    if (pressure == FramePressure::overloaded) {
+        frame_boost_frames_.store(12U, std::memory_order_release);
+    } else if (pressure == FramePressure::high) {
+        frame_boost_frames_.store(std::max<u8>(boost, 6U),
+                                  std::memory_order_release);
+    } else if (boost != 0U) {
+        frame_boost_frames_.store(static_cast<u8>(boost - 1U),
+                                  std::memory_order_release);
+    }
 }
 
 void WorkCoordinator::set_thermal_pressure(ThermalPressure pressure) noexcept {
@@ -125,6 +169,10 @@ ThermalPressure WorkCoordinator::thermal_pressure() const noexcept {
 FramePressure WorkCoordinator::frame_pressure() const noexcept {
     return static_cast<FramePressure>(
         frame_pressure_.load(std::memory_order_acquire));
+}
+
+bool WorkCoordinator::frame_boost_active() const noexcept {
+    return frame_boost_frames_.load(std::memory_order_acquire) != 0U;
 }
 
 u32 WorkCoordinator::active_frame_jobs() const noexcept {

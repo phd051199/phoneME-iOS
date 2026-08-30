@@ -11,11 +11,68 @@
 
 namespace phoneme::vm {
 
+inline constexpr usize kJitRuntimeOperationCounterCount = 43U;
+
 enum class AllocationPayloadKind : u8 {
     object,
     array,
     clone,
     string_payload,
+    count,
+};
+
+enum class LockedHeapOperationKind : u8 {
+    allocation,
+    field,
+    array_element_read,
+    array_element_write,
+    array_element_snapshot,
+    array_element_checked,
+    array_metadata,
+    array_bulk,
+    class_name,
+    string,
+    reference,
+    garbage_collection,
+    count,
+};
+
+enum class LockedHeapCallerDomain : u8 {
+    java_util,
+    java_lang,
+    io,
+    lcdui,
+    graphics_3d,
+    media,
+    other_java,
+    unknown,
+    count,
+};
+
+enum class LockedHeapIoOwnerKind : u8 {
+    byte_array_input,
+    byte_array_output,
+    data_input,
+    data_output,
+    input_stream_reader,
+    output_stream_writer,
+    buffered_reader,
+    buffered_output,
+    reader,
+    writer,
+    other,
+    count,
+};
+
+enum class LockedHeapGraphics3dOwnerKind : u8 {
+    m3g_geometry,
+    m3g_graphics,
+    m3g_other,
+    micro3d_math,
+    micro3d_graphics,
+    micro3d_resource,
+    micro3d_state,
+    micro3d_other,
     count,
 };
 
@@ -25,10 +82,44 @@ struct PerformanceCounterSnapshot final {
     u64 method_invocations {0};
     u64 native_invocations {0};
     u64 maximum_java_call_depth {0};
+    u64 invocation_argument_overflows {0};
+    u64 maximum_invocation_argument_values {0};
+    u64 oversized_execution_frames {0};
+    u64 local_slot_storage_fallbacks {0};
+    u64 operand_slot_storage_fallbacks {0};
+    u64 maximum_frame_local_slots {0};
+    u64 maximum_frame_operand_slots {0};
+    u64 execution_frame_stack_growths {0};
+    u64 maximum_execution_frame_stack_capacity {0};
+    u64 execution_frame_stack_pool_misses {0};
+    u64 execution_root_publications {0};
+    u64 execution_root_copy_publications {0};
+    u64 execution_root_exchange_publications {0};
+    u64 execution_roots_published {0};
+    u64 maximum_execution_roots_per_publication {0};
+    u64 verified_root_map_hits {0};
+    u64 verified_root_map_partial_hits {0};
+    u64 verified_root_map_fallbacks {0};
+    u64 verified_root_slots_visited {0};
+    u64 verified_root_slots_avoided {0};
+    u64 fallback_root_slots_scanned {0};
     u64 exception_dispatches {0};
     u64 class_initializations {0};
     u64 instruction_budget_exits {0};
     u64 scheduler_quanta {0};
+    std::array<u64, kJitRuntimeOperationCounterCount>
+        jit_runtime_operation_calls {};
+    std::array<u64, kJitRuntimeOperationCounterCount>
+        jit_runtime_safepoint_calls {};
+    u64 jit_call_operand_decodes {0};
+    u64 jit_call_operand_overflows {0};
+    u64 maximum_jit_call_operand_values {0};
+    u64 jit_root_stages {0};
+    u64 jit_root_stage_commits {0};
+    u64 jit_staged_root_materializations {0};
+    u64 jit_staged_roots_materialized {0};
+    u64 jit_staged_reference_slots_deferred {0};
+    u64 jit_staged_reference_slots_scanned {0};
 
     u64 class_cache_hits {0};
     u64 class_cache_misses {0};
@@ -64,7 +155,21 @@ struct PerformanceCounterSnapshot final {
         allocated_bytes_by_kind {};
     u64 failed_allocations {0};
     u64 public_locked_heap_operations {0};
+    std::array<u64, static_cast<usize>(LockedHeapOperationKind::count)>
+        locked_heap_operations_by_kind {};
+    std::array<u64, static_cast<usize>(LockedHeapCallerDomain::count)>
+        locked_heap_operations_by_domain {};
+    std::array<u64,
+               static_cast<usize>(LockedHeapCallerDomain::count) *
+                   static_cast<usize>(LockedHeapOperationKind::count)>
+        locked_heap_operations_by_domain_and_kind {};
+    std::array<u64, static_cast<usize>(LockedHeapIoOwnerKind::count)>
+        locked_heap_io_operations_by_owner {};
+    std::array<u64, static_cast<usize>(LockedHeapGraphics3dOwnerKind::count)>
+        locked_heap_graphics_3d_operations_by_owner {};
     u64 vm_fast_heap_operations {0};
+    u64 vm_slot_cache_hits {0};
+    u64 vm_slot_cache_misses {0};
     u64 gc_count {0};
     u64 gc_total_nanoseconds {0};
     u64 gc_max_pause_nanoseconds {0};
@@ -114,10 +219,35 @@ public:
     static void record_method_invocation() noexcept;
     static void record_native_invocation() noexcept;
     static void observe_java_call_depth(usize depth) noexcept;
+    static void observe_invocation_arguments(usize values,
+                                             bool overflow) noexcept;
+    static void observe_execution_frame_slots(usize locals,
+                                              usize operands,
+                                              bool local_fallback,
+                                              bool operand_fallback) noexcept;
+    static void observe_execution_frame_stack(usize capacity,
+                                              bool grew) noexcept;
+    static void record_execution_frame_stack_pool_miss() noexcept;
+    static void observe_execution_root_publication(usize roots,
+                                                   bool exchanged = false) noexcept;
+    static void record_verified_root_scan(bool full_hit,
+                                          bool partial_hit,
+                                          usize verified_slots_visited,
+                                          usize verified_slots_avoided,
+                                          usize fallback_slots_scanned) noexcept;
     static void record_exception_dispatch() noexcept;
     static void record_class_initialization() noexcept;
     static void record_instruction_budget_exit() noexcept;
     static void record_scheduler_quantum() noexcept;
+    static void record_jit_runtime_operation(u32 operation,
+                                             bool safepoint) noexcept;
+    static void observe_jit_call_operands(usize values,
+                                          bool overflow) noexcept;
+    static void record_jit_root_stage() noexcept;
+    static void record_jit_root_stage_commit() noexcept;
+    static void observe_jit_staged_root_materialization(usize roots) noexcept;
+    static void observe_jit_staged_reference_slots(usize slots,
+                                                   bool scanned) noexcept;
 
     static void record_class_cache(bool hit) noexcept;
     static void record_method_resolution(bool hit, bool declared) noexcept;
@@ -138,8 +268,9 @@ public:
 
     static void record_allocation(AllocationPayloadKind kind, usize bytes) noexcept;
     static void record_failed_allocation() noexcept;
-    static void record_locked_heap_operation() noexcept;
+    static void record_locked_heap_operation(LockedHeapOperationKind kind) noexcept;
     static void record_vm_fast_heap_operation() noexcept;
+    static void record_vm_slot_cache(bool hit) noexcept;
     static void record_gc(u64 pause_nanoseconds,
                           usize roots_scanned,
                           usize objects_scanned,
@@ -175,10 +306,26 @@ public:
     static constexpr void record_method_invocation() noexcept {}
     static constexpr void record_native_invocation() noexcept {}
     static constexpr void observe_java_call_depth(usize) noexcept {}
+    static constexpr void observe_invocation_arguments(usize, bool) noexcept {}
+    static constexpr void observe_execution_frame_slots(
+        usize, usize, bool, bool) noexcept {}
+    static constexpr void observe_execution_frame_stack(usize, bool) noexcept {}
+    static constexpr void record_execution_frame_stack_pool_miss() noexcept {}
+    static constexpr void observe_execution_root_publication(
+        usize, bool = false) noexcept {}
+    static constexpr void record_verified_root_scan(
+        bool, bool, usize, usize, usize) noexcept {}
     static constexpr void record_exception_dispatch() noexcept {}
     static constexpr void record_class_initialization() noexcept {}
     static constexpr void record_instruction_budget_exit() noexcept {}
     static constexpr void record_scheduler_quantum() noexcept {}
+    static constexpr void record_jit_runtime_operation(u32, bool) noexcept {}
+    static constexpr void observe_jit_call_operands(usize, bool) noexcept {}
+    static constexpr void record_jit_root_stage() noexcept {}
+    static constexpr void record_jit_root_stage_commit() noexcept {}
+    static constexpr void observe_jit_staged_root_materialization(usize) noexcept {}
+    static constexpr void observe_jit_staged_reference_slots(
+        usize, bool) noexcept {}
 
     static constexpr void record_class_cache(bool) noexcept {}
     static constexpr void record_method_resolution(bool, bool) noexcept {}
@@ -197,8 +344,10 @@ public:
 
     static constexpr void record_allocation(AllocationPayloadKind, usize) noexcept {}
     static constexpr void record_failed_allocation() noexcept {}
-    static constexpr void record_locked_heap_operation() noexcept {}
+    static constexpr void record_locked_heap_operation(
+        LockedHeapOperationKind) noexcept {}
     static constexpr void record_vm_fast_heap_operation() noexcept {}
+    static constexpr void record_vm_slot_cache(bool) noexcept {}
     static constexpr void record_gc(u64, usize, usize, usize, usize) noexcept {}
 
     static constexpr void record_scheduler_state_transition() noexcept {}
