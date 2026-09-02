@@ -18,10 +18,14 @@
 namespace phoneme::vm {
 
 class Machine;
+class InvocationArguments;
 
 using NativeMethod = std::function<Result<std::optional<Value>>(
     Machine& machine,
     std::span<const Value> arguments)>;
+using CompactNativeMethod = std::function<Result<std::optional<Value>>(
+    Machine& machine,
+    const InvocationArguments& arguments)>;
 
 enum class NativeJitPolicy : u8 {
     conservative,
@@ -62,7 +66,8 @@ public:
         std::string name,
         std::string descriptor,
         NativeMethod implementation,
-        NativeJitPolicy jit_policy = NativeJitPolicy::conservative);
+        NativeJitPolicy jit_policy = NativeJitPolicy::conservative,
+        CompactNativeMethod compact_implementation = {});
     [[nodiscard]] Status register_alias(std::string_view source_owner,
                                         std::string_view source_name,
                                         std::string_view source_descriptor,
@@ -81,6 +86,12 @@ public:
                                 std::string_view descriptor) const noexcept;
     [[nodiscard]] NativeJitPolicy jit_policy(
         NativeMethodId method_id) const noexcept;
+    [[nodiscard]] bool has_compact_implementation(
+        NativeMethodId method_id) const noexcept;
+    [[nodiscard]] Result<std::optional<Value>> invoke_compact(
+        Machine& machine,
+        NativeMethodId method_id,
+        const InvocationArguments& arguments) const;
     [[nodiscard]] Result<std::optional<Value>> invoke(
         Machine& machine,
         NativeMethodId method_id,
@@ -118,6 +129,7 @@ private:
     struct Entry final {
         NativeMethodSignature signature;
         NativeMethod implementation;
+        CompactNativeMethod compact_implementation;
         NativeJitPolicy jit_policy {NativeJitPolicy::conservative};
         std::atomic<std::size_t> invocation_count {0};
     };

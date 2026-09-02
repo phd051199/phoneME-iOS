@@ -17,6 +17,8 @@
 
 namespace phoneme::vm {
 
+class JavaFiber;
+
 enum class JavaThreadState : u8 {
     new_thread,
     runnable,
@@ -90,12 +92,14 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable condition_;
     JavaWorkerThread worker_;
+    std::unique_ptr<JavaFiber> fiber_;
     JavaThreadState state_ {JavaThreadState::new_thread};
     i32 priority_ {5};
     bool interrupted_ {false};
     bool started_ {false};
     bool stop_requested_ {false};
     bool native_task_ {false};
+    bool fiber_backed_ {false};
     std::optional<ObjectRef> uncaught_throwable_;
     std::optional<Error> native_failure_;
 };

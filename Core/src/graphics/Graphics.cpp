@@ -306,6 +306,11 @@ template <ImageAlphaKind AlphaKind>
                               clip_top, clip_bottom);
     if (!range.has_value()) return {};
 
+    bool wrote_pixel = false;
+    i64 dirty_left = std::numeric_limits<i64>::max();
+    i64 dirty_top = std::numeric_limits<i64>::max();
+    i64 dirty_right = std::numeric_limits<i64>::min();
+    i64 dirty_bottom = std::numeric_limits<i64>::min();
     for (u64 sample = range->first; sample <= range->second; ++sample) {
         const u64 minor = rounded_minor(sample, minor_delta, major_delta);
         const i64 current_x = x_major
@@ -318,14 +323,26 @@ template <ImageAlphaKind AlphaKind>
             current_y >= clip_top && current_y <= clip_bottom &&
             (context.stroke_style == stroke_solid ||
              (sample & 1U) == 0U)) {
-            auto stored = target.set_pixel(
+            auto stored = target.set_pixel_untracked(
                 static_cast<i32>(current_x),
                 static_cast<i32>(current_y),
                 context.color,
                 true);
             if (!stored) return stored;
+            wrote_pixel = true;
+            dirty_left = std::min(dirty_left, current_x);
+            dirty_top = std::min(dirty_top, current_y);
+            dirty_right = std::max(dirty_right, current_x);
+            dirty_bottom = std::max(dirty_bottom, current_y);
         }
         if (sample == range->second) break;
+    }
+    if (wrote_pixel) {
+        target.mark_dirty_region(
+            static_cast<i32>(dirty_left),
+            static_cast<i32>(dirty_top),
+            static_cast<i32>(dirty_right - dirty_left + 1),
+            static_cast<i32>(dirty_bottom - dirty_top + 1));
     }
     return {};
 }
@@ -826,6 +843,7 @@ Status draw_round_rect(Image& target,
         Rect {.x = absolute_x, .y = absolute_y,
               .width = width, .height = height},
         context.clip);
+    bool wrote_pixel = false;
     for (i32 destination_y = visible.y;
          destination_y < visible.y + visible.height;
          ++destination_y) {
@@ -850,12 +868,19 @@ Status draw_round_rect(Image& target,
                                      std::max(0, radius_y - 1));
                 if (inner) continue;
             }
-            auto stored = target.set_pixel(destination_x,
-                                           destination_y,
-                                           context.color,
-                                           true);
+            auto stored = target.set_pixel_untracked(destination_x,
+                                                     destination_y,
+                                                     context.color,
+                                                     true);
             if (!stored) return stored;
+            wrote_pixel = true;
         }
+    }
+    if (wrote_pixel) {
+        target.mark_dirty_region(visible.x,
+                                 visible.y,
+                                 visible.width,
+                                 visible.height);
     }
     return {};
 }
@@ -990,6 +1015,7 @@ Status fill_triangle(Image& target,
         visible_top > visible_bottom) {
         return {};
     }
+    bool wrote_pixel = false;
     for (i64 y_cursor = visible_top;
          y_cursor <= visible_bottom;
          ++y_cursor) {
@@ -1011,12 +1037,20 @@ Status fill_triangle(Image& target,
             const bool inside_third = third > 0.0L ||
                 (third == 0.0L && third_top_left);
             if (!inside_first || !inside_second || !inside_third) continue;
-            auto stored = target.set_pixel(x_value,
-                                           y_value,
-                                           context.color,
-                                           true);
+            auto stored = target.set_pixel_untracked(x_value,
+                                                     y_value,
+                                                     context.color,
+                                                     true);
             if (!stored) return stored;
+            wrote_pixel = true;
         }
+    }
+    if (wrote_pixel) {
+        target.mark_dirty_region(
+            static_cast<i32>(visible_left),
+            static_cast<i32>(visible_top),
+            static_cast<i32>(visible_right - visible_left + 1),
+            static_cast<i32>(visible_bottom - visible_top + 1));
     }
     return {};
 }

@@ -105,8 +105,19 @@ public:
                                    i32 y,
                                    Pixel pixel,
                                    bool blend);
+    // Internal rasterizers that already batch dirty tracking can bypass the
+    // per-pixel dirty-island merge and publish one aggregate region afterward.
+    [[nodiscard]] Status set_pixel_untracked(i32 x,
+                                             i32 y,
+                                             Pixel pixel,
+                                             bool blend);
 
 private:
+    [[nodiscard]] Status store_pixel(i32 x,
+                                     i32 y,
+                                     Pixel pixel,
+                                     bool blend,
+                                     bool track_dirty);
     Image(i32 width,
           i32 height,
           bool mutable_image,

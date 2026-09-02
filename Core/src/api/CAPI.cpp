@@ -219,6 +219,19 @@ void phoneme_destroy(PhoneMERuntimeRef runtime) {
     delete cast_runtime(runtime);
 }
 
+void phoneme_set_host_wake_callback(PhoneMERuntimeRef runtime,
+                                    PhoneMEHostWakeCallback callback,
+                                    void* context) {
+    Runtime* instance = cast_runtime(runtime);
+    if (instance == nullptr) return;
+    if (callback == nullptr) {
+        instance->configure_host_wake({});
+        return;
+    }
+    instance->configure_host_wake(
+        [callback, context] { callback(context); });
+}
+
 int32_t phoneme_configure(PhoneMERuntimeRef runtime,
                           const char* runtime_home,
                           const char* classes_zip) {

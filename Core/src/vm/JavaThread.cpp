@@ -1,4 +1,5 @@
 #include "phoneme/vm/JavaThread.hpp"
+#include "phoneme/vm/JavaFiber.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -6,6 +7,11 @@
 #include <memory>
 #include <new>
 #include <system_error>
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#include <pthread/qos.h>
+#endif
 
 namespace phoneme::vm {
 
@@ -56,11 +62,32 @@ Status JavaWorkerThread::start(
                     "pthread_attr_init failed: " +
                         std::string(std::strerror(status)));
     }
-    constexpr usize kJavaWorkerStackBytes = 8U * 1024U * 1024U;
+    // Java frames live in Machine/ExecutionContext rather than recursively on
+    // the pthread C stack. 8 MiB per guest Thread was therefore mostly dead
+    // address-space/stack commitment and made thread-heavy MIDlets needlessly
+    // expensive on iOS. Keep a generous native stack for JNI/HLE recursion
+    // while staying much closer to a mobile JVM worker footprint.
+    constexpr usize kJavaWorkerStackBytes = 2U * 1024U * 1024U;
     status = pthread_attr_setstacksize(
         &attributes,
         std::max<usize>(kJavaWorkerStackBytes,
                         static_cast<usize>(PTHREAD_STACK_MIN)));
+#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+    if (status == 0) {
+        // Do not inherit a user-interactive/user-initiated QoS from the launch
+        // path, but also do not demote the foreground game to Utility. Utility
+        // is aggressively deprioritized under load/thermal pressure and makes
+        // the serialized VM execution gate visible as input/render latency.
+        // QOS_CLASS_DEFAULT lets iOS choose P/E cores while frame pacing and
+        // cooperative backoff control package power explicitly.
+        const int qos_status = pthread_attr_set_qos_class_np(
+            &attributes, QOS_CLASS_DEFAULT, 0);
+        // QoS is a thermal hint, not a correctness requirement. Older runtimes
+        // may reject the non-portable attribute, in which case keep creating
+        // the worker with the normal scheduler defaults.
+        (void)qos_status;
+    }
+#endif
     if (status == 0) {
         status = pthread_create(
             &thread_, &attributes, &JavaWorkerThread::thread_entry,

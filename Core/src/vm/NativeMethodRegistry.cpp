@@ -168,7 +168,8 @@ Status NativeMethodRegistry::register_method(
     std::string name,
     std::string descriptor,
     NativeMethod implementation,
-    NativeJitPolicy jit_policy) {
+    NativeJitPolicy jit_policy,
+    CompactNativeMethod compact_implementation) {
     if (owner.empty() || name.empty() || descriptor.empty() || !implementation) {
         return fail(ErrorCode::invalid_argument,
                     "native method registration is incomplete");
@@ -200,6 +201,7 @@ Status NativeMethodRegistry::register_method(
         .descriptor = std::move(descriptor),
     };
     entry->implementation = std::move(implementation);
+    entry->compact_implementation = std::move(compact_implementation);
     entry->jit_policy = jit_policy;
     Entry* stable_entry = entry.get();
     entries_.push_back(std::move(entry));
@@ -268,6 +270,8 @@ Status NativeMethodRegistry::register_alias(
         .descriptor = std::move(target_descriptor),
     };
     entry->implementation = entries_[source_index]->implementation;
+    entry->compact_implementation =
+        entries_[source_index]->compact_implementation;
     entry->jit_policy = entries_[source_index]->jit_policy;
     Entry* stable_entry = entry.get();
     entries_.push_back(std::move(entry));
@@ -329,6 +333,50 @@ NativeJitPolicy NativeMethodRegistry::jit_policy(
         return NativeJitPolicy::conservative;
     }
     return (*table)[index]->jit_policy;
+}
+
+bool NativeMethodRegistry::has_compact_implementation(
+    NativeMethodId method_id) const noexcept {
+    if (!method_id.valid()) return false;
+    const DispatchTable* table = dispatch_table_.load(std::memory_order_acquire);
+    if (table == nullptr) return false;
+    const usize index = static_cast<usize>(method_id.value - 1U);
+    return index < table->size() && (*table)[index] != nullptr &&
+           (*table)[index]->signature.id == method_id &&
+           static_cast<bool>((*table)[index]->compact_implementation);
+}
+
+Result<std::optional<Value>> NativeMethodRegistry::invoke_compact(
+    Machine& machine,
+    NativeMethodId method_id,
+    const InvocationArguments& arguments) const {
+    if (!method_id.valid()) {
+        return fail(ErrorCode::unsupported_feature,
+                    "native method is not ported");
+    }
+    const DispatchTable* table = dispatch_table_.load(std::memory_order_acquire);
+    const usize index = static_cast<usize>(method_id.value - 1U);
+    if (table == nullptr || index >= table->size() ||
+        (*table)[index] == nullptr ||
+        (*table)[index]->signature.id != method_id ||
+        !(*table)[index]->compact_implementation) {
+        return fail(ErrorCode::unsupported_feature,
+                    "native method has no compact implementation");
+    }
+    const std::shared_ptr<Entry>& entry = (*table)[index];
+    entry->invocation_count.fetch_add(1U, std::memory_order_relaxed);
+    PerformanceCounters::record_native_invocation();
+    auto result = entry->compact_implementation(machine, arguments);
+    if (!result) {
+        Error error = result.error();
+        if (error.java_exception_class.empty()) {
+            error.message = entry->signature.owner + "." +
+                            entry->signature.name + entry->signature.descriptor +
+                            ": " + error.message;
+        }
+        return std::unexpected(std::move(error));
+    }
+    return result;
 }
 
 Result<std::optional<Value>> NativeMethodRegistry::invoke(

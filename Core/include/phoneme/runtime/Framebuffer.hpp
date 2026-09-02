@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -91,6 +92,8 @@ public:
     };
 
     [[nodiscard]] Status resize(Dimensions dimensions);
+    using ChangeSink = std::function<void()>;
+    void configure_change_sink(ChangeSink sink);
     [[nodiscard]] Status replace(Dimensions dimensions,
                                  std::span<const u8> pixels,
                                  FramePixelFormat format = FramePixelFormat::rgba8);
@@ -121,12 +124,15 @@ public:
     void clear() noexcept;
 
 private:
+    void notify_changed() noexcept;
+
     mutable std::mutex mutex_;
     Dimensions dimensions_;
     u64 generation_ {0};
     std::vector<u8> rgba_;
     FramePixelFormat pixel_format_ {FramePixelFormat::rgba8};
     std::vector<FrameDamageRegion> damage_regions_;
+    ChangeSink change_sink_;
 };
 
 } // namespace phoneme::runtime

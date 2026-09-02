@@ -1,11 +1,14 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 #include <vector>
 
 #include "phoneme/vm/Value.hpp"
@@ -45,7 +48,10 @@ enum class HeapArrayKind : u8 {
 struct HeapArrayInfo final {
     HeapArrayKind kind {HeapArrayKind::integer};
     usize length {0};
-    std::string reference_component;
+    // Borrowed from the Heap's interned array descriptor and therefore stable
+    // for the Heap lifetime. Reference-array checks no longer allocate a
+    // component std::string for every aaload/aastore/native query.
+    std::string_view reference_component;
 };
 
 struct HeapArrayElementSnapshot final {
@@ -285,6 +291,14 @@ private:
     [[nodiscard]] Result<i32> vm_string_index_of(ObjectRef reference,
                                                  u16 character,
                                                  usize start = 0U) const;
+    [[nodiscard]] Result<bool> vm_string_starts_with(
+        ObjectRef reference,
+        ObjectRef prefix,
+        usize offset = 0U) const;
+    [[nodiscard]] Result<std::u16string> vm_string_slice(
+        ObjectRef reference,
+        usize begin,
+        usize end) const;
     [[nodiscard]] Result<bool> vm_string_equals(ObjectRef left,
                                                 ObjectRef right) const;
     [[nodiscard]] bool vm_automatic_collection_due() const noexcept;
@@ -337,7 +351,11 @@ private:
                   "array payload must not grow the heap object header");
 
     struct Object final {
-        std::string class_name;
+        // Class descriptors are immutable VM metadata. Storing a full
+        // std::string in every Java object caused an independent host heap
+        // allocation for most real class names. Keep one interned copy per
+        // Heap and let objects retain only a cheap view into that stable copy.
+        std::string_view class_name;
         // Object fields use one compact word vector. The first N words are
         // the raw 64-bit payloads; trailing words pack ValueKind at 3 bits per
         // field. N is recovered from the total word count, so no per-object
@@ -404,6 +422,8 @@ private:
     [[nodiscard]] Result<usize> resolve_slot_unlocked(ObjectRef reference) const;
     [[nodiscard]] Result<usize> resolve_slot_vm_fast(ObjectRef reference) const;
     void invalidate_vm_slot_cache_unlocked() const noexcept;
+    [[nodiscard]] std::string_view intern_class_name(
+        std::string_view class_name);
     [[nodiscard]] Result<bool> try_copy_primitive_array_range_unlocked(
         ObjectRef source,
         usize source_index,
@@ -426,6 +446,15 @@ private:
 
     HeapLimits limits_ {};
     mutable std::mutex mutex_;
+    // Class names live for the Heap lifetime, including across clear(). This
+    // keeps every Object::class_name view and the lock-free direct-mapped
+    // allocation cache valid without generation bookkeeping.
+    mutable std::mutex class_names_mutex_;
+    std::unordered_set<std::string> class_names_;
+    static constexpr usize kClassNameCacheSize = 64U;
+    static_assert((kClassNameCacheSize & (kClassNameCacheSize - 1U)) == 0U);
+    std::array<std::atomic<const std::string*>, kClassNameCacheSize>
+        class_name_cache_ {};
     std::vector<Slot> slots_;
     std::vector<usize> free_slots_;
     struct VmSlotCacheEntry final {

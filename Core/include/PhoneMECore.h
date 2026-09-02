@@ -10,7 +10,7 @@ extern "C" {
 typedef void* PhoneMERuntimeRef;
 
 #define PHONEME_C_API_VERSION_MAJOR 1u
-#define PHONEME_C_API_VERSION_MINOR 2u
+#define PHONEME_C_API_VERSION_MINOR 3u
 #define PHONEME_C_API_VERSION_PATCH 0u
 #define PHONEME_C_API_VERSION \
     ((PHONEME_C_API_VERSION_MAJOR << 16u) | \
@@ -186,6 +186,12 @@ typedef PhoneMEPermissionResponse (*PhoneMEPermissionPromptCallback)(
     void* context,
     const PhoneMEPermissionRequest* request);
 
+/* Invoked asynchronously when Core has host-visible work (new framebuffer,
+ * pending Canvas repaint or LCDUI event). The callback may run on any VM
+ * worker thread and must only wake/schedule the host UI loop; do not re-enter
+ * the same runtime from this callback. Passing NULL clears the callback. */
+typedef void (*PhoneMEHostWakeCallback)(void* context);
+
 PhoneMERuntimeRef phoneme_create(void);
 void phoneme_destroy(PhoneMERuntimeRef runtime);
 /* optional_class_archive may be NULL. The standalone Core provides its
@@ -193,6 +199,9 @@ void phoneme_destroy(PhoneMERuntimeRef runtime);
 int32_t phoneme_configure(PhoneMERuntimeRef runtime,
                           const char* runtime_home,
                           const char* optional_class_archive);
+void phoneme_set_host_wake_callback(PhoneMERuntimeRef runtime,
+                                    PhoneMEHostWakeCallback callback,
+                                    void* context);
 int32_t phoneme_configure_keymap(PhoneMERuntimeRef runtime,
                                  int32_t up,
                                  int32_t down,

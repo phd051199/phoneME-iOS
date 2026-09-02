@@ -224,13 +224,17 @@ final class EmbeddedPhoneMEEngine: NSObject {
             let idleCanvasCallbacks: UInt64
             let idleNativeCallbacks: UInt64
             let framesProduced: UInt64
+            let targetFramesPerSecond: UInt64
         }
 
         var visibleScreen: VisibleScreen?
         var didReportRuntimeExit = false
 
-        let frameIntervalNanoseconds: UInt64
-        let idleNativePollIntervalNanoseconds: UInt64 = 100_000_000
+        private var frameIntervalNanoseconds: UInt64
+        // Core now pushes a host-wake edge for repaint/frame/LCDUI changes.
+        // Keep only a slow watchdog timer for missed/third-party edges instead
+        // of waking 10-30 times/sec while a game screen is static.
+        let idleNativePollIntervalNanoseconds: UInt64 = 500_000_000
         let idleCanvasPollIntervalNanoseconds: UInt64
         let idleNativePollThreshold: Int
         let idleCanvasPollThreshold: Int
@@ -240,9 +244,10 @@ final class EmbeddedPhoneMEEngine: NSObject {
         private var consecutiveIdleCanvasPolls = 0
         private var usesIdleNativeCadence = false
         private var usesIdleCanvasCadence = false
-        private let framesPerSecond: UInt64
-        private let wholeFrameIntervalNanoseconds: UInt64
-        private let frameIntervalRemainder: UInt64
+        private let configuredFramesPerSecond: UInt64
+        private var framesPerSecond: UInt64
+        private var wholeFrameIntervalNanoseconds: UInt64
+        private var frameIntervalRemainder: UInt64
         private var remainderAccumulator: UInt64 = 0
         private var nextActiveDeadlineNanoseconds: UInt64 = 0
         private var telemetryStartedNanoseconds: UInt64 = 0
@@ -252,24 +257,58 @@ final class EmbeddedPhoneMEEngine: NSObject {
         private var telemetryIdleNativeCallbacks: UInt64 = 0
         private var telemetryFramesProduced: UInt64 = 0
 
-        init(framesPerSecond: Int) {
+        init(
+            framesPerSecond: Int,
+            thermalPressure: PhoneMECAPI.ThermalPressure
+        ) {
             let normalizedFrameRate = GameProfile.resolvedFrameRate(
                 framesPerSecond
             )
-            self.framesPerSecond = UInt64(normalizedFrameRate)
-            wholeFrameIntervalNanoseconds = 1_000_000_000
-                / UInt64(normalizedFrameRate)
-            frameIntervalRemainder = 1_000_000_000
-                % UInt64(normalizedFrameRate)
-            frameIntervalNanoseconds = (
-                1_000_000_000 + UInt64(normalizedFrameRate / 2)
-            ) / UInt64(normalizedFrameRate)
-            idleCanvasPollIntervalNanoseconds = max(
-                frameIntervalNanoseconds * 2,
-                50_000_000
+            configuredFramesPerSecond = UInt64(normalizedFrameRate)
+            let effectiveFrameRate = Self.effectiveFramesPerSecond(
+                configured: configuredFramesPerSecond,
+                thermalPressure: thermalPressure
             )
-            idleNativePollThreshold = max(normalizedFrameRate / 2, 1)
-            idleCanvasPollThreshold = max(normalizedFrameRate, 1)
+            self.framesPerSecond = effectiveFrameRate
+            wholeFrameIntervalNanoseconds = 1_000_000_000
+                / effectiveFrameRate
+            frameIntervalRemainder = 1_000_000_000
+                % effectiveFrameRate
+            frameIntervalNanoseconds = (
+                1_000_000_000 + effectiveFrameRate / 2
+            ) / effectiveFrameRate
+            idleCanvasPollIntervalNanoseconds = max(
+                frameIntervalNanoseconds * 4,
+                500_000_000
+            )
+            idleNativePollThreshold = 3
+            idleCanvasPollThreshold = max(normalizedFrameRate / 8, 3)
+        }
+
+        func updateThermalPressure(
+            _ thermalPressure: PhoneMECAPI.ThermalPressure
+        ) {
+            cadenceLock.lock()
+            let nextFrameRate = Self.effectiveFramesPerSecond(
+                configured: configuredFramesPerSecond,
+                thermalPressure: thermalPressure
+            )
+            guard nextFrameRate != framesPerSecond else {
+                cadenceLock.unlock()
+                return
+            }
+            framesPerSecond = nextFrameRate
+            wholeFrameIntervalNanoseconds = 1_000_000_000 / nextFrameRate
+            frameIntervalRemainder = 1_000_000_000 % nextFrameRate
+            frameIntervalNanoseconds = (
+                1_000_000_000 + nextFrameRate / 2
+            ) / nextFrameRate
+            // Restart from wall time rather than carrying a 60 FPS remainder
+            // into a 30/20 FPS cadence (or vice versa). This prevents a short
+            // catch-up burst exactly when iOS has asked us to reduce heat.
+            nextActiveDeadlineNanoseconds = 0
+            remainderAccumulator = 0
+            cadenceLock.unlock()
         }
 
         var pollLeewayNanoseconds: UInt64 {
@@ -344,7 +383,8 @@ final class EmbeddedPhoneMEEngine: NSObject {
                 activeCallbacks: telemetryActiveCallbacks,
                 idleCanvasCallbacks: telemetryIdleCanvasCallbacks,
                 idleNativeCallbacks: telemetryIdleNativeCallbacks,
-                framesProduced: telemetryFramesProduced
+                framesProduced: telemetryFramesProduced,
+                targetFramesPerSecond: framesPerSecond
             )
             telemetryStartedNanoseconds = nowNanoseconds
             telemetryCallbacks = 0
@@ -409,6 +449,20 @@ final class EmbeddedPhoneMEEngine: NSObject {
             if remainderAccumulator >= framesPerSecond {
                 nextActiveDeadlineNanoseconds += 1
                 remainderAccumulator -= framesPerSecond
+            }
+        }
+
+        private static func effectiveFramesPerSecond(
+            configured: UInt64,
+            thermalPressure: PhoneMECAPI.ThermalPressure
+        ) -> UInt64 {
+            switch thermalPressure {
+            case .critical:
+                return min(configured, 20)
+            case .serious:
+                return min(configured, 30)
+            case .fair, .nominal:
+                return configured
             }
         }
     }
@@ -485,7 +539,11 @@ final class EmbeddedPhoneMEEngine: NSObject {
 
     private let runtimeQueue = DispatchQueue(
         label: "com.phoneme.runtime.lifecycle",
-        qos: .userInitiated
+        // Guest lifecycle callbacks may become the MIDlet's long-running
+        // execution loop when a game does not spawn a separate Thread. Keep
+        // them off userInitiated/performance-core QoS; input and presentation
+        // have their own latency-sensitive queues.
+        qos: .utility
     )
     private let inputQueue = DispatchQueue(
         label: "com.phoneme.runtime.input",
@@ -545,8 +603,12 @@ final class EmbeddedPhoneMEEngine: NSObject {
     }
 
     private func applyCurrentThermalPressure() {
-        guard let api, let runtime else { return }
         let pressure = PhoneMECAPI.currentThermalPressure
+        activePollContextLock.lock()
+        let pollContext = activePollContext
+        activePollContextLock.unlock()
+        pollContext?.updateThermalPressure(pressure)
+        guard let api, let runtime else { return }
         runtimeQueue.async {
             _ = api.setThermalPressure(runtime, pressure: pressure)
         }
@@ -1868,16 +1930,14 @@ final class EmbeddedPhoneMEEngine: NSObject {
         activePollContextLock.unlock()
         guard let context else { return }
         context.noteHostActivity()
-        pollQueue.async { [weak self] in
-            guard let self, let pollTimer = self.pollTimer,
-                  !self.pollTimerIsSuspended else {
-                return
-            }
-            pollTimer.schedule(
-                deadline: .now(),
-                leeway: .milliseconds(1)
-            )
-        }
+        guard let pollTimer, !pollTimerIsSuspended else { return }
+        // DispatchSourceTimer is Sendable and may be rescheduled directly.
+        // Avoid a main -> pollQueue hop for every Core host-wake edge; the
+        // source's handler still executes on pollQueue when the deadline fires.
+        pollTimer.schedule(
+            deadline: .now(),
+            leeway: .milliseconds(1)
+        )
     }
 
     func sendKey(_ key: J2MEKey, pressed: Bool) {
@@ -2064,6 +2124,15 @@ final class EmbeddedPhoneMEEngine: NSObject {
         gameID: UUID? = nil,
         appID: Int32? = nil
     ) {
+        // Harrier/libGDX-style requestRendering path: Core wakes this host
+        // loop only when guest work can change what the user sees. The timer
+        // below remains a watchdog/pacing source, not the sole producer of
+        // presentation work.
+        api.configureHostWake(runtime) { [weak self] in
+            DispatchQueue.main.async { [weak self] in
+                self?.wakeCanvasPollingForHostActivity()
+            }
+        }
         if let pollTimer {
             if pollTimerIsSuspended {
                 pollTimer.resume()
@@ -2073,7 +2142,8 @@ final class EmbeddedPhoneMEEngine: NSObject {
         }
 
         let context = PollContext(
-            framesPerSecond: framePollingFramesPerSecond
+            framesPerSecond: framePollingFramesPerSecond,
+            thermalPressure: PhoneMECAPI.currentThermalPressure
         )
         activePollContextLock.lock()
         activePollContext = context
@@ -2099,8 +2169,9 @@ final class EmbeddedPhoneMEEngine: NSObject {
                 let wakeupsPerSecond = Double(pollMetrics.callbacks)
                     / max(pollMetrics.durationSeconds, 0.001)
                 NSLog(
-                    "[phoneME-thermal] thermal=%d polls_per_s=%.2f polls=%llu active=%llu idle_canvas=%llu idle_native=%llu frames=%llu uploads=%llu staged=%llu full=%llu regions=%llu uploaded_kb=%.1f acquire_ms=%.2f stage_ms=%.2f upload_ms=%.2f",
+                    "[phoneME-thermal] thermal=%d target_fps=%llu polls_per_s=%.2f polls=%llu active=%llu idle_canvas=%llu idle_native=%llu frames=%llu uploads=%llu staged=%llu full=%llu regions=%llu uploaded_kb=%.1f acquire_ms=%.2f stage_ms=%.2f upload_ms=%.2f",
                     PhoneMECAPI.currentThermalPressure.rawValue,
+                    pollMetrics.targetFramesPerSecond,
                     wakeupsPerSecond,
                     pollMetrics.callbacks,
                     pollMetrics.activeCallbacks,

@@ -29,9 +29,15 @@ REPO_ROOT = CORE_ROOT.parent
 DEFAULT_MANIFEST = SCRIPT_PATH.parent / "performance-benchmarks.json"
 
 
-def run(command: list[str], *, cwd: pathlib.Path, env: dict[str, str]) -> None:
+def run(
+    command: list[str],
+    *,
+    cwd: pathlib.Path,
+    env: dict[str, str],
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
     print("+", " ".join(command), flush=True)
-    subprocess.run(command, cwd=cwd, env=env, check=True)
+    return subprocess.run(command, cwd=cwd, env=env, check=check, text=True)
 
 
 def sha256(path: pathlib.Path) -> str:
@@ -121,6 +127,22 @@ def extract_report(report_md: pathlib.Path) -> dict[str, Any]:
             if isinstance(value, (int, float)):
                 metrics[key] = float(value)
         stderr_path = pathlib.Path(str((item.get("artifacts") or {}).get("stderr", "")))
+        # Older baselines may come from a test-jar-directory version that did
+        # not promote CPU/frame-timing fields into `observed`. The harness has
+        # always written those fields to runner-result.json, so read that raw
+        # sidecar as a backwards-compatible source for A/B metrics.
+        runner_result_path = stderr_path.parent / "runner-result.json"
+        if runner_result_path.is_file():
+            try:
+                runner_result = json.loads(
+                    runner_result_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                runner_result = {}
+            for key in RUNNER_METRICS:
+                value = runner_result.get(key)
+                if key not in metrics and isinstance(value, (int, float)):
+                    metrics[key] = float(value)
         perf = parse_perf_log(stderr_path)
         for key, value in perf.items():
             metrics[f"perf.{key}"] = value
@@ -247,11 +269,10 @@ def run_corpus(
     report: pathlib.Path,
     env: dict[str, str],
 ) -> None:
+    corpus_manifest = load_manifest(manifest)
     filters = [
-        "NinjaSchoolOffline_2.1.7_v1.jar",
-        "Army2_Offline_1.6.19.jar",
-        "Majesty_The_Northern_Expansion_vi_Full.jar",
-        "Zombie Infection VH By Sykeo99 J2ME loader Only 240x320.jar",
+        pathlib.Path(str(item["jar"])).name
+        for item in corpus_manifest["benchmarks"]
     ]
     command = [
         sys.executable,
@@ -278,7 +299,11 @@ def run_corpus(
     ]
     for value in filters:
         command.extend(["--filter", value])
-    run(command, cwd=tree, env=env)
+    # A single compatibility failure must not discard performance data from
+    # every other pinned game. test-jar-directory always writes its JSON/report
+    # before returning non-zero, so preserve that evidence and let the A/B
+    # report expose the failed item's status explicitly.
+    run(command, cwd=tree, env=env, check=False)
 
 
 def parse_args() -> argparse.Namespace:
@@ -303,12 +328,19 @@ def main() -> int:
     output_root.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()
+    release_flags = env.get("PHONEME_EXTRA_CXXFLAGS", "").strip()
+    release_flags = f"{release_flags} -O3 -DNDEBUG".strip()
     env.update(
         {
             "PHONEME_ENABLE_VM_PROFILING": "1",
             "PHONEME_ENABLE_DECODED_EXECUTION": "1",
             "PHONEME_DUMP_PERF": "1",
             "PHONEME_HARNESS_JIT": args.jit,
+            # Performance A/B must resemble the production Core build. The
+            # generic compatibility harness intentionally defaults to an
+            # unoptimized compile for diagnostics, which badly distorts CPU,
+            # frame-time and interpreter-vs-JIT comparisons.
+            "PHONEME_EXTRA_CXXFLAGS": release_flags,
         }
     )
 

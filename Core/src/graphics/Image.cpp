@@ -317,6 +317,21 @@ Status Image::set_pixel(i32 x,
                         i32 y,
                         Pixel pixel_value,
                         bool blend) {
+    return store_pixel(x, y, pixel_value, blend, true);
+}
+
+Status Image::set_pixel_untracked(i32 x,
+                                  i32 y,
+                                  Pixel pixel_value,
+                                  bool blend) {
+    return store_pixel(x, y, pixel_value, blend, false);
+}
+
+Status Image::store_pixel(i32 x,
+                          i32 y,
+                          Pixel pixel_value,
+                          bool blend,
+                          bool track_dirty) {
     if (!mutable_) {
         return fail(ErrorCode::invalid_state,
                     "cannot draw into an immutable image");
@@ -339,7 +354,9 @@ Status Image::set_pixel(i32 x,
     }
     if (composited != destination) {
         destination = composited;
-        mark_dirty_region(x, y, 1, 1);
+        if (track_dirty) {
+            mark_dirty_region(x, y, 1, 1);
+        }
     }
     return {};
 }

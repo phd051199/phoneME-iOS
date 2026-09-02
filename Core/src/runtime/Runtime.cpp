@@ -37,6 +37,7 @@ namespace phoneme::runtime {
 struct UiTranslationReplayState final {
     std::mutex mutex;
     ConcurrentQueue<UiEvent>* queue {nullptr};
+    std::function<void()> wake;
     bool active {true};
     u64 reset_epoch {0U};
     u64 commands_reset_generation {0U};
@@ -54,53 +55,59 @@ struct UiTranslationReplayState final {
     }
 
     void publish(UiEvent event, bool replay, u64 expected_epoch = 0U) {
-        std::scoped_lock lock(mutex);
-        if (!active || queue == nullptr) return;
-        if (replay) {
-            if (expected_epoch != reset_epoch) return;
-            if (const auto deleted = deleted_components.find(event.component_id);
-                deleted != deleted_components.end() &&
-                event.generation < deleted->second) {
-                return;
-            }
-            if (event.kind == 12) {
-                const auto exact = deleted_choices.find(
-                    choice_key(event.component_id, event.index));
-                const auto all = deleted_choices.find(
-                    choice_key(event.component_id, -1));
-                if ((exact != deleted_choices.end() &&
-                     event.generation < exact->second) ||
-                    (all != deleted_choices.end() &&
-                     event.generation < all->second)) {
+        std::function<void()> wake_sink;
+        {
+            std::scoped_lock lock(mutex);
+            if (!active || queue == nullptr) return;
+            if (replay) {
+                if (expected_epoch != reset_epoch) return;
+                if (const auto deleted = deleted_components.find(event.component_id);
+                    deleted != deleted_components.end() &&
+                    event.generation < deleted->second) {
                     return;
                 }
+                if (event.kind == 12) {
+                    const auto exact = deleted_choices.find(
+                        choice_key(event.component_id, event.index));
+                    const auto all = deleted_choices.find(
+                        choice_key(event.component_id, -1));
+                    if ((exact != deleted_choices.end() &&
+                         event.generation < exact->second) ||
+                        (all != deleted_choices.end() &&
+                         event.generation < all->second)) {
+                        return;
+                    }
+                }
+                if (event.kind == 15 &&
+                    event.generation < commands_reset_generation) {
+                    return;
+                }
+            } else {
+                if (event.kind == 1) {
+                    ++reset_epoch;
+                    deleted_components.clear();
+                    deleted_choices.clear();
+                } else if (event.kind == 6 || event.kind == 11) {
+                    deleted_components[event.component_id] = event.generation;
+                } else if (event.kind == 13) {
+                    deleted_choices[choice_key(event.component_id, event.index)] =
+                        event.generation;
+                } else if (event.kind == 14) {
+                    commands_reset_generation = std::max(
+                        commands_reset_generation, event.generation);
+                }
             }
-            if (event.kind == 15 &&
-                event.generation < commands_reset_generation) {
-                return;
-            }
-        } else {
-            if (event.kind == 1) {
-                ++reset_epoch;
-                deleted_components.clear();
-                deleted_choices.clear();
-            } else if (event.kind == 6 || event.kind == 11) {
-                deleted_components[event.component_id] = event.generation;
-            } else if (event.kind == 13) {
-                deleted_choices[choice_key(event.component_id, event.index)] =
-                    event.generation;
-            } else if (event.kind == 14) {
-                commands_reset_generation = std::max(
-                    commands_reset_generation, event.generation);
-            }
+            queue->push(std::move(event));
+            wake_sink = wake;
         }
-        queue->push(std::move(event));
+        if (wake_sink) wake_sink();
     }
 
     void deactivate() noexcept {
         std::scoped_lock lock(mutex);
         active = false;
         queue = nullptr;
+        wake = {};
         deleted_components.clear();
         deleted_choices.clear();
     }
@@ -149,6 +156,7 @@ public:
         AppHeapConfig heap_config,
         bool jit_enabled,
         Framebuffer& framebuffer,
+        std::function<void()> host_wake,
         std::shared_ptr<translation::TranslationService> translation_service);
     ~ApplicationVM();
 
@@ -941,6 +949,7 @@ ApplicationVM::ApplicationVM(
     AppHeapConfig heap_config,
     bool jit_enabled,
     Framebuffer& framebuffer,
+    std::function<void()> host_wake,
     std::shared_ptr<translation::TranslationService> translation_service)
     : machine(classes,
               vm::HeapLimits {.maximum_bytes = heap_config.maximum_bytes}),
@@ -952,6 +961,7 @@ ApplicationVM::ApplicationVM(
     machine.configure_jit(jit_enabled);
     machine.configure_translation_service(std::move(translation_service));
     CanvasRenderHooks hooks;
+    hooks.request_host_wake = std::move(host_wake);
     hooks.acquire_paint_graphics = [this, &framebuffer](
         vm::Machine& target_machine,
         vm::ObjectRef,
@@ -1024,11 +1034,29 @@ Runtime::Runtime()
       ui_queue_(1'024),
       ui_translation_replay_(std::make_shared<UiTranslationReplayState>()) {
     ui_translation_replay_->queue = &ui_queue_;
+    ui_translation_replay_->wake = [this] { signal_host_wake(); };
+    framebuffer_.configure_change_sink([this] { signal_host_wake(); });
 }
 
 Runtime::~Runtime() {
+    configure_host_wake({});
+    framebuffer_.configure_change_sink({});
     ui_translation_replay_->deactivate();
     stop();
+}
+
+void Runtime::configure_host_wake(HostWakeSink sink) {
+    std::scoped_lock lock(host_wake_mutex_);
+    host_wake_sink_ = std::move(sink);
+}
+
+void Runtime::signal_host_wake() noexcept {
+    HostWakeSink sink;
+    {
+        std::scoped_lock lock(host_wake_mutex_);
+        sink = host_wake_sink_;
+    }
+    if (sink) sink();
 }
 
 Status Runtime::configure(std::string runtime_home,
@@ -1660,6 +1688,7 @@ Status Runtime::start_midlet(SuiteId suite_id,
         heap_config,
         jit_enabled,
         framebuffer_,
+        [this] { signal_host_wake(); },
         std::move(translation_service));
     // Persist only stable hot method signatures per installed suite. Profile
     // I/O is opportunistic: a missing/unwritable profile must never prevent a
@@ -2082,6 +2111,7 @@ Status Runtime::start_midlet(SuiteId suite_id,
                           ? "MIDlet became observable while startApp continues on the lifecycle thread"
                           : "MIDlet constructor and startApp completed in the C++ VM")),
     });
+    signal_host_wake();
     if (suite.managed && !start_app_deferred) {
         auto verified_classes =
             application_vm->classes.verified_classes(suite.jar_path);
@@ -3414,6 +3444,7 @@ void Runtime::finalize_deferred_start(
             .generation = sequence_,
             .detail = "Deferred MIDlet startApp failed: " + diagnostic,
         });
+        signal_host_wake();
         return;
     }
 
@@ -3513,6 +3544,7 @@ void Runtime::finalize_deferred_start(
             ? "Deferred MIDlet startApp notified destruction"
             : "Deferred MIDlet startApp notified pause",
     });
+    signal_host_wake();
 }
 
 void Runtime::finalize_pending_destruction(
@@ -3584,6 +3616,7 @@ void Runtime::finalize_pending_destruction(
         .generation = sequence_,
         .detail = "MIDlet notified destruction",
     });
+    signal_host_wake();
 }
 
 void Runtime::mark_canvas_failure_unlocked(App& app, const Error& error) {
@@ -3614,6 +3647,7 @@ void Runtime::mark_canvas_failure_unlocked(App& app, const Error& error) {
         .generation = sequence_,
         .detail = "Canvas dispatcher failed: " + diagnostic,
     });
+    signal_host_wake();
 }
 
 void Runtime::push_ui_action(i32 kind,
@@ -3667,6 +3701,7 @@ void Runtime::push_ui_action(i32 kind,
             .text = std::move(text),
             .detail = handled.error().message,
         });
+        signal_host_wake();
         return;
     }
 
@@ -3679,6 +3714,7 @@ void Runtime::push_ui_action(i32 kind,
         .generation = ++sequence_,
         .text = std::move(text),
     });
+    signal_host_wake();
 }
 
 } // namespace phoneme::runtime

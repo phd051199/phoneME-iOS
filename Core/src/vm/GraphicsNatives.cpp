@@ -316,7 +316,8 @@ void add(NativeMethodRegistry& registry,
          std::string name,
          std::string descriptor,
          NativeMethod method,
-         NativeJitPolicy jit_policy = NativeJitPolicy::conservative) {
+         NativeJitPolicy jit_policy = NativeJitPolicy::conservative,
+         CompactNativeMethod compact_method = {}) {
     // MIDP Graphics operations are synchronous, in-memory drawing/state
     // updates. They never wait on external I/O, so compiled Java renderers can
     // invoke them exactly once without pre-deoptimizing back to the
@@ -329,7 +330,8 @@ void add(NativeMethodRegistry& registry,
                                                std::move(name),
                                                std::move(descriptor),
                                                std::move(method),
-                                               jit_policy);
+                                               jit_policy,
+                                               std::move(compact_method));
     if (!registered) {
         std::terminate();
     }
@@ -342,9 +344,10 @@ void add(NativeMethodRegistry& registry,
     return *payload;
 }
 
+template <typename Arguments>
 [[nodiscard]] Result<BoundGraphics> bound_graphics(
     Machine& machine,
-    std::span<const Value> arguments,
+    const Arguments& arguments,
     std::string_view operation,
     bool preserve_character_run = false) {
     auto graphics_object = receiver(arguments, operation);
@@ -1298,6 +1301,106 @@ void add(NativeMethodRegistry& registry,
         static_cast<u8>(rgb & 0xFFU));
 }
 
+template <typename Arguments>
+[[nodiscard]] Result<std::optional<Value>> draw_image_native(
+    Machine& machine,
+    const Arguments& arguments) {
+    auto bound = bound_graphics(machine, arguments, "Graphics.drawImage");
+    auto source_reference = reference_argument(
+        arguments, 1U, "Graphics.drawImage");
+    auto x = int_argument(arguments, 2U, "Graphics.drawImage");
+    auto y = int_argument(arguments, 3U, "Graphics.drawImage");
+    auto anchor = int_argument(arguments, 4U, "Graphics.drawImage");
+    if (!bound) return std::unexpected(bound.error());
+    if (!source_reference) return std::unexpected(source_reference.error());
+    if (!x) return std::unexpected(x.error());
+    if (!y) return std::unexpected(y.error());
+    if (!anchor) return std::unexpected(anchor.error());
+    auto source = image_payload(machine, *source_reference);
+    if (!source) return std::unexpected(source.error());
+    machine.intercept_image_draw(ImageDrawEvent {
+        .kind = ImageDrawKind::image,
+        .graphics_id = bound->graphics_id,
+        .target_image_id = bound->context->target_key,
+        .source_image_id = source_reference->bits,
+        .source_width = (*source)->width(),
+        .source_height = (*source)->height(),
+        .transform = static_cast<i32>(graphics::Transform::none),
+        .destination_x = *x,
+        .destination_y = *y,
+        .anchor = *anchor,
+        .translate_x = bound->context->translate_x,
+        .translate_y = bound->context->translate_y,
+        .clip_x = bound->context->clip.x,
+        .clip_y = bound->context->clip.y,
+        .clip_width = bound->context->clip.width,
+        .clip_height = bound->context->clip.height,
+        .display_target = bound->context->display_target,
+    });
+    return status_result(graphics::draw_image(
+        *bound->target, *bound->context, **source, *x, *y, *anchor));
+}
+
+template <typename Arguments>
+[[nodiscard]] Result<std::optional<Value>> draw_region_native(
+    Machine& machine,
+    const Arguments& arguments) {
+    auto bound = bound_graphics(machine, arguments, "Graphics.drawRegion");
+    auto source_reference = reference_argument(
+        arguments, 1U, "Graphics.drawRegion");
+    std::array<Result<i32>, 8> values {
+        int_argument(arguments, 2U, "Graphics.drawRegion"),
+        int_argument(arguments, 3U, "Graphics.drawRegion"),
+        int_argument(arguments, 4U, "Graphics.drawRegion"),
+        int_argument(arguments, 5U, "Graphics.drawRegion"),
+        int_argument(arguments, 6U, "Graphics.drawRegion"),
+        int_argument(arguments, 7U, "Graphics.drawRegion"),
+        int_argument(arguments, 8U, "Graphics.drawRegion"),
+        int_argument(arguments, 9U, "Graphics.drawRegion"),
+    };
+    if (!bound) return std::unexpected(bound.error());
+    if (!source_reference) return std::unexpected(source_reference.error());
+    for (const auto& value : values) {
+        if (!value) return std::unexpected(value.error());
+    }
+    auto transform = graphics::transform_from_int(*values[4]);
+    if (!transform) return graphics_error(transform.error());
+    auto anchor_validation = graphics::anchored_rect(
+        0, 0, 0, 0, *values[7], false);
+    if (!anchor_validation) return graphics_error(anchor_validation.error());
+    if (source_reference->bits == bound->context->target_key) {
+        return fail_java("java/lang/IllegalArgumentException",
+                         "drawRegion source equals destination");
+    }
+    auto source = image_payload(machine, *source_reference);
+    if (!source) return std::unexpected(source.error());
+    machine.intercept_image_draw(ImageDrawEvent {
+        .kind = ImageDrawKind::region,
+        .graphics_id = bound->graphics_id,
+        .target_image_id = bound->context->target_key,
+        .source_image_id = source_reference->bits,
+        .source_x = *values[0],
+        .source_y = *values[1],
+        .source_width = *values[2],
+        .source_height = *values[3],
+        .transform = *values[4],
+        .destination_x = *values[5],
+        .destination_y = *values[6],
+        .anchor = *values[7],
+        .translate_x = bound->context->translate_x,
+        .translate_y = bound->context->translate_y,
+        .clip_x = bound->context->clip.x,
+        .clip_y = bound->context->clip.y,
+        .clip_width = bound->context->clip.width,
+        .clip_height = bound->context->clip.height,
+        .display_target = bound->context->display_target,
+    });
+    return status_result(graphics::draw_region(
+        *bound->target, *bound->context, **source,
+        *values[0], *values[1], *values[2], *values[3],
+        *transform, *values[5], *values[6], *values[7]));
+}
+
 } // namespace
 
 void register_graphics_natives(NativeMethodRegistry& registry) {
@@ -1307,6 +1410,18 @@ void register_graphics_natives(NativeMethodRegistry& registry) {
 
     add(registry, graphics_owner, "setColor", "(I)V",
         [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto bound = bound_graphics(machine, arguments,
+                                        "Graphics.setColor");
+            auto rgb = int_argument(arguments, 1U, "Graphics.setColor");
+            if (!bound) return std::unexpected(bound.error());
+            if (!rgb) return std::unexpected(rgb.error());
+            bound->context->color = phone_me_opaque_color(
+                static_cast<u32>(*rgb));
+            return std::optional<Value> {};
+        },
+        NativeJitPolicy::conservative,
+        [](Machine& machine, const InvocationArguments& arguments)
             -> Result<std::optional<Value>> {
             auto bound = bound_graphics(machine, arguments,
                                         "Graphics.setColor");
@@ -1457,10 +1572,32 @@ void register_graphics_natives(NativeMethodRegistry& registry) {
             if (!y) return std::unexpected(y.error());
             graphics::translate(*bound->context, *x, *y);
             return std::optional<Value> {};
+        },
+        NativeJitPolicy::conservative,
+        [](Machine& machine, const InvocationArguments& arguments)
+            -> Result<std::optional<Value>> {
+            auto bound = bound_graphics(machine, arguments,
+                                        "Graphics.translate");
+            auto x = int_argument(arguments, 1U, "Graphics.translate");
+            auto y = int_argument(arguments, 2U, "Graphics.translate");
+            if (!bound) return std::unexpected(bound.error());
+            if (!x) return std::unexpected(x.error());
+            if (!y) return std::unexpected(y.error());
+            graphics::translate(*bound->context, *x, *y);
+            return std::optional<Value> {};
         });
 
     add(registry, graphics_owner, "getTranslateX", "()I",
         [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto bound = bound_graphics(machine, arguments,
+                                        "Graphics.getTranslateX");
+            if (!bound) return std::unexpected(bound.error());
+            return std::optional<Value>(Value::from_int(
+                bound->context->translate_x));
+        },
+        NativeJitPolicy::conservative,
+        [](Machine& machine, const InvocationArguments& arguments)
             -> Result<std::optional<Value>> {
             auto bound = bound_graphics(machine, arguments,
                                         "Graphics.getTranslateX");
@@ -1476,12 +1613,43 @@ void register_graphics_natives(NativeMethodRegistry& registry) {
             if (!bound) return std::unexpected(bound.error());
             return std::optional<Value>(Value::from_int(
                 bound->context->translate_y));
+        },
+        NativeJitPolicy::conservative,
+        [](Machine& machine, const InvocationArguments& arguments)
+            -> Result<std::optional<Value>> {
+            auto bound = bound_graphics(machine, arguments,
+                                        "Graphics.getTranslateY");
+            if (!bound) return std::unexpected(bound.error());
+            return std::optional<Value>(Value::from_int(
+                bound->context->translate_y));
         });
 
     const auto clip_operation = [&registry](const char* name, bool replace) {
         add(registry, graphics_owner, name, "(IIII)V",
             [replace, name](Machine& machine,
                             std::span<const Value> arguments)
+                -> Result<std::optional<Value>> {
+                auto bound = bound_graphics(machine, arguments, name);
+                auto x = int_argument(arguments, 1U, name);
+                auto y = int_argument(arguments, 2U, name);
+                auto width = int_argument(arguments, 3U, name);
+                auto height = int_argument(arguments, 4U, name);
+                if (!bound) return std::unexpected(bound.error());
+                if (!x) return std::unexpected(x.error());
+                if (!y) return std::unexpected(y.error());
+                if (!width) return std::unexpected(width.error());
+                if (!height) return std::unexpected(height.error());
+                return status_result(replace
+                    ? graphics::set_clip(*bound->context,
+                                         *bound->target,
+                                         *x, *y, *width, *height)
+                    : graphics::clip_rect(*bound->context,
+                                          *bound->target,
+                                          *x, *y, *width, *height));
+            },
+            NativeJitPolicy::conservative,
+            [replace, name](Machine& machine,
+                            const InvocationArguments& arguments)
                 -> Result<std::optional<Value>> {
                 auto bound = bound_graphics(machine, arguments, name);
                 auto x = int_argument(arguments, 1U, name);
@@ -1581,6 +1749,28 @@ void register_graphics_natives(NativeMethodRegistry& registry) {
         add(registry, graphics_owner, name, "(IIII)V",
             [fill, name](Machine& machine,
                          std::span<const Value> arguments)
+                -> Result<std::optional<Value>> {
+                auto bound = bound_graphics(machine, arguments, name);
+                auto x = int_argument(arguments, 1U, name);
+                auto y = int_argument(arguments, 2U, name);
+                auto width = int_argument(arguments, 3U, name);
+                auto height = int_argument(arguments, 4U, name);
+                if (!bound) return std::unexpected(bound.error());
+                if (!x) return std::unexpected(x.error());
+                if (!y) return std::unexpected(y.error());
+                if (!width) return std::unexpected(width.error());
+                if (!height) return std::unexpected(height.error());
+                return status_result(fill
+                    ? graphics::fill_rect(*bound->target,
+                                          *bound->context,
+                                          *x, *y, *width, *height)
+                    : graphics::draw_rect(*bound->target,
+                                          *bound->context,
+                                          *x, *y, *width, *height));
+            },
+            NativeJitPolicy::conservative,
+            [fill, name](Machine& machine,
+                         const InvocationArguments& arguments)
                 -> Result<std::optional<Value>> {
                 auto bound = bound_graphics(machine, arguments, name);
                 auto x = int_argument(arguments, 1U, name);
@@ -1705,107 +1895,24 @@ void register_graphics_natives(NativeMethodRegistry& registry) {
         "(Ljavax/microedition/lcdui/Image;III)V",
         [](Machine& machine, std::span<const Value> arguments)
             -> Result<std::optional<Value>> {
-            auto bound = bound_graphics(machine, arguments,
-                                        "Graphics.drawImage");
-            auto source_reference = reference_argument(
-                arguments, 1U, "Graphics.drawImage");
-            auto x = int_argument(arguments, 2U, "Graphics.drawImage");
-            auto y = int_argument(arguments, 3U, "Graphics.drawImage");
-            auto anchor = int_argument(arguments, 4U, "Graphics.drawImage");
-            if (!bound) return std::unexpected(bound.error());
-            if (!source_reference) return std::unexpected(source_reference.error());
-            if (!x) return std::unexpected(x.error());
-            if (!y) return std::unexpected(y.error());
-            if (!anchor) return std::unexpected(anchor.error());
-            auto source = image_payload(machine, *source_reference);
-            if (!source) return std::unexpected(source.error());
-            machine.intercept_image_draw(ImageDrawEvent {
-                .kind = ImageDrawKind::image,
-                .graphics_id = bound->graphics_id,
-                .target_image_id = bound->context->target_key,
-                .source_image_id = source_reference->bits,
-                .source_width = (*source)->width(),
-                .source_height = (*source)->height(),
-                .transform = static_cast<i32>(graphics::Transform::none),
-                .destination_x = *x,
-                .destination_y = *y,
-                .anchor = *anchor,
-                .translate_x = bound->context->translate_x,
-                .translate_y = bound->context->translate_y,
-                .clip_x = bound->context->clip.x,
-                .clip_y = bound->context->clip.y,
-                .clip_width = bound->context->clip.width,
-                .clip_height = bound->context->clip.height,
-                .display_target = bound->context->display_target,
-            });
-            return status_result(graphics::draw_image(
-                *bound->target, *bound->context, **source,
-                *x, *y, *anchor));
+            return draw_image_native(machine, arguments);
+        },
+        NativeJitPolicy::conservative,
+        [](Machine& machine, const InvocationArguments& arguments)
+            -> Result<std::optional<Value>> {
+            return draw_image_native(machine, arguments);
         });
 
     add(registry, graphics_owner, "drawRegion",
         "(Ljavax/microedition/lcdui/Image;IIIIIIII)V",
         [](Machine& machine, std::span<const Value> arguments)
             -> Result<std::optional<Value>> {
-            auto bound = bound_graphics(machine, arguments,
-                                        "Graphics.drawRegion");
-            auto source_reference = reference_argument(
-                arguments, 1U, "Graphics.drawRegion");
-            std::array<Result<i32>, 8> values {
-                int_argument(arguments, 2U, "Graphics.drawRegion"),
-                int_argument(arguments, 3U, "Graphics.drawRegion"),
-                int_argument(arguments, 4U, "Graphics.drawRegion"),
-                int_argument(arguments, 5U, "Graphics.drawRegion"),
-                int_argument(arguments, 6U, "Graphics.drawRegion"),
-                int_argument(arguments, 7U, "Graphics.drawRegion"),
-                int_argument(arguments, 8U, "Graphics.drawRegion"),
-                int_argument(arguments, 9U, "Graphics.drawRegion"),
-            };
-            if (!bound) return std::unexpected(bound.error());
-            if (!source_reference) return std::unexpected(source_reference.error());
-            for (const auto& value : values) {
-                if (!value) return std::unexpected(value.error());
-            }
-            // Match phoneME Graphics.renderRegion validation order:
-            // transform, anchor, then same-source/source-region checks.
-            auto transform = graphics::transform_from_int(*values[4]);
-            if (!transform) return graphics_error(transform.error());
-            auto anchor_validation = graphics::anchored_rect(
-                0, 0, 0, 0, *values[7], false);
-            if (!anchor_validation) {
-                return graphics_error(anchor_validation.error());
-            }
-            if (source_reference->bits == bound->context->target_key) {
-                return fail_java("java/lang/IllegalArgumentException",
-                                 "drawRegion source equals destination");
-            }
-            auto source = image_payload(machine, *source_reference);
-            if (!source) return std::unexpected(source.error());
-            machine.intercept_image_draw(ImageDrawEvent {
-                .kind = ImageDrawKind::region,
-                .graphics_id = bound->graphics_id,
-                .target_image_id = bound->context->target_key,
-                .source_image_id = source_reference->bits,
-                .source_x = *values[0],
-                .source_y = *values[1],
-                .source_width = *values[2],
-                .source_height = *values[3],
-                .transform = *values[4],
-                .destination_x = *values[5],
-                .destination_y = *values[6],
-                .anchor = *values[7],
-                .translate_x = bound->context->translate_x,
-                .translate_y = bound->context->translate_y,
-                .clip_x = bound->context->clip.x,
-                .clip_y = bound->context->clip.y,
-                .clip_width = bound->context->clip.width,
-                .clip_height = bound->context->clip.height,
-                .display_target = bound->context->display_target,
-            });
-            return status_result(graphics::draw_region(
-                *bound->target, *bound->context, **source,
-                *values[0], *values[1], *values[2], *values[3],
-                *transform, *values[5], *values[6], *values[7]));
+            return draw_region_native(machine, arguments);
+        },
+        NativeJitPolicy::conservative,
+        [](Machine& machine, const InvocationArguments& arguments)
+            -> Result<std::optional<Value>> {
+            return draw_region_native(machine, arguments);
         });
 
     add(registry, graphics_owner, "copyArea", "(IIIIIII)V",

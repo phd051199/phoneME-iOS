@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -93,6 +94,7 @@ struct FrameReadView final {
 
 class Runtime final {
 public:
+    using HostWakeSink = std::function<void()>;
     Runtime();
     ~Runtime();
 
@@ -185,6 +187,7 @@ public:
     void record_error(const Error& error);
     void clear_error();
     [[nodiscard]] std::string last_error_message() const;
+    void configure_host_wake(HostWakeSink sink);
 
     void stop() noexcept;
     void suspend() noexcept;
@@ -234,6 +237,7 @@ public:
     void ui_set_scroll_position(i32 position);
 
 private:
+    void signal_host_wake() noexcept;
     [[nodiscard]] App* find_app_unlocked(AppId app_id) noexcept;
     [[nodiscard]] const App* find_app_unlocked(AppId app_id) const noexcept;
     [[nodiscard]] Status require_running_unlocked() const;
@@ -252,6 +256,8 @@ private:
     // Protects Runtime state only. Java/native callbacks are serialized by the
     // owning ApplicationVM and must never execute while this mutex is held.
     mutable std::mutex mutex_;
+    mutable std::mutex host_wake_mutex_;
+    HostWakeSink host_wake_sink_;
     std::string runtime_home_;
     std::string optional_class_archive_;
     std::array<i32, 7> keymap_ {-1, -2, -3, -4, -5, -6, -7};

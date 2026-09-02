@@ -6,6 +6,11 @@
 
 namespace phoneme::vm {
 
+void MonitorTable::set_wake_hook(WakeHook hook) {
+    std::scoped_lock lock(mutex_);
+    wake_hook_ = std::move(hook);
+}
+
 std::shared_ptr<MonitorTable::Monitor> MonitorTable::monitor_locked(
     ObjectRef object) {
     auto& monitor = monitors_[object.bits];
@@ -87,7 +92,8 @@ Result<MonitorEnterResult> MonitorTable::enter(ObjectRef object,
 Status MonitorTable::enter_blocking(ObjectRef object,
                                     JavaThreadId thread_id,
                                     BlockHook before_block,
-                                    BlockHook after_block) {
+                                    BlockHook after_block,
+                                    CooperativeWait cooperative_wait) {
     if (object.is_null()) {
         return fail(ErrorCode::invalid_argument,
                     "cannot enter monitor for null reference");
@@ -119,12 +125,21 @@ Status MonitorTable::enter_blocking(ObjectRef object,
     lock.unlock();
     before_block();
     lock.lock();
-    monitor->condition.wait(lock, [&] {
+    const auto ready = [&] {
         return monitor->cancelled ||
                (monitor->owner == 0U &&
                 !monitor->entry_queue.empty() &&
                 monitor->entry_queue.front() == thread_id);
-    });
+    };
+    if (cooperative_wait) {
+        while (!ready()) {
+            lock.unlock();
+            cooperative_wait(std::nullopt);
+            lock.lock();
+        }
+    } else {
+        monitor->condition.wait(lock, ready);
+    }
     if (monitor->cancelled) {
         erase_thread(monitor->entry_queue, thread_id);
         lock.unlock();
@@ -161,12 +176,20 @@ Status MonitorTable::exit(ObjectRef object, JavaThreadId thread_id) {
                          "current Java thread does not own monitor");
     }
     auto monitor = iterator->second;
+    std::optional<JavaThreadId> wake_thread;
+    WakeHook wake_hook;
     --monitor->recursion;
     if (monitor->recursion == 0U) {
         monitor->owner = 0U;
         monitor->condition.notify_all();
+        if (!monitor->entry_queue.empty()) {
+            wake_thread = monitor->entry_queue.front();
+        }
+        wake_hook = wake_hook_;
         erase_if_unused_locked(object.bits, monitor);
     }
+    lock.unlock();
+    if (wake_thread.has_value() && wake_hook) wake_hook(*wake_thread);
     return {};
 }
 
@@ -176,7 +199,8 @@ Result<MonitorWaitResult> MonitorTable::wait(
     std::optional<std::chrono::milliseconds> timeout,
     BlockHook before_block,
     BlockHook after_block,
-    InterruptCheck interrupted) {
+    InterruptCheck interrupted,
+    CooperativeWait cooperative_wait) {
     if (object.is_null()) {
         return fail_java("java/lang/NullPointerException",
                          "Object.wait receiver is null");
@@ -220,7 +244,25 @@ Result<MonitorWaitResult> MonitorTable::wait(
         return monitor->cancelled || waiter->notified || interrupted();
     };
     bool awakened = false;
-    if (timeout.has_value()) {
+    if (cooperative_wait) {
+        const auto deadline = timeout.has_value()
+            ? std::optional<std::chrono::steady_clock::time_point>(
+                  wait_started + *timeout)
+            : std::nullopt;
+        for (;;) {
+            if (predicate()) {
+                awakened = true;
+                break;
+            }
+            if (deadline.has_value() &&
+                std::chrono::steady_clock::now() >= *deadline) {
+                break;
+            }
+            lock.unlock();
+            cooperative_wait(deadline);
+            lock.lock();
+        }
+    } else if (timeout.has_value()) {
         awakened = monitor->condition.wait_for(lock, *timeout, predicate);
     } else {
         monitor->condition.wait(lock, predicate);
@@ -241,12 +283,21 @@ Result<MonitorWaitResult> MonitorTable::wait(
     }
 
     enqueue_unique(monitor->entry_queue, thread_id);
-    monitor->condition.wait(lock, [&] {
+    const auto reacquire_ready = [&] {
         return monitor->cancelled ||
                (monitor->owner == 0U &&
                 !monitor->entry_queue.empty() &&
                 monitor->entry_queue.front() == thread_id);
-    });
+    };
+    if (cooperative_wait) {
+        while (!reacquire_ready()) {
+            lock.unlock();
+            cooperative_wait(std::nullopt);
+            lock.lock();
+        }
+    } else {
+        monitor->condition.wait(lock, reacquire_ready);
+    }
     if (monitor->cancelled) {
         erase_thread(monitor->entry_queue, thread_id);
         lock.unlock();
@@ -288,7 +339,7 @@ Status MonitorTable::notify_one(ObjectRef object,
         return fail_java("java/lang/NullPointerException",
                          "Object.notify receiver is null");
     }
-    std::scoped_lock lock(mutex_);
+    std::unique_lock lock(mutex_);
     const auto iterator = monitors_.find(object.bits);
     if (iterator == monitors_.end() || iterator->second->owner != thread_id) {
         return fail_java("java/lang/IllegalMonitorStateException",
@@ -304,12 +355,19 @@ Status MonitorTable::notify_one(ObjectRef object,
         (*waiter)->notified = true;
         monitor.condition.notify_all();
     }
+    const std::optional<JavaThreadId> wake_thread =
+        waiter != monitor.wait_set.end()
+            ? std::optional<JavaThreadId>((*waiter)->thread_id)
+            : std::nullopt;
+    WakeHook wake_hook = wake_hook_;
     vm_trace("monitor",
              "notify java=%u object=%llu selected=%d waiters=%zu",
              static_cast<unsigned>(thread_id),
              static_cast<unsigned long long>(object.bits),
              waiter != monitor.wait_set.end() ? 1 : 0,
              monitor.wait_set.size());
+    lock.unlock();
+    if (wake_thread.has_value() && wake_hook) wake_hook(*wake_thread);
     return {};
 }
 
@@ -319,22 +377,32 @@ Status MonitorTable::notify_all(ObjectRef object,
         return fail_java("java/lang/NullPointerException",
                          "Object.notifyAll receiver is null");
     }
-    std::scoped_lock lock(mutex_);
+    std::unique_lock lock(mutex_);
     const auto iterator = monitors_.find(object.bits);
     if (iterator == monitors_.end() || iterator->second->owner != thread_id) {
         return fail_java("java/lang/IllegalMonitorStateException",
                          "Object.notifyAll requires monitor ownership");
     }
     auto& monitor = *iterator->second;
+    std::vector<JavaThreadId> wake_threads;
+    wake_threads.reserve(monitor.wait_set.size());
     for (const auto& waiter : monitor.wait_set) {
         waiter->notified = true;
+        wake_threads.push_back(waiter->thread_id);
     }
     monitor.condition.notify_all();
+    WakeHook wake_hook = wake_hook_;
     vm_trace("monitor",
              "notify-all java=%u object=%llu waiters=%zu",
              static_cast<unsigned>(thread_id),
              static_cast<unsigned long long>(object.bits),
              monitor.wait_set.size());
+    lock.unlock();
+    if (wake_hook) {
+        for (const JavaThreadId wake_thread : wake_threads) {
+            wake_hook(wake_thread);
+        }
+    }
     return {};
 }
 
@@ -391,44 +459,86 @@ void MonitorTable::wake_all() noexcept {
 }
 
 void MonitorTable::release_all(JavaThreadId thread_id) noexcept {
-    std::scoped_lock lock(mutex_);
-    for (auto iterator = monitors_.begin(); iterator != monitors_.end();) {
-        auto& monitor = *iterator->second;
-        if (monitor.owner == thread_id) {
-            monitor.owner = 0U;
-            monitor.recursion = 0U;
-        }
-        erase_thread(monitor.entry_queue, thread_id);
-        for (const auto& waiter : monitor.wait_set) {
-            if (waiter->thread_id == thread_id) {
-                waiter->notified = true;
+    std::vector<JavaThreadId> wake_threads;
+    WakeHook wake_hook;
+    {
+        std::scoped_lock lock(mutex_);
+        wake_hook = wake_hook_;
+        for (auto iterator = monitors_.begin(); iterator != monitors_.end();) {
+            auto& monitor = *iterator->second;
+            const bool released_owner = monitor.owner == thread_id;
+            if (released_owner) {
+                monitor.owner = 0U;
+                monitor.recursion = 0U;
+            }
+            erase_thread(monitor.entry_queue, thread_id);
+            for (const auto& waiter : monitor.wait_set) {
+                if (waiter->thread_id == thread_id) {
+                    waiter->notified = true;
+                }
+            }
+            monitor.wait_set.erase(
+                std::remove_if(
+                    monitor.wait_set.begin(), monitor.wait_set.end(),
+                    [thread_id](const std::shared_ptr<WaitNode>& waiter) {
+                        return waiter->thread_id == thread_id;
+                    }),
+                monitor.wait_set.end());
+            monitor.condition.notify_all();
+
+            // pthread waiters observe the condition-variable broadcast above,
+            // but a logical Java thread is parked on the shared carrier and
+            // must be explicitly re-queued. Only the FIFO head can acquire a
+            // freshly released monitor, so waking exactly that fiber preserves
+            // the existing entry-queue fairness without a thundering herd.
+            if (released_owner && monitor.owner == 0U &&
+                !monitor.entry_queue.empty()) {
+                wake_threads.push_back(monitor.entry_queue.front());
+            }
+
+            if (monitor.owner == 0U && monitor.entry_queue.empty() &&
+                monitor.wait_set.empty()) {
+                iterator = monitors_.erase(iterator);
+            } else {
+                ++iterator;
             }
         }
-        monitor.wait_set.erase(
-            std::remove_if(monitor.wait_set.begin(), monitor.wait_set.end(),
-                           [thread_id](const std::shared_ptr<WaitNode>& waiter) {
-                               return waiter->thread_id == thread_id;
-                           }),
-            monitor.wait_set.end());
-        monitor.condition.notify_all();
-        if (monitor.owner == 0U && monitor.entry_queue.empty() &&
-            monitor.wait_set.empty()) {
-            iterator = monitors_.erase(iterator);
-        } else {
-            ++iterator;
+    }
+    if (wake_hook) {
+        for (const JavaThreadId wake_thread : wake_threads) {
+            wake_hook(wake_thread);
         }
     }
 }
 
 void MonitorTable::clear() noexcept {
-    std::scoped_lock lock(mutex_);
-    cancelled_ = true;
-    for (const auto& [bits, monitor] : monitors_) {
-        (void)bits;
-        monitor->cancelled = true;
-        monitor->condition.notify_all();
+    std::vector<JavaThreadId> wake_threads;
+    WakeHook wake_hook;
+    {
+        std::scoped_lock lock(mutex_);
+        cancelled_ = true;
+        wake_hook = wake_hook_;
+        for (const auto& [bits, monitor] : monitors_) {
+            (void)bits;
+            monitor->cancelled = true;
+            monitor->condition.notify_all();
+            wake_threads.insert(wake_threads.end(),
+                                monitor->entry_queue.begin(),
+                                monitor->entry_queue.end());
+            for (const auto& waiter : monitor->wait_set) {
+                wake_threads.push_back(waiter->thread_id);
+            }
+        }
+        monitors_.clear();
     }
-    monitors_.clear();
+    if (wake_hook) {
+        std::sort(wake_threads.begin(), wake_threads.end());
+        wake_threads.erase(std::unique(wake_threads.begin(), wake_threads.end()),
+                           wake_threads.end());
+        for (const JavaThreadId wake_thread : wake_threads) {
+            wake_hook(wake_thread);
+        }
+    }
 }
 
 } // namespace phoneme::vm

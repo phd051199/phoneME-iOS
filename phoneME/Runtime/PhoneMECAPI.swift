@@ -4,6 +4,18 @@ import Foundation
 import Metal
 #endif
 
+private let phoneMEHostWakeLock = NSLock()
+private var phoneMEHostWakeHandlers: [UInt: () -> Void] = [:]
+
+private func phoneMEHostWakeCallback(_ context: UnsafeMutableRawPointer?) {
+    guard let context else { return }
+    let key = UInt(bitPattern: context)
+    phoneMEHostWakeLock.lock()
+    let handler = phoneMEHostWakeHandlers[key]
+    phoneMEHostWakeLock.unlock()
+    handler?()
+}
+
 #if canImport(Metal)
 private final class PhoneMEMetalFrameTexturePool: @unchecked Sendable {
     private struct TextureKey: Hashable {
@@ -737,7 +749,29 @@ final class PhoneMECAPI: @unchecked Sendable {
     }
 
     func destroyRuntime(_ runtime: RuntimeHandle?) {
+        configureHostWake(runtime, handler: nil)
         phoneme_destroy(runtime?.rawValue)
+    }
+
+    func configureHostWake(
+        _ runtime: RuntimeHandle?,
+        handler: (() -> Void)?
+    ) {
+        guard let rawRuntime = runtime?.rawValue else { return }
+        let key = UInt(bitPattern: rawRuntime)
+        phoneMEHostWakeLock.lock()
+        if let handler {
+            phoneMEHostWakeHandlers[key] = handler
+        } else {
+            phoneMEHostWakeHandlers.removeValue(forKey: key)
+        }
+        phoneMEHostWakeLock.unlock()
+
+        phoneme_set_host_wake_callback(
+            rawRuntime,
+            handler == nil ? nil : phoneMEHostWakeCallback,
+            handler == nil ? nil : rawRuntime
+        )
     }
 
     func configureKeymap(

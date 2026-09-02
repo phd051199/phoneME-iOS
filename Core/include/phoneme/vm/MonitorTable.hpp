@@ -37,13 +37,19 @@ class MonitorTable final {
 public:
     using BlockHook = std::function<void()>;
     using InterruptCheck = std::function<bool()>;
+    using CooperativeWait = std::function<void(
+        std::optional<std::chrono::steady_clock::time_point>)>;
+    using WakeHook = std::function<void(JavaThreadId)>;
+
+    void set_wake_hook(WakeHook hook);
 
     [[nodiscard]] Result<MonitorEnterResult> enter(ObjectRef object,
                                                    JavaThreadId thread_id);
     [[nodiscard]] Status enter_blocking(ObjectRef object,
                                         JavaThreadId thread_id,
                                         BlockHook before_block,
-                                        BlockHook after_block);
+                                        BlockHook after_block,
+                                        CooperativeWait cooperative_wait = {});
     [[nodiscard]] Status exit(ObjectRef object, JavaThreadId thread_id);
 
     [[nodiscard]] Result<MonitorWaitResult> wait(
@@ -52,7 +58,8 @@ public:
         std::optional<std::chrono::milliseconds> timeout,
         BlockHook before_block,
         BlockHook after_block,
-        InterruptCheck interrupted);
+        InterruptCheck interrupted,
+        CooperativeWait cooperative_wait = {});
     [[nodiscard]] Status notify_one(ObjectRef object,
                                     JavaThreadId thread_id);
     [[nodiscard]] Status notify_all(ObjectRef object,
@@ -91,6 +98,7 @@ private:
 
     mutable std::mutex mutex_;
     std::unordered_map<u64, std::shared_ptr<Monitor>> monitors_;
+    WakeHook wake_hook_;
     bool cancelled_ {false};
 };
 

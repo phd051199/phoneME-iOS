@@ -65,19 +65,38 @@ namespace phoneme::runtime
       replacement[offset] = 0xFFU;
     }
 
-    std::scoped_lock lock(mutex_);
-    dimensions_ = dimensions;
-    rgba_ = std::move(replacement);
-    pixel_format_ = FramePixelFormat::rgba8;
-    damage_regions_.clear();
-    damage_regions_.push_back(FrameDamageRegion {
-        .x = 0,
-        .y = 0,
-        .width = dimensions.width,
-        .height = dimensions.height,
-    });
-    ++generation_;
+    {
+      std::scoped_lock lock(mutex_);
+      dimensions_ = dimensions;
+      rgba_ = std::move(replacement);
+      pixel_format_ = FramePixelFormat::rgba8;
+      damage_regions_.clear();
+      damage_regions_.push_back(FrameDamageRegion {
+          .x = 0,
+          .y = 0,
+          .width = dimensions.width,
+          .height = dimensions.height,
+      });
+      ++generation_;
+    }
+    notify_changed();
     return {};
+  }
+
+  void Framebuffer::configure_change_sink(ChangeSink sink)
+  {
+    std::scoped_lock lock(mutex_);
+    change_sink_ = std::move(sink);
+  }
+
+  void Framebuffer::notify_changed() noexcept
+  {
+    ChangeSink sink;
+    {
+      std::scoped_lock lock(mutex_);
+      sink = change_sink_;
+    }
+    if (sink) sink();
   }
 
   Status Framebuffer::replace(Dimensions dimensions,
@@ -96,18 +115,21 @@ namespace phoneme::runtime
     }
 
     std::vector<u8> replacement(pixels.begin(), pixels.end());
-    std::scoped_lock lock(mutex_);
-    dimensions_ = dimensions;
-    rgba_ = std::move(replacement);
-    pixel_format_ = format;
-    damage_regions_.clear();
-    damage_regions_.push_back(FrameDamageRegion {
-        .x = 0,
-        .y = 0,
-        .width = dimensions.width,
-        .height = dimensions.height,
-    });
-    ++generation_;
+    {
+      std::scoped_lock lock(mutex_);
+      dimensions_ = dimensions;
+      rgba_ = std::move(replacement);
+      pixel_format_ = format;
+      damage_regions_.clear();
+      damage_regions_.push_back(FrameDamageRegion {
+          .x = 0,
+          .y = 0,
+          .width = dimensions.width,
+          .height = dimensions.height,
+      });
+      ++generation_;
+    }
+    notify_changed();
     return {};
   }
 
@@ -126,18 +148,21 @@ namespace phoneme::runtime
                   "frame byte size does not match its dimensions");
     }
 
-    std::scoped_lock lock(mutex_);
-    dimensions_ = dimensions;
-    rgba_.swap(pixels);
-    pixel_format_ = format;
-    damage_regions_.clear();
-    damage_regions_.push_back(FrameDamageRegion {
-        .x = 0,
-        .y = 0,
-        .width = dimensions.width,
-        .height = dimensions.height,
-    });
-    ++generation_;
+    {
+      std::scoped_lock lock(mutex_);
+      dimensions_ = dimensions;
+      rgba_.swap(pixels);
+      pixel_format_ = format;
+      damage_regions_.clear();
+      damage_regions_.push_back(FrameDamageRegion {
+          .x = 0,
+          .y = 0,
+          .width = dimensions.width,
+          .height = dimensions.height,
+      });
+      ++generation_;
+    }
+    notify_changed();
     return {};
   }
 
@@ -195,45 +220,48 @@ namespace phoneme::runtime
       }
     }
 
-    std::scoped_lock lock(mutex_);
-    if (dimensions_.width != dimensions.width ||
-        dimensions_.height != dimensions.height ||
-        rgba_.size() != *full_size || pixel_format_ != format)
     {
-      return fail(ErrorCode::invalid_state,
-                  "framebuffer dimensions changed before partial update");
-    }
-
-    const usize destination_stride = static_cast<usize>(dimensions.width) * 4U;
-    for (const FrameRegionUpdate& update : updates) {
-      const usize source_stride = static_cast<usize>(update.width) * 4U;
-      for (i32 row = 0; row < update.height; ++row)
+      std::scoped_lock lock(mutex_);
+      if (dimensions_.width != dimensions.width ||
+          dimensions_.height != dimensions.height ||
+          rgba_.size() != *full_size || pixel_format_ != format)
       {
-        const usize source_offset = static_cast<usize>(row) * source_stride;
-        const usize destination_offset =
-            static_cast<usize>(update.y + row) * destination_stride +
-            static_cast<usize>(update.x) * 4U;
-        std::copy_n(
-            update.rgba.begin() +
-                static_cast<std::ptrdiff_t>(source_offset),
-            source_stride,
-            rgba_.begin() +
-                static_cast<std::ptrdiff_t>(destination_offset));
+        return fail(ErrorCode::invalid_state,
+                    "framebuffer dimensions changed before partial update");
       }
+
+      const usize destination_stride = static_cast<usize>(dimensions.width) * 4U;
+      for (const FrameRegionUpdate& update : updates) {
+        const usize source_stride = static_cast<usize>(update.width) * 4U;
+        for (i32 row = 0; row < update.height; ++row)
+        {
+          const usize source_offset = static_cast<usize>(row) * source_stride;
+          const usize destination_offset =
+              static_cast<usize>(update.y + row) * destination_stride +
+              static_cast<usize>(update.x) * 4U;
+          std::copy_n(
+              update.rgba.begin() +
+                  static_cast<std::ptrdiff_t>(source_offset),
+              source_stride,
+              rgba_.begin() +
+                  static_cast<std::ptrdiff_t>(destination_offset));
+        }
+      }
+      damage_regions_.clear();
+      if (damage_regions_.capacity() < updates.size()) {
+        damage_regions_.reserve(updates.size());
+      }
+      for (const FrameRegionUpdate& update : updates) {
+        damage_regions_.push_back(FrameDamageRegion {
+            .x = update.x,
+            .y = update.y,
+            .width = update.width,
+            .height = update.height,
+        });
+      }
+      ++generation_;
     }
-    damage_regions_.clear();
-    if (damage_regions_.capacity() < updates.size()) {
-      damage_regions_.reserve(updates.size());
-    }
-    for (const FrameRegionUpdate& update : updates) {
-      damage_regions_.push_back(FrameDamageRegion {
-          .x = update.x,
-          .y = update.y,
-          .width = update.width,
-          .height = update.height,
-      });
-    }
-    ++generation_;
+    notify_changed();
     return {};
   }
 
@@ -357,12 +385,15 @@ namespace phoneme::runtime
 
   void Framebuffer::clear() noexcept
   {
-    std::scoped_lock lock(mutex_);
-    dimensions_ = {};
-    rgba_.clear();
-    pixel_format_ = FramePixelFormat::rgba8;
-    damage_regions_.clear();
-    ++generation_;
+    {
+      std::scoped_lock lock(mutex_);
+      dimensions_ = {};
+      rgba_.clear();
+      pixel_format_ = FramePixelFormat::rgba8;
+      damage_regions_.clear();
+      ++generation_;
+    }
+    notify_changed();
   }
 
 } // namespace phoneme::runtime

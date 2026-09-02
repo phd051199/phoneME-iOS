@@ -394,8 +394,13 @@ struct GameProfile: Codable, Equatable {
         _ configuredValue: Int,
         mode: FramePacingMode
     ) -> Int {
+        // Native means preserve the MIDlet's own timing. The scheduler still
+        // needs a ceiling for runaway repaint loops, but using the 30 FPS
+        // override default here silently turned "Default / native" into a
+        // 30 FPS cap on physical iPhone. Keep native timing up to the display
+        // ceiling; explicit 30/60 choices continue to use overrideGameLoop.
         mode == .native
-            ? defaultFrameRate
+            ? maximumFrameRate
             : resolvedFrameRate(configuredValue)
     }
 

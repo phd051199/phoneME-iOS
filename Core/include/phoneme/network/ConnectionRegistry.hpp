@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -37,6 +38,8 @@ struct NetworkBlockingHooks final {
     std::function<u32()> before_block;
     std::function<void(u32)> after_block;
     std::function<std::optional<Error>()> poll_cancellation;
+    std::function<bool(std::chrono::milliseconds)> cooperative_wait;
+    std::function<void()> wake_waiters;
 };
 
 struct OpenedConnection final {

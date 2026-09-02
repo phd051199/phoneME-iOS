@@ -41,15 +41,8 @@ Status TimerService::initialize_timer(ObjectRef timer, bool daemon) {
                          "Timer receiver is null");
     }
 
-    auto thread = machine_.class_states().allocate_instance(
-        machine_.heap(), "java/lang/Thread");
-    if (!thread) return std::unexpected(thread.error());
-    auto registered = machine_.initialize_java_thread(*thread, ObjectRef {});
-    if (!registered) return registered;
-
     auto state = std::make_shared<TimerState>();
     state->timer = timer;
-    state->thread = *thread;
     state->daemon = daemon;
     {
         std::scoped_lock lock(mutex_);
@@ -64,12 +57,7 @@ Status TimerService::initialize_timer(ObjectRef timer, bool daemon) {
         timers_.emplace(timer.bits, state);
     }
 
-    auto started = machine_.scheduler().start_native_thread(
-        machine_, *thread,
-        [this, state](std::stop_token stop_token)
-            -> Result<std::optional<ObjectRef>> {
-            return run_timer(state, stop_token);
-        });
+    auto started = machine_.ensure_emulation_event_worker();
     if (!started) {
         std::scoped_lock lock(mutex_);
         timers_.erase(timer.bits);
@@ -139,7 +127,7 @@ Status TimerService::schedule(ObjectRef timer,
         .sequence = next_sequence_++,
     });
     sort_entries(timer_found->second->entries);
-    condition_.notify_all();
+    machine_.wake_emulation_event_worker();
     return {};
 }
 
@@ -153,7 +141,7 @@ Status TimerService::cancel_timer(ObjectRef timer) {
     if (found == timers_.end()) return {};
     found->second->cancelled = true;
     found->second->entries.clear();
-    condition_.notify_all();
+    machine_.wake_emulation_event_worker();
     return {};
 }
 
@@ -177,7 +165,7 @@ Result<bool> TimerService::cancel_task(ObjectRef task) {
                           });
         }
     }
-    condition_.notify_all();
+    machine_.wake_emulation_event_worker();
     return prevented;
 }
 
@@ -206,115 +194,106 @@ TimerServiceDiagnostics TimerService::diagnostics() const noexcept {
     return result;
 }
 
-Result<std::optional<ObjectRef>> TimerService::run_timer(
-    const std::shared_ptr<TimerState>& timer,
-    std::stop_token stop_token) {
-    while (!stop_token.stop_requested()) {
-        ScheduledEntry entry;
-        bool has_entry = false;
-        {
-            std::unique_lock lock(mutex_);
-            for (;;) {
-                if (shutting_down_ || timer->cancelled ||
-                    stop_token.stop_requested()) {
-                    return std::optional<ObjectRef> {};
-                }
+Result<bool> TimerService::dispatch_one_due() {
+    ScheduledEntry entry;
+    std::shared_ptr<TimerState> timer;
+    {
+        std::scoped_lock lock(mutex_);
+        if (shutting_down_) return false;
 
-                std::erase_if(timer->entries,
-                              [this](const ScheduledEntry& candidate) {
-                                  const auto task = tasks_.find(candidate.task.bits);
-                                  return task == tasks_.end() ||
-                                         task->second.cancelled ||
-                                         task->second.completed;
-                              });
-                sort_entries(timer->entries);
-                if (timer->entries.empty()) {
-                    machine_.scheduler().set_current_state(
-                        JavaThreadState::waiting);
-                    condition_.wait(lock, [&] {
-                        return shutting_down_ || timer->cancelled ||
-                               stop_token.stop_requested() ||
-                               !timer->entries.empty();
-                    });
-                    machine_.scheduler().set_current_state(
-                        JavaThreadState::running);
-                    continue;
-                }
-
-                const i64 now = current_time_millis();
-                const i64 due = timer->entries.front().next_time_millis;
-                if (due > now) {
-                    const auto deadline = std::chrono::system_clock::time_point(
-                        std::chrono::milliseconds(due));
-                    machine_.scheduler().set_current_state(
-                        JavaThreadState::sleeping);
-                    condition_.wait_until(lock, deadline);
-                    machine_.scheduler().set_current_state(
-                        JavaThreadState::running);
-                    continue;
-                }
-
-                entry = timer->entries.front();
-                timer->entries.erase(timer->entries.begin());
-                auto task = tasks_.find(entry.task.bits);
-                if (task == tasks_.end() || task->second.cancelled) continue;
-                task->second.scheduled_execution_time = entry.next_time_millis;
-                if (entry.period_millis == 0) {
-                    task->second.completed = true;
-                } else if (entry.fixed_rate) {
-                    if (entry.next_time_millis >
-                        std::numeric_limits<i64>::max() - entry.period_millis) {
-                        task->second.completed = true;
-                    } else {
-                        entry.next_time_millis += entry.period_millis;
-                        timer->entries.push_back(entry);
-                        sort_entries(timer->entries);
-                    }
-                }
-                has_entry = true;
-                break;
+        const i64 now = current_time_millis();
+        i64 earliest_due = std::numeric_limits<i64>::max();
+        for (auto& [bits, candidate] : timers_) {
+            (void)bits;
+            if (candidate == nullptr || candidate->cancelled) continue;
+            std::erase_if(
+                candidate->entries,
+                [this](const ScheduledEntry& scheduled) {
+                    const auto task = tasks_.find(scheduled.task.bits);
+                    return task == tasks_.end() || task->second.cancelled ||
+                           task->second.completed;
+                });
+            sort_entries(candidate->entries);
+            if (!candidate->entries.empty() &&
+                candidate->entries.front().next_time_millis < earliest_due) {
+                earliest_due = candidate->entries.front().next_time_millis;
+                timer = candidate;
             }
         }
+        if (!timer || earliest_due > now) return false;
 
-        if (!has_entry) continue;
-        auto invoked = machine_.invoke_instance(
-            entry.task,
-            "java/util/TimerTask",
-            "run",
-            "()V");
-        if (!invoked) {
-            std::scoped_lock lock(mutex_);
-            timer->cancelled = true;
-            timer->entries.clear();
-            return std::unexpected(invoked.error());
-        }
-        if (invoked->throwable.has_value()) {
-            std::scoped_lock lock(mutex_);
-            timer->cancelled = true;
-            timer->entries.clear();
-            return invoked->throwable;
-        }
-
-        if (entry.period_millis > 0 && !entry.fixed_rate) {
-            std::scoped_lock lock(mutex_);
-            const auto task = tasks_.find(entry.task.bits);
-            if (!timer->cancelled && task != tasks_.end() &&
-                !task->second.cancelled && !task->second.completed &&
-                !shutting_down_) {
-                const i64 now = current_time_millis();
-                if (now <= std::numeric_limits<i64>::max() -
-                               entry.period_millis) {
-                    entry.next_time_millis = now + entry.period_millis;
-                    timer->entries.push_back(entry);
-                    sort_entries(timer->entries);
-                    condition_.notify_all();
-                } else {
-                    task->second.completed = true;
-                }
+        entry = timer->entries.front();
+        timer->entries.erase(timer->entries.begin());
+        auto task = tasks_.find(entry.task.bits);
+        if (task == tasks_.end() || task->second.cancelled) return true;
+        task->second.scheduled_execution_time = entry.next_time_millis;
+        if (entry.period_millis == 0) {
+            task->second.completed = true;
+        } else if (entry.fixed_rate) {
+            if (entry.next_time_millis >
+                std::numeric_limits<i64>::max() - entry.period_millis) {
+                task->second.completed = true;
+            } else {
+                entry.next_time_millis += entry.period_millis;
+                timer->entries.push_back(entry);
+                sort_entries(timer->entries);
             }
         }
     }
-    return std::optional<ObjectRef> {};
+
+    auto invoked = machine_.invoke_instance(
+        entry.task, "java/util/TimerTask", "run", "()V");
+    if (!invoked || invoked->throwable.has_value()) {
+        std::scoped_lock lock(mutex_);
+        timer->cancelled = true;
+        timer->entries.clear();
+        return true;
+    }
+
+    if (entry.period_millis > 0 && !entry.fixed_rate) {
+        std::scoped_lock lock(mutex_);
+        const auto task = tasks_.find(entry.task.bits);
+        if (!timer->cancelled && task != tasks_.end() &&
+            !task->second.cancelled && !task->second.completed &&
+            !shutting_down_) {
+            const i64 now = current_time_millis();
+            if (now <= std::numeric_limits<i64>::max() - entry.period_millis) {
+                entry.next_time_millis = now + entry.period_millis;
+                timer->entries.push_back(entry);
+                sort_entries(timer->entries);
+            } else {
+                task->second.completed = true;
+            }
+        }
+    }
+    return true;
+}
+
+std::optional<std::chrono::milliseconds>
+TimerService::time_until_next_event() const noexcept {
+    std::scoped_lock lock(mutex_);
+    if (shutting_down_) return std::nullopt;
+
+    i64 earliest_due = std::numeric_limits<i64>::max();
+    for (const auto& [bits, timer] : timers_) {
+        (void)bits;
+        if (timer == nullptr || timer->cancelled) continue;
+        for (const ScheduledEntry& entry : timer->entries) {
+            const auto task = tasks_.find(entry.task.bits);
+            if (task == tasks_.end() || task->second.cancelled ||
+                task->second.completed) {
+                continue;
+            }
+            earliest_due = std::min(earliest_due, entry.next_time_millis);
+        }
+    }
+    if (earliest_due == std::numeric_limits<i64>::max()) {
+        return std::nullopt;
+    }
+    const i64 now = current_time_millis();
+    if (earliest_due <= now) return std::chrono::milliseconds::zero();
+    const i64 delta = earliest_due - now;
+    return std::chrono::milliseconds(delta);
 }
 
 void TimerService::append_reference_roots(
@@ -324,7 +303,6 @@ void TimerService::append_reference_roots(
     for (const auto& [bits, timer] : timers_) {
         (void)bits;
         if (!timer->timer.is_null()) roots.push_back(timer->timer);
-        if (!timer->thread.is_null()) roots.push_back(timer->thread);
         for (const ScheduledEntry& entry : timer->entries) {
             if (!entry.task.is_null()) roots.push_back(entry.task);
         }
@@ -337,15 +315,17 @@ void TimerService::append_reference_roots(
 }
 
 void TimerService::shutdown() noexcept {
-    std::scoped_lock lock(mutex_);
-    if (shutting_down_) return;
-    shutting_down_ = true;
-    for (auto& [bits, timer] : timers_) {
-        (void)bits;
-        timer->cancelled = true;
-        timer->entries.clear();
+    {
+        std::scoped_lock lock(mutex_);
+        if (shutting_down_) return;
+        shutting_down_ = true;
+        for (auto& [bits, timer] : timers_) {
+            (void)bits;
+            timer->cancelled = true;
+            timer->entries.clear();
+        }
     }
-    condition_.notify_all();
+    machine_.wake_emulation_event_worker();
 }
 
 } // namespace phoneme::vm

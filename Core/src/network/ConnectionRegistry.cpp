@@ -81,6 +81,9 @@ private:
 template <typename T>
 class WaitState final {
 public:
+    explicit WaitState(std::function<void()> wake_waiters = {})
+        : wake_waiters_(std::move(wake_waiters)) {}
+
     [[nodiscard]] std::optional<Result<T>> complete(Result<T> value) {
         {
             std::scoped_lock lock(mutex_);
@@ -89,6 +92,7 @@ public:
             completed_ = true;
         }
         condition_.notify_all();
+        if (wake_waiters_) wake_waiters_();
         return std::nullopt;
     }
 
@@ -119,6 +123,7 @@ public:
             operation = operation_;
         }
         condition_.notify_all();
+        if (wake_waiters_) wake_waiters_();
         if (operation.has_value() && adapter) {
             (void)adapter->cancel(*operation);
         }
@@ -176,8 +181,18 @@ public:
                         timeout - elapsed);
                 wait_slice = std::min(wait_slice, remaining);
             }
-            condition_.wait_for(lock, wait_slice,
-                                [this] { return completed_; });
+            if (hooks.cooperative_wait) {
+                lock.unlock();
+                const bool parked = hooks.cooperative_wait(wait_slice);
+                lock.lock();
+                if (!parked && !completed_) {
+                    condition_.wait_for(lock, wait_slice,
+                                        [this] { return completed_; });
+                }
+            } else {
+                condition_.wait_for(lock, wait_slice,
+                                    [this] { return completed_; });
+            }
         }
         if (!result_.has_value()) {
             return fail(ErrorCode::internal_error,
@@ -199,6 +214,7 @@ private:
     bool cancel_requested_ {false};
     std::optional<OperationId> operation_;
     std::optional<Result<T>> result_;
+    std::function<void()> wake_waiters_;
 };
 
 [[nodiscard]] std::optional<std::string> find_header(
@@ -247,7 +263,7 @@ Result<T> ConnectionRegistry::await_operation(ConnectionToken token,
                     "network adapter is not configured");
     }
 
-    auto state = std::make_shared<WaitState<T>>();
+    auto state = std::make_shared<WaitState<T>>(hooks.wake_waiters);
     const std::weak_ptr<AsyncNetworkAdapter> weak_adapter(adapter);
     auto registered = register_pending_operation(
         token, kind,

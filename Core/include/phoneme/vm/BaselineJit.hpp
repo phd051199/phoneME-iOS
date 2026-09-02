@@ -222,6 +222,7 @@ struct JitExecutionResult final {
 struct JitStatistics final {
     u64 compile_attempts {0};
     u64 compiled_methods {0};
+    u64 quick_compiled_methods {0};
     u64 executed_methods {0};
     u64 rejected_methods {0};
     u64 deoptimized_executions {0};
@@ -282,6 +283,7 @@ struct JitStatistics final {
     u64 background_compile_queue_peak {0};
     u64 background_compile_render_cooldown_waits {0};
     u64 background_compile_render_cooldown_nanoseconds {0};
+    u64 foreground_compile_deferred {0};
     u64 startup_compile_attempts {0};
     u64 startup_compiled_methods {0};
     u64 startup_compile_deferred {0};

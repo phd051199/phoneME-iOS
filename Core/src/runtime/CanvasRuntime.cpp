@@ -278,6 +278,7 @@ Status CanvasRuntime::set_host_rendering_enabled(bool enabled) {
 }
 
 void CanvasRuntime::enqueue_key(i32 key_code, bool pressed, u64 sequence) {
+    machine_.scheduler().signal_emulation_event();
     PendingInput input {
         .kind = InputKind::key,
         .first = key_code,
@@ -297,6 +298,7 @@ void CanvasRuntime::enqueue_key(i32 key_code, bool pressed, u64 sequence) {
 void CanvasRuntime::enqueue_host_key(i32 key_code,
                                      bool pressed,
                                      u64 sequence) {
+    machine_.scheduler().signal_emulation_event();
     PendingInput input {
         .kind = InputKind::host_key,
         .first = key_code,
@@ -321,6 +323,7 @@ void CanvasRuntime::enqueue_pointer(i32 x,
         (action == kPointerDragged && !pointer_motion_supported_)) {
         return;
     }
+    machine_.scheduler().signal_emulation_event();
     PendingInput input {
         .kind = InputKind::pointer,
         .first = x,
@@ -485,6 +488,9 @@ Status CanvasRuntime::set_display_visible(vm::ObjectRef displayable,
         .object = displayable,
         .visible = visible,
     });
+    if (render_hooks_.request_host_wake) {
+        render_hooks_.request_host_wake();
+    }
     return {};
 }
 
@@ -506,6 +512,9 @@ Status CanvasRuntime::request_repaint(vm::ObjectRef canvas,
         (*state)->initial_automatic_paint_pending = false;
         merge_region((*state)->repaint_region, *clipped);
         machine_.note_frame_pacing_request();
+        if (render_hooks_.request_host_wake) {
+            render_hooks_.request_host_wake();
+        }
     }
     return {};
 }

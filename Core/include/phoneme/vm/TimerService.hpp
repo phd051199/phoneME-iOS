@@ -1,10 +1,9 @@
 #pragma once
 
-#include <condition_variable>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <stop_token>
 #include <unordered_map>
 #include <vector>
 
@@ -41,6 +40,13 @@ public:
     [[nodiscard]] Result<i64> scheduled_execution_time(ObjectRef task) const;
     [[nodiscard]] TimerServiceDiagnostics diagnostics() const noexcept;
 
+    // Harrier-style shared emulation event-loop hooks. Timer owns scheduling
+    // state only; Machine owns the single native event worker used by Timer,
+    // LCDUI callSerially and MMAPI callbacks.
+    [[nodiscard]] Result<bool> dispatch_one_due();
+    [[nodiscard]] std::optional<std::chrono::milliseconds>
+    time_until_next_event() const noexcept;
+
     void append_reference_roots(std::vector<ObjectRef>& roots) const;
     void shutdown() noexcept;
 
@@ -55,7 +61,6 @@ private:
 
     struct TimerState final {
         ObjectRef timer;
-        ObjectRef thread;
         bool daemon {false};
         bool cancelled {false};
         std::vector<ScheduledEntry> entries;
@@ -70,15 +75,11 @@ private:
         u64 owner_timer_bits {0};
     };
 
-    [[nodiscard]] Result<std::optional<ObjectRef>> run_timer(
-        const std::shared_ptr<TimerState>& timer,
-        std::stop_token stop_token);
     [[nodiscard]] static i64 current_time_millis() noexcept;
     static void sort_entries(std::vector<ScheduledEntry>& entries);
 
     Machine& machine_;
     mutable std::mutex mutex_;
-    std::condition_variable_any condition_;
     std::unordered_map<u64, std::shared_ptr<TimerState>> timers_;
     std::unordered_map<u64, TaskState> tasks_;
     u64 next_sequence_ {1};

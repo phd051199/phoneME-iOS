@@ -703,6 +703,42 @@ void test_execution_context_root_exchange() {
     published.clear();
     context.append_reference_roots(published);
     require(published.empty(), "execution root clear removes exchanged roots");
+
+    struct WalkerState final {
+        std::array<ObjectRef, 2U> roots;
+        int calls {0};
+    } walker_state {
+        .roots = {
+            ObjectRef::make(13U, 14U),
+            ObjectRef::make(15U, 16U),
+        },
+    };
+    const auto walker = +[](void* opaque,
+                            std::vector<ObjectRef>& roots) noexcept {
+        auto* state = static_cast<WalkerState*>(opaque);
+        ++state->calls;
+        roots.insert(roots.end(), state->roots.begin(), state->roots.end());
+    };
+    context.publish_roots(3U, previous);
+    context.set_root_walker(3U, &walker_state, walker, true);
+    published.clear();
+    context.append_reference_roots(published);
+    require(walker_state.calls == 1 && published.size() == 2U &&
+                published[0] == walker_state.roots[0] &&
+                published[1] == walker_state.roots[1],
+            "execution root walker exposes live roots without retaining the old publication");
+
+    context.clear_published_roots(3U);
+    published.clear();
+    context.append_reference_roots(published);
+    require(walker_state.calls == 2 && published.size() == 2U,
+            "clearing published roots preserves an installed live root walker");
+
+    context.clear_roots(3U);
+    published.clear();
+    context.append_reference_roots(published);
+    require(published.empty(),
+            "clearing execution roots unregisters the live root walker");
 }
 
 void test_descriptors_and_slots() {

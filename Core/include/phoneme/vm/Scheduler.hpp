@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "phoneme/vm/JavaThread.hpp"
+#include "phoneme/vm/Heap.hpp"
 
 namespace phoneme::vm {
 
@@ -74,6 +75,10 @@ public:
     }
     void configure_frame_pacing(i32 frames_per_second,
                                 FramePacingMode mode) noexcept;
+    // Harrier/JarlyME-style emulation-turn wakeup. Host input, repaint and
+    // other latency-sensitive events call this to cancel any frame remainder
+    // sleep immediately instead of waiting for the next display deadline.
+    void signal_emulation_event() noexcept;
     void pace_current_frame_publication(Machine& machine);
     void note_current_frame_boundary() noexcept;
     void note_current_frame_request() noexcept;
@@ -103,6 +108,12 @@ public:
     std::span<const ObjectRef> exchange_current_roots(
         u32 invocation_depth,
         std::vector<ObjectRef>& roots);
+    void set_current_root_walker(
+        u32 invocation_depth,
+        void* context,
+        ExecutionContext::RootWalker walker,
+        bool clear_published_roots = false);
+    void clear_current_published_roots(u32 invocation_depth) noexcept;
     void clear_current_roots(u32 invocation_depth) noexcept;
     void set_current_pending_exception(
         std::optional<ObjectRef> throwable) noexcept;
@@ -114,6 +125,13 @@ public:
     [[nodiscard]] bool deterministic() const noexcept;
 
     void wake_thread(JavaThreadId thread_id) noexcept;
+    [[nodiscard]] bool current_is_fiber() const noexcept;
+    void park_current_fiber(
+        JavaThreadState state,
+        std::optional<std::chrono::steady_clock::time_point> deadline =
+            std::nullopt);
+    void yield_current_fiber();
+    void wake_fibers(JavaThreadState state) noexcept;
     void shutdown(MonitorTable* monitors = nullptr) noexcept;
 
 private:
@@ -124,6 +142,13 @@ private:
                        std::optional<ObjectRef> throwable,
                        std::optional<Error> failure) noexcept;
     void prune_terminated_native_threads();
+    [[nodiscard]] bool ensure_fiber_carrier(Machine& machine);
+    void fiber_carrier_loop(Machine& machine,
+                            std::stop_token stop_token) noexcept;
+    void enqueue_fiber(JavaThreadId thread_id) noexcept;
+    void wake_fiber(JavaThreadId thread_id) noexcept;
+    void wake_all_fibers_for_shutdown() noexcept;
+    [[nodiscard]] bool has_live_fibers() const noexcept;
     void reset_current_frame_pacing_state() noexcept;
     void synchronize_current_frame_pacing_state() noexcept;
     void update_queue_membership_locked(JavaThreadId id,
@@ -149,6 +174,64 @@ private:
     };
     std::atomic<u64> frame_pacing_generation_ {1U};
     std::atomic<u64> host_foreground_generation_ {1U};
+    // Physical-iOS global emulation turn gate. Unlike the per-thread pacing
+    // state below, this deadline applies to every guest worker sharing the VM,
+    // matching Harrier's single emulation clock: once a frame finishes early,
+    // all guest execution idles for the unused frame budget unless an event
+    // explicitly wakes the emulation loop.
+    std::atomic<i64> emulation_frame_deadline_nanoseconds_ {0};
+    std::atomic<i64> emulation_last_frame_nanoseconds_ {0};
+    std::atomic<u64> emulation_event_generation_ {1U};
+
+    enum class FiberRunState : u8 {
+        runnable,
+        running,
+        parked,
+        finished,
+    };
+
+    struct FiberControl final {
+        FiberRunState state {FiberRunState::runnable};
+        JavaThreadState park_state {JavaThreadState::runnable};
+        std::optional<std::chrono::steady_clock::time_point> deadline;
+        bool queued {false};
+    };
+
+    struct FiberTlsState final {
+        u32 unblocked_quantum_count {0U};
+        u64 unblocked_active_microseconds {0U};
+        u64 host_foreground_generation {0U};
+        std::chrono::steady_clock::time_point quantum_resume_time {};
+        bool quantum_timing_valid {false};
+        u32 unpaced_execution_depth {0U};
+        bool frame_boundary_pending {false};
+        u32 frame_pacing_streak {0U};
+        i64 frame_interval_sample_nanoseconds {0};
+        bool frame_loop_wake_valid {false};
+        bool frame_cap_deadline_valid {false};
+        bool native_frame_boundary_valid {false};
+        bool native_backpressure_active {false};
+        bool pressure_frame_boundary_valid {false};
+        u32 native_fast_frame_streak {0U};
+        u64 frame_pacing_generation {0U};
+        std::chrono::steady_clock::time_point frame_loop_wake_time {};
+        std::chrono::steady_clock::time_point frame_cap_deadline {};
+        std::chrono::steady_clock::time_point frame_boundary_time {};
+        std::chrono::steady_clock::time_point native_frame_boundary_time {};
+        std::chrono::steady_clock::time_point pressure_frame_boundary_time {};
+        HeapAccessContext heap_access_context {};
+    };
+
+    void save_fiber_tls_state(JavaThreadId thread_id) noexcept;
+    void restore_fiber_tls_state(JavaThreadId thread_id) noexcept;
+
+    mutable std::mutex fiber_mutex_;
+    std::condition_variable fiber_condition_;
+    std::unordered_map<JavaThreadId, FiberControl> fiber_controls_;
+    std::unordered_map<JavaThreadId, FiberTlsState> fiber_tls_states_;
+    std::deque<JavaThreadId> fiber_runnable_queue_;
+    JavaWorkerThread fiber_carrier_;
+    bool fiber_carrier_started_ {false};
 
     static thread_local Scheduler* tls_scheduler_;
     static thread_local JavaThreadId tls_thread_id_;

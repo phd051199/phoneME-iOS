@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -319,14 +320,14 @@ ObjectAllocationProfiler& object_allocation_profiler() {
     return fail(ErrorCode::invalid_state, "unknown Java array kind");
 }
 
-[[nodiscard]] std::string reference_array_component(
+[[nodiscard]] std::string_view reference_array_component(
     std::string_view class_name) {
     if (class_name.starts_with("[L") && class_name.ends_with(';') &&
         class_name.size() >= 4U) {
-        return std::string(class_name.substr(2U, class_name.size() - 3U));
+        return class_name.substr(2U, class_name.size() - 3U);
     }
     if (class_name.starts_with("[[")) {
-        return std::string(class_name.substr(1U));
+        return class_name.substr(1U);
     }
     return {};
 }
@@ -601,6 +602,23 @@ Heap::Heap(HeapLimits limits) : limits_(limits) {
     update_automatic_collection_threshold_unlocked();
 }
 
+std::string_view Heap::intern_class_name(std::string_view class_name) {
+    const usize cache_index =
+        std::hash<std::string_view>{}(class_name) & (kClassNameCacheSize - 1U);
+    const std::string* cached =
+        class_name_cache_[cache_index].load(std::memory_order_acquire);
+    if (cached != nullptr && *cached == class_name) {
+        return *cached;
+    }
+
+    std::scoped_lock lock(class_names_mutex_);
+    const auto [iterator, inserted] = class_names_.emplace(class_name);
+    (void)inserted;
+    const std::string* interned = &*iterator;
+    class_name_cache_[cache_index].store(interned, std::memory_order_release);
+    return *interned;
+}
+
 Result<ObjectRef> Heap::allocate_object(std::string class_name,
                                         usize field_count) {
     return allocate_object_with_fields(
@@ -642,7 +660,7 @@ Result<ObjectRef> Heap::allocate_object_with_fields(
 #endif
 
     Object object {
-        .class_name = std::move(class_name),
+        .class_name = intern_class_name(class_name),
         .fields = compact_fields(fields),
         .array_payload = {},
         .string_payload = {},
@@ -693,7 +711,7 @@ Result<ObjectRef> Heap::allocate_text_object(
 #endif
 
     Object object {
-        .class_name = std::move(class_name),
+        .class_name = intern_class_name(class_name),
         .fields = compact_fields(initial_fields),
         .array_payload = {},
         .string_payload = std::move(text),
@@ -765,7 +783,7 @@ Result<ObjectRef> Heap::allocate_array(std::string class_name,
         }
     }
     Object object {
-        .class_name = std::move(class_name),
+        .class_name = intern_class_name(class_name),
         .fields = {},
         .array_payload = std::move(payload),
         .array_length = length,
@@ -923,7 +941,7 @@ Result<ObjectRef> Heap::vm_allocate_object(
 #endif
 
     Object object {
-        .class_name = std::string(class_name),
+        .class_name = intern_class_name(class_name),
         .fields = compact_fields(initial_fields),
         .array_payload = {},
         .array_length = 0U,
@@ -987,7 +1005,7 @@ Result<ObjectRef> Heap::vm_allocate_array(std::string_view class_name,
         }
     }
     Object object {
-        .class_name = std::string(class_name),
+        .class_name = intern_class_name(class_name),
         .fields = {},
         .array_payload = std::move(payload),
         .array_length = length,
@@ -1940,7 +1958,7 @@ Result<std::string> Heap::class_name(ObjectRef reference) const {
     if (!slot) {
         return heap_access_error(slot.error(), "Heap.class_name", reference);
     }
-    return slots_[*slot].object.class_name;
+    return std::string(slots_[*slot].object.class_name);
 }
 
 Result<std::string_view> Heap::vm_class_name_view(ObjectRef reference) const {
@@ -1950,7 +1968,7 @@ Result<std::string_view> Heap::vm_class_name_view(ObjectRef reference) const {
         return heap_access_error(
             slot.error(), "Heap.vm_class_name_view", reference);
     }
-    return std::string_view(slots_[*slot].object.class_name);
+    return slots_[*slot].object.class_name;
 }
 
 Status Heap::attach_string(ObjectRef reference, std::u16string value) {
@@ -2345,6 +2363,67 @@ Result<i32> Heap::vm_string_index_of(ObjectRef reference,
                     "Java text character position exceeds int range");
     }
     return static_cast<i32>(position);
+}
+
+Result<bool> Heap::vm_string_starts_with(ObjectRef reference,
+                                         ObjectRef prefix,
+                                         usize offset) const {
+    PerformanceCounters::record_vm_fast_heap_operation();
+    auto text_slot = resolve_slot_vm_fast(reference);
+    if (!text_slot) {
+        return heap_access_error(text_slot.error(),
+                                 "Heap.vm_string_starts_with",
+                                 reference);
+    }
+    const Object& text = slots_[*text_slot].object;
+    if (!text.is_string || text.class_name != "java/lang/String") {
+        return fail(ErrorCode::invalid_state,
+                    "String.startsWith receiver is not a Java String");
+    }
+
+    auto prefix_slot = resolve_slot_vm_fast(prefix);
+    if (!prefix_slot) {
+        return heap_access_error(prefix_slot.error(),
+                                 "Heap.vm_string_starts_with",
+                                 prefix);
+    }
+    const Object& prefix_object = slots_[*prefix_slot].object;
+    if (!prefix_object.is_string ||
+        prefix_object.class_name != "java/lang/String") {
+        return fail(ErrorCode::invalid_state,
+                    "String.startsWith prefix is not a Java String");
+    }
+    if (offset > text.string_payload.size() ||
+        prefix_object.string_payload.size() >
+            text.string_payload.size() - offset) {
+        return false;
+    }
+    return std::equal(prefix_object.string_payload.begin(),
+                      prefix_object.string_payload.end(),
+                      text.string_payload.begin() +
+                          static_cast<std::ptrdiff_t>(offset));
+}
+
+Result<std::u16string> Heap::vm_string_slice(ObjectRef reference,
+                                             usize begin,
+                                             usize end) const {
+    PerformanceCounters::record_vm_fast_heap_operation();
+    auto slot = resolve_slot_vm_fast(reference);
+    if (!slot) {
+        return heap_access_error(slot.error(),
+                                 "Heap.vm_string_slice",
+                                 reference);
+    }
+    const Object& object = slots_[*slot].object;
+    if (!object.is_string || object.class_name != "java/lang/String") {
+        return fail(ErrorCode::invalid_state,
+                    "String.substring receiver is not a Java String");
+    }
+    if (begin > end || end > object.string_payload.size()) {
+        return fail(ErrorCode::out_of_range,
+                    "String substring range is outside the Java text payload");
+    }
+    return object.string_payload.substr(begin, end - begin);
 }
 
 Result<bool> Heap::vm_string_equals(ObjectRef left, ObjectRef right) const {
@@ -2811,10 +2890,6 @@ Result<usize> Heap::estimate_object_bytes(std::string_view class_name,
                                           usize field_count,
                                           usize element_count,
                                           usize text_length) noexcept {
-    auto class_bytes = checked_add(class_name.size(), 1U);
-    if (!class_bytes) {
-        return std::unexpected(class_bytes.error());
-    }
     auto field_bytes = checked_multiply(
         compact_field_word_count(field_count), sizeof(u64));
     if (!field_bytes) {
@@ -2833,11 +2908,8 @@ Result<usize> Heap::estimate_object_bytes(std::string_view class_name,
         return std::unexpected(text_bytes.error());
     }
 
-    auto total = checked_add(sizeof(Object), *class_bytes);
-    if (!total) {
-        return std::unexpected(total.error());
-    }
-    total = checked_add(*total, *field_bytes);
+    // Class-name bytes are shared interned metadata, not per-object payload.
+    auto total = checked_add(sizeof(Object), *field_bytes);
     if (!total) {
         return std::unexpected(total.error());
     }

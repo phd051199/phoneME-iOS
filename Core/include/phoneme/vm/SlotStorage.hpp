@@ -16,7 +16,13 @@ namespace phoneme::vm {
 // several malloc/free pairs for every interpreted Java call. Large/obfuscated
 // methods transparently fall back to the original vector-backed storage.
 inline constexpr usize kInlineFrameSlotCapacity = 16U;
-inline constexpr usize kInlineInvocationArgumentCapacity = 8U;
+// Real MIDlets frequently route rendering, media and helper calls through
+// methods with 9-13 arguments. An 8-value inline bank therefore spilled tens
+// of thousands of times during a short NinjaSchool run, paying for two host
+// vector allocations on the Java call path. Keep a Harrier-style 16-value
+// bank instead: it covers the observed J2ME call shapes while remaining small
+// enough to live comfortably in the transient Invocation object.
+inline constexpr usize kInlineInvocationArgumentCapacity = 16U;
 
 static_assert(sizeof(ValueKind) == 1U,
               "compact slot storage requires a byte-sized ValueKind");

@@ -34,11 +34,13 @@ struct CanvasRenderHooks final {
         vm::Machine&, vm::ObjectRef, Dimensions)>;
     using FlushGameGraphics = std::function<Status(
         vm::Machine&, vm::ObjectRef, vm::ObjectRef, vm::CanvasRect)>;
+    using RequestHostWake = std::function<void()>;
 
     AcquirePaintGraphics acquire_paint_graphics;
     CommitPaint commit_paint;
     AcquireGameGraphics acquire_game_graphics;
     FlushGameGraphics flush_game_graphics;
+    RequestHostWake request_host_wake;
 };
 
 class CanvasRuntime final : public vm::CanvasBridge {

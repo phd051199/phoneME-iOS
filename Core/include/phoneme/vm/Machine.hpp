@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -147,6 +148,8 @@ namespace phoneme::vm
     void shutdown() noexcept;
 
   private:
+    friend class TimerService;
+    friend class MediaEventService;
     void dump_performance_summary_if_requested() noexcept;
 
   public:
@@ -179,6 +182,16 @@ namespace phoneme::vm
     // generic InputStream path; Java EOF/invalid-state errors are preserved.
     [[nodiscard]] Result<std::optional<u64>>
     try_read_byte_array_input_bits(ObjectRef input, usize byte_count);
+    [[nodiscard]] Result<std::optional<i32>> try_byte_array_input_read(
+        ObjectRef input,
+        ObjectRef destination,
+        i32 offset,
+        i32 length);
+    [[nodiscard]] Result<std::optional<i64>> try_byte_array_input_skip(
+        ObjectRef input,
+        i64 requested);
+    [[nodiscard]] Result<std::optional<i32>> try_byte_array_input_available(
+        ObjectRef input);
     [[nodiscard]] ClassStateRegistry &class_states() noexcept { return states_; }
     [[nodiscard]] ClassRepository &classes() noexcept { return classes_; }
     [[nodiscard]] NativeMethodRegistry &natives() noexcept { return natives_; }
@@ -309,6 +322,12 @@ namespace phoneme::vm
     // between calls is safe; each caller still gets a fresh stream object.
     [[nodiscard]] Result<ObjectRef> cached_resource_byte_array(
         std::string_view resource_name);
+    [[nodiscard]] std::optional<std::string> cached_resource_path(
+        ObjectRef mirror,
+        std::string_view resource_name) const;
+    void cache_resource_path(ObjectRef mirror,
+                             std::string resource_name,
+                             std::string path);
     void append_console(std::u16string_view text);
     [[nodiscard]] const std::u16string& console_output() const noexcept {
       return console_output_;
@@ -648,8 +667,13 @@ namespace phoneme::vm
       std::vector<ObjectRef> published_roots;
       std::span<const ObjectRef> published_root_view;
       std::span<const u64> frame_root_bits;
-      const u64* staged_frame_base{nullptr};
-      std::span<const u32> staged_root_offsets;
+      // Deferred JIT publication must never retain a raw pointer into a
+      // generated native frame. Fast JIT-to-JIT calls can nest runtime
+      // dispatch deeply enough that a later commit observes a stale frame
+      // address. Snapshot the exact reference values synchronously while the
+      // publishing frame is unquestionably live, then carry only owned roots
+      // across the nested call.
+      std::vector<ObjectRef> staged_roots;
       bool roots_staged{false};
       std::optional<ObjectRef> pending_throwable;
       u64 nested_instructions{0U};
@@ -672,6 +696,11 @@ namespace phoneme::vm
     };
 
     [[nodiscard]] Status initialize_system_streams();
+    [[nodiscard]] Status ensure_emulation_event_worker();
+    [[nodiscard]] Result<std::optional<ObjectRef>>
+    run_emulation_event_worker(std::stop_token stop_token);
+    void wake_emulation_event_worker() noexcept;
+    [[nodiscard]] bool dispatch_one_serial_callback();
     [[nodiscard]] Result<ExecutionResult> execute(
         Invocation invocation,
         u64 instruction_budget,
@@ -802,6 +831,12 @@ namespace phoneme::vm
     std::span<const ObjectRef> exchange_execution_roots(
         u32 invocation_depth,
         std::vector<ObjectRef>& roots);
+    void set_execution_root_walker(
+        u32 invocation_depth,
+        void* context,
+        ExecutionContext::RootWalker walker,
+        bool clear_published_roots = false);
+    void clear_execution_published_roots(u32 invocation_depth) noexcept;
     void clear_execution_roots(u32 invocation_depth) noexcept;
     [[nodiscard]] Result<LambdaBinding> resolve_lambda_binding(
         const classfile::ClassFile &owner,
@@ -862,10 +897,24 @@ namespace phoneme::vm
     // ponytail: byte[] still stores 16-byte Values, so the heap cost is 16x
     // the payload budget; track payload bytes when arrays get raw storage.
     static constexpr u64 kResourceArrayCachePayloadLimit = 8ULL * 1024ULL * 1024ULL;
-    std::unordered_map<std::string, ObjectRef> resource_array_cache_;
+    std::unordered_map<std::string,
+                       ObjectRef,
+                       TransparentStringHash,
+                       TransparentStringEqual> resource_array_cache_;
+    std::unordered_map<std::string,
+                       std::string,
+                       TransparentStringHash,
+                       TransparentStringEqual> resource_path_cache_;
     std::deque<std::string> resource_array_cache_order_;
     u64 resource_array_cache_payload_bytes_ {0};
-    std::unordered_map<std::string, ObjectRef> class_mirrors_;
+    std::unordered_map<std::string,
+                       ObjectRef,
+                       TransparentStringHash,
+                       TransparentStringEqual> class_mirrors_;
+    // Reverse lookup for java/lang/Class mirrors.  Resource APIs ask for the
+    // represented class on every call; scanning the name->mirror table made a
+    // common getResourceAsStream path O(number of loaded classes).
+    std::unordered_map<u64, std::string> class_mirror_names_;
     std::unordered_map<i32, ObjectRef> ui_components_;
     std::unordered_map<u64, LambdaBinding> lambda_bindings_;
     u64 metadata_binding_generation_ {0U};
@@ -903,6 +952,13 @@ namespace phoneme::vm
         virtual_call_bindings_;
     RootSet native_roots_;
     mutable std::mutex serial_callbacks_mutex_;
+    // One Harrier-style emulation event-loop condition multiplexes LCDUI,
+    // java.util.Timer and MMAPI listener work. The serial queue keeps its own
+    // mutex because NativeRootScope ownership still needs independent GC-safe
+    // synchronization.
+    std::condition_variable_any emulation_events_condition_;
+    mutable std::mutex emulation_events_mutex_;
+    u64 emulation_event_generation_ {0U};
     std::deque<NativeRootScope> serial_callbacks_;
     bool serial_callback_coalescing_ {false};
     mutable std::mutex lcd_ui_alert_timeout_mutex_;
@@ -931,7 +987,11 @@ namespace phoneme::vm
     MediaEventService media_events_;
     // Appended to preserve the established layout of every pre-existing
     // Machine member for mixed-object compatibility validation builds.
-    bool serial_callback_worker_running_ {false};
+    bool emulation_event_worker_running_ {false};
+    bool emulation_event_worker_started_ {false};
+    bool emulation_event_worker_starting_ {false};
+    ObjectRef emulation_event_worker_thread_ {};
+    bool serial_callback_dispatch_running_ {false};
     std::optional<Error> serial_callback_failure_;
     MethodId operand_resolution_method_id_ {};
     std::shared_ptr<const RuntimeMethod> operand_resolution_method_;

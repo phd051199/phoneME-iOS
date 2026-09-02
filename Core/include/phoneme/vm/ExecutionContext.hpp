@@ -12,6 +12,9 @@ namespace phoneme::vm {
 
 class ExecutionContext final {
 public:
+    using RootWalker =
+        void (*)(void* context, std::vector<ObjectRef>& roots) noexcept;
+
     explicit ExecutionContext(JavaThreadId thread_id) noexcept
         : thread_id_(thread_id) {}
 
@@ -24,6 +27,11 @@ public:
     std::span<const ObjectRef> exchange_roots(
         u32 invocation_depth,
         std::vector<ObjectRef>& roots);
+    void set_root_walker(u32 invocation_depth,
+                         void* context,
+                         RootWalker walker,
+                         bool clear_published_roots = false);
+    void clear_published_roots(u32 invocation_depth) noexcept;
     void clear_roots(u32 invocation_depth) noexcept;
     void append_reference_roots(std::vector<ObjectRef>& roots) const;
 
@@ -34,9 +42,22 @@ public:
     [[nodiscard]] u64 executed_instructions() const noexcept;
 
 private:
+    struct DepthRoots final {
+        std::vector<ObjectRef> published;
+        void* walker_context {nullptr};
+        RootWalker walker {nullptr};
+    };
+
+    [[nodiscard]] DepthRoots& depth_roots(u32 invocation_depth);
+
     JavaThreadId thread_id_ {0};
     mutable std::mutex mutex_;
-    std::unordered_map<u32, std::vector<ObjectRef>> roots_by_depth_;
+    // Invocation depth is dense and normally tiny. A flat vector avoids the
+    // hash lookup/allocation that used to sit on every Java/JIT safepoint.
+    // Each depth can also expose a live stack walker. Interpreter frames then
+    // remain precise GC roots without flattening/copying them into a vector on
+    // every cooperative yield; they are walked only when GC actually asks.
+    std::vector<DepthRoots> roots_by_depth_;
     std::optional<ObjectRef> pending_exception_;
     u64 executed_instructions_ {0};
 };

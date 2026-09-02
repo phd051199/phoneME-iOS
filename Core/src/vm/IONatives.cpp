@@ -496,6 +496,11 @@ struct ByteOutputState final {
                                                  ObjectRef destination,
                                                  i32 offset,
                                                  i32 length) {
+    auto fast = machine.try_byte_array_input_read(
+        stream, destination, offset, length);
+    if (!fast) return std::unexpected(fast.error());
+    if (fast->has_value()) return **fast;
+
     auto state = byte_input_state(machine, stream);
     if (!state) return std::unexpected(state.error());
     const i32 available = state->count - state->position;
@@ -674,6 +679,9 @@ struct ByteOutputState final {
         *runtime_class, "java/io/ByteArrayInputStream");
     if (!byte_array) return std::unexpected(byte_array.error());
     if (*byte_array) {
+        auto fast = machine.try_byte_array_input_skip(stream, requested);
+        if (!fast) return std::unexpected(fast.error());
+        if (fast->has_value()) return **fast;
         auto state = byte_input_state(machine, stream);
         if (!state) return std::unexpected(state.error());
         const i64 available =
@@ -735,6 +743,9 @@ struct ByteOutputState final {
         *runtime_class, "java/io/ByteArrayInputStream");
     if (!byte_array) return std::unexpected(byte_array.error());
     if (*byte_array) {
+        auto fast = machine.try_byte_array_input_available(stream);
+        if (!fast) return std::unexpected(fast.error());
+        if (fast->has_value()) return **fast;
         auto state = byte_input_state(machine, stream);
         if (!state) return std::unexpected(state.error());
         return state->count - state->position;

@@ -1263,9 +1263,9 @@ struct FrameSurface: View {
 
     var body: some View {
         GeometryReader { geometry in
-            if let frame = frameStore.frame {
+            if let frameSize = frameStore.frameSize {
                 let rect = FrameLayout.renderedFrameRect(
-                    frame: frame,
+                    frameSize: frameSize,
                     availableSize: geometry.size,
                     profile: profile,
                     strictFit: fitsEntireFrame,
@@ -1273,7 +1273,7 @@ struct FrameSurface: View {
                 )
 
                 ZStack(alignment: .topLeading) {
-                    renderedFrame(frame)
+                    renderedFrame()
                         .frame(
                             width: max(rect.width, 0),
                             height: max(rect.height, 0)
@@ -1300,7 +1300,7 @@ struct FrameSurface: View {
                 .clipped()
                 .contentShape(Rectangle())
                 .gesture(pointerGesture(
-                    frame: frame,
+                    frameSize: frameSize,
                     availableSize: geometry.size
                 ))
             }
@@ -1309,14 +1309,15 @@ struct FrameSurface: View {
     }
 
     @ViewBuilder
-    private func renderedFrame(_ frame: PhoneMEFrame) -> some View {
+    private func renderedFrame() -> some View {
 #if canImport(UIKit)
         PhoneMEFrameLayerView(
-            frame: frame,
+            frameStore: frameStore,
             filtering: forcesNearestNeighborFit ? false : profile.filtering
         )
 #else
-        if let image = frame.image ?? frame.makeCGImage() {
+        if let frame = frameStore.frame,
+           let image = frame.image ?? frame.makeCGImage() {
             Image(decorative: image, scale: 1, orientation: .up)
                 .resizable()
                 .interpolation(profile.filtering ? .high : .none)
@@ -1325,7 +1326,7 @@ struct FrameSurface: View {
     }
 
     private func pointerGesture(
-        frame: PhoneMEFrame,
+        frameSize: CGSize,
         availableSize: CGSize
     ) -> some Gesture {
         DragGesture(minimumDistance: 0, coordinateSpace: .local)
@@ -1334,7 +1335,7 @@ struct FrameSurface: View {
                 let action: Int32 = pointerIsDown ? 3 : 1
                 guard let point = pointerPoint(
                     value.location,
-                    frame: frame,
+                    frameSize: frameSize,
                     availableSize: availableSize,
                     clampOutside: pointerIsDown
                 ) else {
@@ -1350,7 +1351,7 @@ struct FrameSurface: View {
                       pointerIsDown,
                       let point = pointerPoint(
                         value.location,
-                        frame: frame,
+                        frameSize: frameSize,
                         availableSize: availableSize,
                         clampOutside: true
                       ) else {
@@ -1363,12 +1364,12 @@ struct FrameSurface: View {
 
     private func pointerPoint(
         _ location: CGPoint,
-        frame: PhoneMEFrame,
+        frameSize: CGSize,
         availableSize: CGSize,
         clampOutside: Bool
     ) -> (x: Int32, y: Int32)? {
         let rect = FrameLayout.renderedFrameRect(
-            frame: frame,
+            frameSize: frameSize,
             availableSize: availableSize,
             profile: profile,
             strictFit: fitsEntireFrame,
@@ -1381,8 +1382,10 @@ struct FrameSurface: View {
         let clampedY = min(max(location.y, rect.minY), rect.maxY)
         let normalizedX = (clampedX - rect.minX) / rect.width
         let normalizedY = (clampedY - rect.minY) / rect.height
-        let x = min(max(Int(normalizedX * CGFloat(frame.width)), 0), frame.width - 1)
-        let y = min(max(Int(normalizedY * CGFloat(frame.height)), 0), frame.height - 1)
+        let frameWidth = max(Int(frameSize.width.rounded()), 1)
+        let frameHeight = max(Int(frameSize.height.rounded()), 1)
+        let x = min(max(Int(normalizedX * CGFloat(frameWidth)), 0), frameWidth - 1)
+        let y = min(max(Int(normalizedY * CGFloat(frameHeight)), 0), frameHeight - 1)
         return (Int32(x), Int32(y))
     }
 
@@ -1427,7 +1430,7 @@ private enum FrameLayout {
         )
     }
 
-    private static func renderedFrameRect(
+    static func renderedFrameRect(
         frameSize: CGSize,
         availableSize: CGSize,
         profile: GameProfile,
@@ -1542,13 +1545,18 @@ private enum FrameLayout {
 }
 
 #if canImport(UIKit)
+@MainActor
 private struct PhoneMEFrameLayerView: UIViewRepresentable {
-    let frame: PhoneMEFrame
+    let frameStore: EmulatorFrameStore
     let filtering: Bool
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(frameStore: frameStore)
+    }
 
     func makeUIView(context: Context) -> PhoneMEFrameLayerHostView {
         let view = PhoneMEFrameLayerHostView()
-        view.update(frame: frame, filtering: filtering)
+        context.coordinator.attach(view: view, filtering: filtering)
         return view
     }
 
@@ -1556,14 +1564,81 @@ private struct PhoneMEFrameLayerView: UIViewRepresentable {
         _ uiView: PhoneMEFrameLayerHostView,
         context: Context
     ) {
-        uiView.update(frame: frame, filtering: filtering)
+        context.coordinator.update(
+            frameStore: frameStore,
+            filtering: filtering
+        )
     }
 
     static func dismantleUIView(
         _ uiView: PhoneMEFrameLayerHostView,
-        coordinator: Void
+        coordinator: Coordinator
     ) {
+        coordinator.detach()
         uiView.clearFrame()
+    }
+
+    @MainActor
+    final class Coordinator {
+        private var frameStore: EmulatorFrameStore
+        private weak var view: PhoneMEFrameLayerHostView?
+        private var observerIdentifier: UUID?
+        private var filtering = false
+
+        init(frameStore: EmulatorFrameStore) {
+            self.frameStore = frameStore
+        }
+
+        func attach(view: PhoneMEFrameLayerHostView, filtering: Bool) {
+            stopObserving()
+            self.view = view
+            self.filtering = filtering
+            startObserving()
+        }
+
+        func update(
+            frameStore: EmulatorFrameStore,
+            filtering: Bool
+        ) {
+            let filteringChanged = self.filtering != filtering
+            self.filtering = filtering
+            if self.frameStore !== frameStore {
+                stopObserving()
+                self.frameStore = frameStore
+                startObserving()
+                return
+            }
+            if filteringChanged {
+                present(frameStore.frame)
+            }
+        }
+
+        func detach() {
+            stopObserving()
+            view = nil
+        }
+
+        private func startObserving() {
+            observerIdentifier = frameStore.observeFrames { [weak self] frame in
+                self?.present(frame)
+            }
+        }
+
+        private func stopObserving() {
+            if let observerIdentifier {
+                frameStore.removeFrameObserver(observerIdentifier)
+            }
+            observerIdentifier = nil
+        }
+
+        private func present(_ frame: PhoneMEFrame?) {
+            guard let view else { return }
+            if let frame {
+                view.update(frame: frame, filtering: filtering)
+            } else {
+                view.clearFrame()
+            }
+        }
     }
 }
 
@@ -1723,6 +1798,8 @@ private final class PhoneMEHardwareKeyboardHostView: UIView {
 }
 
 private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
+    private static let idleDrawablePixelsPerPoint: CGFloat = 1.0
+
     private static let shaderSource = """
     #include <metal_stdlib>
     using namespace metal;
@@ -1782,6 +1859,7 @@ private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
     private var linearSampler: MTLSamplerState?
     private var frameTexture: MTLTexture?
     private var currentFrame: PhoneMEFrame?
+    private var sourceFrameSize: CGSize?
     private var usesLinearFiltering = false
 
     override init(frame: CGRect, device: MTLDevice?) {
@@ -1800,10 +1878,29 @@ private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
     override func layoutSubviews() {
         super.layoutSubviews()
         fallbackLayer.frame = bounds
+        updateLowPowerDrawableSize()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        guard window != nil else { return }
+        // UIKit may refresh a view's backing scale when it moves between
+        // windows/screens. Reassert the intentionally low-resolution Metal
+        // presentation surface instead of silently returning to Retina-sized
+        // drawables.
+        contentScaleFactor = Self.idleDrawablePixelsPerPoint
+        updateLowPowerDrawableSize()
     }
 
     func update(frame: PhoneMEFrame, filtering: Bool) {
+        let nextSourceSize = CGSize(width: frame.width, height: frame.height)
+        if sourceFrameSize != nextSourceSize {
+            sourceFrameSize = nextSourceSize
+            updateLowPowerDrawableSize()
+        }
         usesLinearFiltering = filtering
+        layer.magnificationFilter = filtering ? .linear : .nearest
+        layer.minificationFilter = filtering ? .linear : .nearest
         installRendererResourcesIfAvailable()
 #if canImport(Metal)
         if let texture = frame.metalTexture,
@@ -1835,6 +1932,7 @@ private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
     func clearFrame() {
         currentFrame = nil
         frameTexture = nil
+        sourceFrameSize = nil
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         fallbackLayer.contents = nil
@@ -1879,9 +1977,20 @@ private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
         isOpaque = true
         isUserInteractionEnabled = false
         backgroundColor = .black
+        // The guest framebuffer is usually 240x320-640x360. Rendering the
+        // fullscreen presentation pass at 2x/3x Retina density only shades the
+        // same low-resolution texels several times and raises GPU/package
+        // power. Once a guest frame is known, updateLowPowerDrawableSize()
+        // limits the drawable to the smaller of the source framebuffer and the
+        // physical pixels the view can actually show. Core Animation performs
+        // any remaining display-density scaling.
+        contentScaleFactor = Self.idleDrawablePixelsPerPoint
         colorPixelFormat = .bgra8Unorm
         framebufferOnly = true
-        autoResizeDrawable = true
+        // MTKView's automatic path derives drawableSize from the native screen
+        // pixel density. Manage it ourselves so the low-power scale remains
+        // deterministic across layout/window changes.
+        autoResizeDrawable = false
         enableSetNeedsDisplay = true
         isPaused = true
         preferredFramesPerSecond = 60
@@ -1894,6 +2003,37 @@ private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
         layer.addSublayer(fallbackLayer)
 
         installRendererResourcesIfAvailable()
+    }
+
+    private func updateLowPowerDrawableSize() {
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        let physicalScale = max(window?.screen.scale ?? 1, 1)
+        var targetWidth = bounds.width * Self.idleDrawablePixelsPerPoint
+        var targetHeight = bounds.height * Self.idleDrawablePixelsPerPoint
+        if let sourceFrameSize,
+           sourceFrameSize.width > 0,
+           sourceFrameSize.height > 0 {
+            // Preserve source detail when a higher-resolution J2ME framebuffer
+            // is displayed in a small view, but never render samples that the
+            // physical screen cannot show. Low-resolution games therefore draw
+            // at their native 240x320-style size instead of a Retina fullscreen
+            // target, while 640x360-class games do not get needlessly blurred.
+            targetWidth = min(
+                sourceFrameSize.width,
+                bounds.width * physicalScale
+            )
+            targetHeight = min(
+                sourceFrameSize.height,
+                bounds.height * physicalScale
+            )
+        }
+        let target = CGSize(
+            width: max(floor(targetWidth), 1),
+            height: max(floor(targetHeight), 1)
+        )
+        if drawableSize != target {
+            drawableSize = target
+        }
     }
 
     private func installRendererResourcesIfAvailable() {

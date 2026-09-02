@@ -3,14 +3,43 @@ import Foundation
 
 @MainActor
 final class EmulatorFrameStore: ObservableObject {
-    @Published private(set) var frame: PhoneMEFrame?
+    @Published private(set) var frameSize: CGSize?
+    private(set) var frame: PhoneMEFrame?
+    private var observers: [UUID: (PhoneMEFrame?) -> Void] = [:]
+
+    @discardableResult
+    func observeFrames(
+        _ observer: @escaping (PhoneMEFrame?) -> Void
+    ) -> UUID {
+        let identifier = UUID()
+        observers[identifier] = observer
+        observer(frame)
+        return identifier
+    }
+
+    func removeFrameObserver(_ identifier: UUID) {
+        observers.removeValue(forKey: identifier)
+    }
 
     fileprivate func update(_ frame: PhoneMEFrame) {
         self.frame = frame
+        let nextSize = CGSize(width: frame.width, height: frame.height)
+        if frameSize != nextSize {
+            frameSize = nextSize
+        }
+        for observer in observers.values {
+            observer(frame)
+        }
     }
 
     fileprivate func reset() {
         frame = nil
+        if frameSize != nil {
+            frameSize = nil
+        }
+        for observer in observers.values {
+            observer(nil)
+        }
     }
 }
 

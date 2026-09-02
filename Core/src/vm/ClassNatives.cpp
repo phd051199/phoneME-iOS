@@ -698,19 +698,25 @@ void register_class_natives(NativeMethodRegistry& registry) {
                 // unexpected SecurityException in legacy game engines.
                 return std::optional<Value>(Value::from_reference({}));
             }
-            const bool absolute = resource->front() == '/';
             std::string path;
-            if (absolute) {
-                path.assign(resource->begin() + 1, resource->end());
+            const bool absolute = resource->front() == '/';
+            if (const auto cached = machine.cached_resource_path(
+                    *mirror, *resource); cached.has_value()) {
+                path = *cached;
             } else {
-                const usize slash = class_name->rfind('/');
-                if (slash != std::string::npos &&
-                    (class_name->empty() || class_name->front() != '[')) {
-                    path.assign(class_name->begin(),
-                                class_name->begin() +
-                                    static_cast<std::ptrdiff_t>(slash + 1U));
+                if (absolute) {
+                    path.assign(resource->begin() + 1, resource->end());
+                } else {
+                    const usize slash = class_name->rfind('/');
+                    if (slash != std::string::npos &&
+                        (class_name->empty() || class_name->front() != '[')) {
+                        path.assign(class_name->begin(),
+                                    class_name->begin() +
+                                        static_cast<std::ptrdiff_t>(slash + 1U));
+                    }
+                    path.append(*resource);
                 }
-                path.append(*resource);
+                machine.cache_resource_path(*mirror, *resource, path);
             }
             auto bytes = machine.cached_resource_byte_array(path);
             if (std::getenv("PHONEME_TRACE_RESOURCE") != nullptr && bytes) {

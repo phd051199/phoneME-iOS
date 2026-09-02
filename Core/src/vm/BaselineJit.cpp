@@ -66,6 +66,8 @@ constexpr usize kMaximumBackgroundCompileQueue = 32U;
 constexpr u32 kMaximumBackgroundCompileWorkers = 1U;
 constexpr usize kMaximumSwitchCases = 512U;
 constexpr usize kMaximumNativeInstructions = 256U * 1024U;
+constexpr u64 kDefaultDeviceForegroundCompileIntervalMilliseconds = 200U;
+constexpr u64 kMaximumDeviceForegroundCompileIntervalMilliseconds = 10'000U;
 
 [[nodiscard]] u32 configured_hot_threshold() noexcept {
     const char* value = std::getenv("PHONEME_JIT_HOT_THRESHOLD");
@@ -165,6 +167,15 @@ constexpr usize kMaximumNativeInstructions = 256U * 1024U;
 #endif
 }
 
+[[nodiscard]] bool quick_compile_tier_enabled() noexcept {
+    if (const char* value = std::getenv("PHONEME_JIT_QUICK_TIER");
+        value != nullptr && *value != '\0') {
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }
+    return conservative_device_jit_mode();
+}
+
 [[nodiscard]] u32 adaptive_device_hot_threshold(u32 configured) noexcept {
     if (!conservative_device_jit_mode()) return configured;
     const auto& coordinator = runtime::shared_work_coordinator();
@@ -194,6 +205,24 @@ constexpr usize kMaximumNativeInstructions = 256U * 1024U;
         return configured;
     }
     return configured;
+}
+
+[[nodiscard]] u64 configured_device_foreground_compile_interval_nanoseconds()
+    noexcept {
+    const char* value = std::getenv("PHONEME_IOS_JIT_COMPILE_INTERVAL_MS");
+    if (value == nullptr || *value == '\0') {
+        return kDefaultDeviceForegroundCompileIntervalMilliseconds * 1'000'000U;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') {
+        return kDefaultDeviceForegroundCompileIntervalMilliseconds * 1'000'000U;
+    }
+    const u64 milliseconds = std::min<u64>(
+        static_cast<u64>(parsed),
+        kMaximumDeviceForegroundCompileIntervalMilliseconds);
+    return milliseconds * 1'000'000U;
 }
 
 [[nodiscard]] u32 configured_background_compile_worker_count() noexcept {
@@ -991,6 +1020,7 @@ struct CompiledMethod final {
     JavaTypeKind return_kind {JavaTypeKind::void_type};
     bool returns_value {false};
     bool requires_runtime_dispatch {false};
+    bool quick_tier {false};
     bool optimized {false};
     bool contains_loop {false};
     u64 propagated_constants {0};
@@ -3365,7 +3395,8 @@ compute_constant_flow(
     const std::vector<std::optional<u32>>& depths,
     u32 local_slots,
     JavaTypeKind return_kind,
-    std::span<const classfile::ExceptionHandler> exception_handlers) {
+    std::span<const classfile::ExceptionHandler> exception_handlers,
+    bool enable_expensive_optimizations) {
     OptimizationPlan plan;
     plan.instructions.resize(instructions.size());
     if (instructions.empty()) return plan;
@@ -3435,6 +3466,16 @@ compute_constant_flow(
         plan.budget_checks_elided =
             reachable_instructions - emitted_budget_guards;
     }
+
+    // Physical iPhone defaults to a thermal-first quick tier. The structural
+    // information above is required by code generation and budget accounting,
+    // but the analyses below (constant-flow/liveness, GVN/CSE, LICM, array
+    // range proofs, scalar replacement, etc.) are compile-time work whose
+    // payoff is often too small for short J2ME methods. Keep them for the
+    // optimizing tier on desktop/simulator and the explicit aggressive iOS
+    // mode while allowing the device tier to reach native code with one cheap
+    // decode/CFG pass.
+    if (!enable_expensive_optimizations) return plan;
 
     const auto constant_flow = compute_constant_flow(
         instructions,
@@ -5202,6 +5243,7 @@ compute_constant_flow(
     }
 
     const u32 total_slots = local_slots + stack_slots;
+    const bool quick_tier = quick_compile_tier_enabled();
 
     std::optional<u8> unsupported_opcode;
     auto decoded = decode_method(owner, method, &unsupported_opcode);
@@ -5307,7 +5349,8 @@ compute_constant_flow(
         *depths,
         local_slots,
         descriptor.return_kind,
-        method.code->exception_table);
+        method.code->exception_table,
+        !quick_tier);
 
     std::unordered_map<usize, InlineRecipe> inline_recipes;
     u64 inlined_bytecodes = 0U;
@@ -5327,89 +5370,93 @@ compute_constant_flow(
         }
         return pushed_constant(instruction).has_value();
     };
-    for (usize index = 0U; index < decoded->size(); ++index) {
-        const DecodedInstruction& instruction = (*decoded)[index];
-        if (!(*depths)[index].has_value() ||
-            (instruction.opcode != 0xB8U && instruction.opcode != 0xB7U &&
-             instruction.opcode != 0xB6U)) {
-            continue;
-        }
-        auto reference = owner.member_reference(
-            static_cast<u16>(instruction.local_index));
-        if (!reference) continue;
-        std::shared_ptr<const classfile::ClassFile> cross_owner;
-        const classfile::ClassFile* callee_owner = &owner;
-        const classfile::Method* callee = nullptr;
-        if (reference->owner == owner.name()) {
-            callee = owner.find_method(reference->name, reference->descriptor);
-        } else {
-            // Cross-class inlining is restricted to invokestatic and delegated
-            // to Machine's resolver. The resolver only exposes targets whose
-            // declaring class has already completed initialization, preserving
-            // the JVM's active-use class initialization semantics.
-            if (instruction.opcode != 0xB8U || inline_resolver.resolve == nullptr) {
+    if (!quick_tier) {
+        for (usize index = 0U; index < decoded->size(); ++index) {
+            const DecodedInstruction& instruction = (*decoded)[index];
+            if (!(*depths)[index].has_value() ||
+                (instruction.opcode != 0xB8U && instruction.opcode != 0xB7U &&
+                 instruction.opcode != 0xB6U)) {
                 continue;
             }
-            auto target = inline_resolver.resolve(
-                inline_resolver.context,
-                reference->owner,
-                reference->name,
-                reference->descriptor);
-            if (!target.has_value() || target->owner == nullptr ||
-                target->method == nullptr) {
-                continue;
-            }
-            cross_owner = std::move(target->owner);
-            callee_owner = cross_owner.get();
-            callee = target->method;
-        }
-        if (callee == nullptr ||
-            (callee_owner == &owner && callee == &method) ||
-            (callee->access_flags & (0x0020U | 0x0100U | 0x0400U)) != 0U) {
-            continue;
-        }
-        const bool callee_static = (callee->access_flags & 0x0008U) != 0U;
-        if ((instruction.opcode == 0xB8U) != callee_static) continue;
-        if (instruction.opcode == 0xB6U &&
-            (callee->access_flags & 0x0010U) == 0U &&
-            (owner.access_flags() & 0x0010U) == 0U) {
-            continue;
-        }
-        auto recipe = analyze_inline_recipe(*callee_owner, *callee);
-        if (!recipe.has_value()) continue;
-        // Field constant-pool indices in this recipe belong to the callee.
-        // Runtime field dispatch below uses the currently compiled owner's
-        // constant pool, so only apply it when both are the same class.
-        if (recipe->kind == InlineRecipeKind::static_byte_cursor_read &&
-            callee_owner != &owner) {
-            continue;
-        }
-        if (instruction.opcode == 0xB7U || instruction.opcode == 0xB6U) {
-            // Only inline an instance leaf when the receiver is the caller's
-            // local-0 `this`, which is JVM-proven non-null. This preserves the
-            // implicit NPE semantics without adding a speculative null guard.
-            if (!has_receiver || instruction.argument_slots > 2U ||
-                index < static_cast<usize>(instruction.argument_slots + 1U)) {
-                continue;
-            }
-            const usize receiver_index =
-                index - static_cast<usize>(instruction.argument_slots) - 1U;
-            const auto receiver = callsite_aload_local((*decoded)[receiver_index]);
-            if (!receiver.has_value() || *receiver != 0U) continue;
-            bool simple_arguments = true;
-            for (usize argument_index = receiver_index + 1U;
-                 argument_index < index;
-                 ++argument_index) {
-                if (!simple_int_argument((*decoded)[argument_index])) {
-                    simple_arguments = false;
-                    break;
+            auto reference = owner.member_reference(
+                static_cast<u16>(instruction.local_index));
+            if (!reference) continue;
+            std::shared_ptr<const classfile::ClassFile> cross_owner;
+            const classfile::ClassFile* callee_owner = &owner;
+            const classfile::Method* callee = nullptr;
+            if (reference->owner == owner.name()) {
+                callee = owner.find_method(reference->name, reference->descriptor);
+            } else {
+                // Cross-class inlining is restricted to invokestatic and delegated
+                // to Machine's resolver. The resolver only exposes targets whose
+                // declaring class has already completed initialization, preserving
+                // the JVM's active-use class initialization semantics.
+                if (instruction.opcode != 0xB8U ||
+                    inline_resolver.resolve == nullptr) {
+                    continue;
                 }
+                auto target = inline_resolver.resolve(
+                    inline_resolver.context,
+                    reference->owner,
+                    reference->name,
+                    reference->descriptor);
+                if (!target.has_value() || target->owner == nullptr ||
+                    target->method == nullptr) {
+                    continue;
+                }
+                cross_owner = std::move(target->owner);
+                callee_owner = cross_owner.get();
+                callee = target->method;
             }
-            if (!simple_arguments) continue;
+            if (callee == nullptr ||
+                (callee_owner == &owner && callee == &method) ||
+                (callee->access_flags & (0x0020U | 0x0100U | 0x0400U)) != 0U) {
+                continue;
+            }
+            const bool callee_static = (callee->access_flags & 0x0008U) != 0U;
+            if ((instruction.opcode == 0xB8U) != callee_static) continue;
+            if (instruction.opcode == 0xB6U &&
+                (callee->access_flags & 0x0010U) == 0U &&
+                (owner.access_flags() & 0x0010U) == 0U) {
+                continue;
+            }
+            auto recipe = analyze_inline_recipe(*callee_owner, *callee);
+            if (!recipe.has_value()) continue;
+            // Field constant-pool indices in this recipe belong to the callee.
+            // Runtime field dispatch below uses the currently compiled owner's
+            // constant pool, so only apply it when both are the same class.
+            if (recipe->kind == InlineRecipeKind::static_byte_cursor_read &&
+                callee_owner != &owner) {
+                continue;
+            }
+            if (instruction.opcode == 0xB7U || instruction.opcode == 0xB6U) {
+                // Only inline an instance leaf when the receiver is the caller's
+                // local-0 `this`, which is JVM-proven non-null. This preserves the
+                // implicit NPE semantics without adding a speculative null guard.
+                if (!has_receiver || instruction.argument_slots > 2U ||
+                    index < static_cast<usize>(instruction.argument_slots + 1U)) {
+                    continue;
+                }
+                const usize receiver_index =
+                    index - static_cast<usize>(instruction.argument_slots) - 1U;
+                const auto receiver =
+                    callsite_aload_local((*decoded)[receiver_index]);
+                if (!receiver.has_value() || *receiver != 0U) continue;
+                bool simple_arguments = true;
+                for (usize argument_index = receiver_index + 1U;
+                     argument_index < index;
+                     ++argument_index) {
+                    if (!simple_int_argument((*decoded)[argument_index])) {
+                        simple_arguments = false;
+                        break;
+                    }
+                }
+                if (!simple_arguments) continue;
+            }
+            if (instruction.opcode == 0xB6U) ++devirtualized_calls;
+            inlined_bytecodes += recipe->nested_bytecode_cost;
+            inline_recipes.emplace(index, *recipe);
         }
-        if (instruction.opcode == 0xB6U) ++devirtualized_calls;
-        inlined_bytecodes += recipe->nested_bytecode_cost;
-        inline_recipes.emplace(index, *recipe);
     }
 
     enum class CachedLocalKind : u8 {
@@ -8922,6 +8969,7 @@ compute_constant_flow(
             .return_kind = descriptor.return_kind,
             .returns_value = descriptor.return_kind != JavaTypeKind::void_type,
             .requires_runtime_dispatch = requires_runtime_dispatch,
+            .quick_tier = quick_tier,
             .optimized = optimization_plan.propagated_constants != 0U ||
                          optimization_plan.folded_operations != 0U ||
                          optimization_plan.folded_branches != 0U ||
@@ -9207,6 +9255,56 @@ public:
 #endif
     }
 
+    [[nodiscard]] bool reserve_foreground_compile_slot() noexcept {
+        if (!conservative_device_jit_mode()) return true;
+
+        const auto& coordinator = runtime::shared_work_coordinator();
+        const runtime::ThermalPressure thermal = coordinator.thermal_pressure();
+        // Once the device is already hot, compiling more code is the wrong
+        // trade: keep executing the interpreter / already-published native
+        // entries and let compilation resume automatically after cooling.
+        if (thermal == runtime::ThermalPressure::serious ||
+            thermal == runtime::ThermalPressure::critical ||
+            coordinator.active_frame_jobs() != 0U) {
+            return false;
+        }
+
+        u64 interval = device_foreground_compile_interval_nanoseconds_;
+        if (interval == 0U) return true;
+        if (thermal == runtime::ThermalPressure::fair) {
+            interval = std::max<u64>(interval, 1'000'000'000U);
+        } else {
+            switch (coordinator.frame_pressure()) {
+            case runtime::FramePressure::high:
+            case runtime::FramePressure::overloaded:
+                interval = std::max<u64>(interval, 500'000'000U);
+                break;
+            case runtime::FramePressure::low:
+            case runtime::FramePressure::normal:
+                break;
+            }
+        }
+
+        const u64 now = static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        u64 next = next_foreground_compile_nanoseconds_.load(
+            std::memory_order_acquire);
+        for (;;) {
+            if (now < next) return false;
+            const u64 deadline = now > std::numeric_limits<u64>::max() - interval
+                ? std::numeric_limits<u64>::max()
+                : now + interval;
+            if (next_foreground_compile_nanoseconds_.compare_exchange_weak(
+                    next,
+                    deadline,
+                    std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return true;
+            }
+        }
+    }
+
     [[nodiscard]] Result<std::optional<JitExecutionResult>> try_execute(
         MethodId method_id,
         const classfile::ClassFile& owner,
@@ -9415,6 +9513,12 @@ public:
                 ++stats_.startup_compile_attempts;
             }
 
+            if (!reserve_foreground_compile_slot()) {
+                ++stats_.foreground_compile_deferred;
+                ++stats_.warmup_fallbacks;
+                return std::optional<JitExecutionResult>{};
+            }
+
             const auto compile_started = std::chrono::steady_clock::now();
             ++stats_.compile_attempts;
             CompileAttempt attempt = compile_scalar_method(
@@ -9470,6 +9574,7 @@ public:
             entry.retryable_call_count = 0U;
             entry.last_used_tick = ++use_tick_;
             ++stats_.compiled_methods;
+            if (entry.compiled->quick_tier) ++stats_.quick_compiled_methods;
             stats_.osr_compiled_entries += entry.compiled->osr_entries.size();
             if (startup) ++stats_.startup_compiled_methods;
             if (entry.compiled->optimized) ++stats_.optimized_methods;
@@ -9930,6 +10035,7 @@ public:
             entry.retryable_call_count = 0U;
             entry.last_used_tick = ++use_tick_;
             ++stats_.compiled_methods;
+            if (entry.compiled->quick_tier) ++stats_.quick_compiled_methods;
             stats_.osr_compiled_entries += entry.compiled->osr_entries.size();
             if (entry.compiled->optimized) ++stats_.optimized_methods;
             if (entry.compiled->contains_loop) ++stats_.loop_optimized_methods;
@@ -10695,6 +10801,7 @@ private:
             entry.retryable_call_count = 0U;
             entry.last_used_tick = ++use_tick_;
             ++stats_.compiled_methods;
+            if (entry.compiled->quick_tier) ++stats_.quick_compiled_methods;
             ++stats_.background_compile_published;
             stats_.osr_compiled_entries += entry.compiled->osr_entries.size();
             if (completed.startup) ++stats_.startup_compiled_methods;
@@ -10771,6 +10878,9 @@ private:
     std::atomic<u64> last_frame_publication_nanoseconds_ {0U};
     const u64 render_compile_cooldown_nanoseconds_ {
         configured_render_compile_cooldown_nanoseconds()};
+    const u64 device_foreground_compile_interval_nanoseconds_ {
+        configured_device_foreground_compile_interval_nanoseconds()};
+    std::atomic<u64> next_foreground_compile_nanoseconds_ {0U};
     std::atomic<u64> background_compile_queue_peak_ {0U};
     std::atomic<u64> background_compile_worker_count_ {0U};
     std::atomic<u64> background_compile_render_cooldown_waits_ {0U};
