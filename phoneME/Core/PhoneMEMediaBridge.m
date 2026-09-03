@@ -10,7 +10,9 @@
 #endif
 
 #include <math.h>
+#include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 
 @class PMMediaEntry;
 
@@ -127,6 +129,417 @@ static NSString *PMNormalizedContentType(NSString *type) {
 
 static BOOL PMIsMIDIType(NSString *type) {
     return [PMNormalizedContentType(type) isEqualToString:@"audio/midi"];
+}
+
+// AVMIDIPlayer requires a caller-provided DLS/SF2 bank on iOS. Supplying nil
+// works on macOS, but silently leaves many J2ME titles without music on iOS.
+// Keep MIDI support self-contained by rendering Standard MIDI data to a small
+// mono PCM wave there. This also lets the existing AVAudioPlayer path honor
+// MMAPI VolumeControl and loopCount consistently.
+typedef struct {
+    uint64_t tick;
+    uint32_t microseconds;
+} PMMIDITempo;
+
+typedef struct {
+    uint64_t startTick;
+    uint64_t endTick;
+    uint8_t note;
+    uint8_t velocity;
+    uint8_t channel;
+    uint8_t program;
+} PMMIDINote;
+
+typedef struct {
+    BOOL active;
+    uint64_t tick;
+    uint8_t velocity;
+    uint8_t program;
+} PMMIDIActiveNote;
+
+static uint16_t PMReadBE16(const uint8_t *bytes) {
+    return (uint16_t)(((uint16_t)bytes[0] << 8U) | bytes[1]);
+}
+
+static uint32_t PMReadBE32(const uint8_t *bytes) {
+    return ((uint32_t)bytes[0] << 24U) |
+           ((uint32_t)bytes[1] << 16U) |
+           ((uint32_t)bytes[2] << 8U) |
+           (uint32_t)bytes[3];
+}
+
+static void PMMIDIWriteLE16(uint8_t *bytes, uint16_t value) {
+    bytes[0] = (uint8_t)(value & 0xffU);
+    bytes[1] = (uint8_t)((value >> 8U) & 0xffU);
+}
+
+static void PMMIDIWriteLE32(uint8_t *bytes, uint32_t value) {
+    bytes[0] = (uint8_t)(value & 0xffU);
+    bytes[1] = (uint8_t)((value >> 8U) & 0xffU);
+    bytes[2] = (uint8_t)((value >> 16U) & 0xffU);
+    bytes[3] = (uint8_t)((value >> 24U) & 0xffU);
+}
+
+static BOOL PMReadMIDIVLQ(const uint8_t *bytes,
+                          NSUInteger end,
+                          NSUInteger *cursor,
+                          uint32_t *value) {
+    uint32_t result = 0;
+    for (NSUInteger index = 0; index < 4; ++index) {
+        if (*cursor >= end) return NO;
+        const uint8_t byte = bytes[(*cursor)++];
+        result = (result << 7U) | (uint32_t)(byte & 0x7fU);
+        if ((byte & 0x80U) == 0) {
+            *value = result;
+            return YES;
+        }
+    }
+    *value = result;
+    return YES;
+}
+
+static BOOL PMAppendMIDITempo(PMMIDITempo **tempos,
+                              NSUInteger *count,
+                              NSUInteger *capacity,
+                              PMMIDITempo tempo) {
+    if (*count >= *capacity) {
+        const NSUInteger nextCapacity = *capacity == 0 ? 16 : *capacity * 2;
+        PMMIDITempo *next = realloc(*tempos,
+                                    nextCapacity * sizeof(PMMIDITempo));
+        if (next == NULL) return NO;
+        *tempos = next;
+        *capacity = nextCapacity;
+    }
+    (*tempos)[(*count)++] = tempo;
+    return YES;
+}
+
+static BOOL PMAppendMIDINote(PMMIDINote **notes,
+                             NSUInteger *count,
+                             NSUInteger *capacity,
+                             PMMIDINote note) {
+    if (*count >= *capacity) {
+        const NSUInteger nextCapacity = *capacity == 0 ? 256 : *capacity * 2;
+        PMMIDINote *next = realloc(*notes,
+                                   nextCapacity * sizeof(PMMIDINote));
+        if (next == NULL) return NO;
+        *notes = next;
+        *capacity = nextCapacity;
+    }
+    (*notes)[(*count)++] = note;
+    return YES;
+}
+
+static int PMCompareMIDITempos(const void *lhs, const void *rhs) {
+    const PMMIDITempo *a = lhs;
+    const PMMIDITempo *b = rhs;
+    if (a->tick < b->tick) return -1;
+    if (a->tick > b->tick) return 1;
+    return 0;
+}
+
+static double PMMIDISecondsForTick(uint64_t tick,
+                                   const PMMIDITempo *tempos,
+                                   NSUInteger tempoCount,
+                                   uint16_t division) {
+    uint64_t lastTick = 0;
+    uint32_t currentTempo = 500000;
+    double seconds = 0.0;
+    for (NSUInteger index = 0; index < tempoCount; ++index) {
+        const PMMIDITempo tempo = tempos[index];
+        if (tempo.tick > tick) break;
+        if (tempo.tick >= lastTick) {
+            seconds += ((double)(tempo.tick - lastTick) * currentTempo) /
+                       ((double)division * 1000000.0);
+            lastTick = tempo.tick;
+            currentTempo = tempo.microseconds;
+        }
+    }
+    seconds += ((double)(tick - lastTick) * currentTempo) /
+               ((double)division * 1000000.0);
+    return seconds;
+}
+
+static float PMMIDIWaveSample(uint8_t program,
+                              uint8_t channel,
+                              uint8_t note,
+                              double phase,
+                              double elapsed,
+                              double duration,
+                              NSUInteger frame) {
+    if (channel == 9) {
+        const double decay = exp(-elapsed * (note < 48 ? 13.0 : 20.0));
+        if (note == 35 || note == 36) {
+            return (float)(sin(phase * (1.0 + 4.0 * exp(-elapsed * 18.0))) *
+                           decay);
+        }
+        uint32_t noise = (uint32_t)(frame * 1664525U +
+                                    (uint32_t)note * 1013904223U);
+        noise ^= noise >> 13U;
+        const float random = ((float)(noise & 0xffffU) / 32767.5f) - 1.0f;
+        return random * (float)decay;
+    }
+
+    const uint8_t family = program / 8U;
+    const double fundamental = sin(phase);
+    switch (family) {
+        case 0: // piano
+            return (float)((fundamental + 0.42 * sin(phase * 2.0) +
+                            0.18 * sin(phase * 3.0)) *
+                           (0.72 * exp(-elapsed * 1.7) + 0.28));
+        case 1: // chromatic percussion
+            return (float)((fundamental + 0.6 * sin(phase * 3.01)) *
+                           exp(-elapsed * 3.0));
+        case 2: // organ
+            return (float)(fundamental + 0.35 * sin(phase * 2.0) +
+                           0.18 * sin(phase * 4.0));
+        case 3: // guitar
+            return (float)((fundamental + 0.32 * sin(phase * 2.0) +
+                            0.12 * sin(phase * 3.0)) *
+                           (0.55 * exp(-elapsed * 2.2) + 0.45));
+        case 4: // bass
+            return (float)(0.75 * sin(phase) + 0.25 * sin(phase * 2.0));
+        case 5: // strings
+        case 6: // ensemble
+            return (float)(0.72 * sin(phase) + 0.2 * sin(phase * 2.0) +
+                           0.08 * sin(phase * 3.0));
+        case 7: // brass
+            return (float)(0.7 * fundamental +
+                           0.3 * (fundamental >= 0.0 ? 1.0 : -1.0));
+        case 8: // reed
+        case 9: // pipe
+            return (float)(0.88 * fundamental + 0.12 * sin(phase * 2.0));
+        case 10: // synth lead
+        case 11: // synth pad
+            return (float)(0.65 * fundamental +
+                           0.2 * sin(phase * 2.0) +
+                           0.15 * sin(phase * 0.5));
+        default:
+            (void)duration;
+            return (float)fundamental;
+    }
+}
+
+static NSData *PMRenderMIDIToWave(NSData *midiData) {
+    static const NSUInteger kSampleRate = 22050;
+    static const double kMaximumDuration = 10.0 * 60.0;
+    const uint8_t *bytes = midiData.bytes;
+    const NSUInteger length = midiData.length;
+    if (bytes == NULL || length < 14 || memcmp(bytes, "MThd", 4) != 0) {
+        return nil;
+    }
+
+    const uint32_t headerLength = PMReadBE32(bytes + 4);
+    if (headerLength < 6 || 8ULL + headerLength > length) return nil;
+    const uint16_t trackCount = PMReadBE16(bytes + 10);
+    const uint16_t division = PMReadBE16(bytes + 12);
+    if (trackCount == 0 || division == 0 || (division & 0x8000U) != 0) {
+        return nil;
+    }
+
+    PMMIDITempo *tempos = NULL;
+    PMMIDINote *notes = NULL;
+    NSUInteger tempoCount = 0, tempoCapacity = 0;
+    NSUInteger noteCount = 0, noteCapacity = 0;
+
+    NSUInteger offset = 8U + headerLength;
+    BOOL valid = YES;
+    for (uint16_t track = 0; track < trackCount && offset + 8U <= length; ++track) {
+        if (memcmp(bytes + offset, "MTrk", 4) != 0) {
+            valid = NO;
+            break;
+        }
+        const uint32_t trackLength = PMReadBE32(bytes + offset + 4U);
+        NSUInteger cursor = offset + 8U;
+        const NSUInteger end = MIN(length, cursor + (NSUInteger)trackLength);
+        uint64_t tick = 0;
+        uint8_t runningStatus = 0;
+        uint8_t programs[16] = {0};
+        PMMIDIActiveNote active[16][128] = {{{0}}};
+
+        while (cursor < end) {
+            uint32_t delta = 0;
+            if (!PMReadMIDIVLQ(bytes, end, &cursor, &delta)) {
+                valid = NO;
+                break;
+            }
+            tick += delta;
+            if (cursor >= end) break;
+            uint8_t status = bytes[cursor];
+            if ((status & 0x80U) != 0) {
+                ++cursor;
+                runningStatus = status;
+            } else if (runningStatus != 0) {
+                status = runningStatus;
+            } else {
+                valid = NO;
+                break;
+            }
+
+            if (status == 0xffU) {
+                runningStatus = 0;
+                if (cursor >= end) { valid = NO; break; }
+                const uint8_t metaType = bytes[cursor++];
+                uint32_t metaLength = 0;
+                if (!PMReadMIDIVLQ(bytes, end, &cursor, &metaLength) ||
+                    metaLength > end - cursor) {
+                    valid = NO;
+                    break;
+                }
+                if (metaType == 0x51U && metaLength == 3U) {
+                    const uint32_t microseconds =
+                        ((uint32_t)bytes[cursor] << 16U) |
+                        ((uint32_t)bytes[cursor + 1U] << 8U) |
+                        bytes[cursor + 2U];
+                    if (microseconds > 0 &&
+                        !PMAppendMIDITempo(&tempos, &tempoCount, &tempoCapacity,
+                                           (PMMIDITempo){tick, microseconds})) {
+                        valid = NO;
+                        break;
+                    }
+                }
+                cursor += metaLength;
+                continue;
+            }
+            if (status == 0xf0U || status == 0xf7U) {
+                runningStatus = 0;
+                uint32_t sysexLength = 0;
+                if (!PMReadMIDIVLQ(bytes, end, &cursor, &sysexLength) ||
+                    sysexLength > end - cursor) {
+                    valid = NO;
+                    break;
+                }
+                cursor += sysexLength;
+                continue;
+            }
+
+            const uint8_t kind = status & 0xf0U;
+            const uint8_t channel = status & 0x0fU;
+            const NSUInteger dataLength = (kind == 0xc0U || kind == 0xd0U) ? 1U : 2U;
+            if (cursor + dataLength > end) { valid = NO; break; }
+            const uint8_t a = bytes[cursor++];
+            const uint8_t b = dataLength == 2U ? bytes[cursor++] : 0U;
+            if (kind == 0xc0U) {
+                programs[channel] = a & 0x7fU;
+                continue;
+            }
+            if (kind != 0x80U && kind != 0x90U) continue;
+            const uint8_t note = a & 0x7fU;
+            PMMIDIActiveNote *slot = &active[channel][note];
+            if (kind == 0x90U && b > 0) {
+                if (slot->active) {
+                    PMAppendMIDINote(&notes, &noteCount, &noteCapacity,
+                                     (PMMIDINote){slot->tick, MAX(slot->tick + 1, tick),
+                                                  note, slot->velocity, channel,
+                                                  slot->program});
+                }
+                *slot = (PMMIDIActiveNote){YES, tick, b, programs[channel]};
+            } else if (slot->active) {
+                if (!PMAppendMIDINote(&notes, &noteCount, &noteCapacity,
+                                      (PMMIDINote){slot->tick, MAX(slot->tick + 1, tick),
+                                                   note, slot->velocity, channel,
+                                                   slot->program})) {
+                    valid = NO;
+                    break;
+                }
+                slot->active = NO;
+            }
+        }
+        if (!valid) break;
+        offset = end;
+    }
+
+    if (!valid || noteCount == 0) {
+        free(tempos);
+        free(notes);
+        return nil;
+    }
+    qsort(tempos, tempoCount, sizeof(PMMIDITempo), PMCompareMIDITempos);
+
+    double duration = 0.0;
+    for (NSUInteger index = 0; index < noteCount; ++index) {
+        const double end = PMMIDISecondsForTick(notes[index].endTick,
+                                                tempos, tempoCount, division);
+        duration = MAX(duration, end);
+    }
+    if (!(duration > 0.0) || duration > kMaximumDuration) {
+        free(tempos);
+        free(notes);
+        return nil;
+    }
+
+    const NSUInteger frameCount = (NSUInteger)ceil((duration + 0.1) * kSampleRate);
+    float *samples = calloc(frameCount, sizeof(float));
+    if (samples == NULL) {
+        free(tempos);
+        free(notes);
+        return nil;
+    }
+
+    for (NSUInteger index = 0; index < noteCount; ++index) {
+        const PMMIDINote event = notes[index];
+        const double startSeconds = PMMIDISecondsForTick(event.startTick,
+                                                         tempos, tempoCount,
+                                                         division);
+        const double endSeconds = PMMIDISecondsForTick(event.endTick,
+                                                       tempos, tempoCount,
+                                                       division);
+        const NSUInteger start = MIN(frameCount,
+                                     (NSUInteger)floor(startSeconds * kSampleRate));
+        const NSUInteger end = MIN(frameCount,
+                                   (NSUInteger)ceil(endSeconds * kSampleRate));
+        if (end <= start) continue;
+        const double frequency = 440.0 * pow(2.0, ((double)event.note - 69.0) / 12.0);
+        const double noteDuration = (double)(end - start) / kSampleRate;
+        const NSUInteger attackFrames = MAX((NSUInteger)1, (NSUInteger)(0.008 * kSampleRate));
+        const NSUInteger releaseFrames = MAX((NSUInteger)1, (NSUInteger)(0.04 * kSampleRate));
+        const float amplitude = 0.075f * ((float)event.velocity / 127.0f);
+        for (NSUInteger frame = start; frame < end; ++frame) {
+            const NSUInteger local = frame - start;
+            const NSUInteger remaining = end - frame;
+            float envelope = MIN(1.0f,
+                                 MIN((float)local / attackFrames,
+                                     (float)remaining / releaseFrames));
+            if (event.channel == 9) envelope = 1.0f;
+            const double elapsed = (double)local / kSampleRate;
+            const double phase = 2.0 * M_PI * frequency * elapsed;
+            samples[frame] += amplitude * envelope *
+                PMMIDIWaveSample(event.program, event.channel, event.note,
+                                 phase, elapsed, noteDuration, frame);
+        }
+    }
+
+    const NSUInteger pcmBytes = frameCount * sizeof(int16_t);
+    if (pcmBytes > UINT32_MAX - 36U) {
+        free(samples);
+        free(tempos);
+        free(notes);
+        return nil;
+    }
+    NSMutableData *wave = [NSMutableData dataWithLength:44U + pcmBytes];
+    uint8_t *output = wave.mutableBytes;
+    memcpy(output, "RIFF", 4);
+    PMMIDIWriteLE32(output + 4, (uint32_t)(36U + pcmBytes));
+    memcpy(output + 8, "WAVEfmt ", 8);
+    PMMIDIWriteLE32(output + 16, 16U);
+    PMMIDIWriteLE16(output + 20, 1U);
+    PMMIDIWriteLE16(output + 22, 1U);
+    PMMIDIWriteLE32(output + 24, (uint32_t)kSampleRate);
+    PMMIDIWriteLE32(output + 28, (uint32_t)(kSampleRate * sizeof(int16_t)));
+    PMMIDIWriteLE16(output + 32, (uint16_t)sizeof(int16_t));
+    PMMIDIWriteLE16(output + 34, 16U);
+    memcpy(output + 36, "data", 4);
+    PMMIDIWriteLE32(output + 40, (uint32_t)pcmBytes);
+    int16_t *pcm = (int16_t *)(output + 44);
+    for (NSUInteger frame = 0; frame < frameCount; ++frame) {
+        const float clamped = fmaxf(-1.0f, fminf(1.0f, samples[frame]));
+        pcm[frame] = (int16_t)lrintf(clamped * 32767.0f);
+    }
+
+    free(samples);
+    free(tempos);
+    free(notes);
+    return wave;
 }
 
 static NSURL *PMURLFromLocator(NSString *locator) {
@@ -1021,10 +1434,31 @@ static PMMediaEntry *PMEntryWithData(NSData *data, NSString *contentType) {
     PMMediaEntry *entry = [[PMMediaEntry alloc] init];
     NSError *error = nil;
     if (PMIsMIDIType(contentType)) {
+#if TARGET_OS_IOS || TARGET_OS_TV
+        NSData *wave = PMRenderMIDIToWave(data);
+        if (wave == nil) {
+            NSLog(@"phoneME media: unable to render MIDI data");
+            return nil;
+        }
+        entry.audioPlayer = [[AVAudioPlayer alloc] initWithData:wave error:&error];
+        if (entry.audioPlayer == nil) {
+            NSLog(@"phoneME media: unable to create rendered MIDI player: %@",
+                  error.localizedDescription);
+            return nil;
+        }
+        entry.audioPlayer.delegate = entry;
+        [entry.audioPlayer prepareToPlay];
+#else
         entry.midiPlayer = [[AVMIDIPlayer alloc] initWithData:data
                                                 soundBankURL:nil
                                                       error:&error];
-        if (entry.midiPlayer == nil) return nil;
+        if (entry.midiPlayer == nil) {
+            NSLog(@"phoneME media: unable to create MIDI player: %@",
+                  error.localizedDescription);
+            return nil;
+        }
+        [entry.midiPlayer prepareToPlay];
+#endif
     } else {
         entry.audioPlayer = [[AVAudioPlayer alloc] initWithData:data error:&error];
         if (entry.audioPlayer == nil) return nil;
@@ -1044,10 +1478,27 @@ static PMMediaEntry *PMEntryWithURL(NSURL *url, NSString *contentType) {
     if (url.isFileURL) {
         if (PMIsMIDIType(contentType) ||
             [@[@"mid", @"midi"] containsObject:url.pathExtension.lowercaseString]) {
+#if TARGET_OS_IOS || TARGET_OS_TV
+            NSData *midiData = [NSData dataWithContentsOfURL:url options:0 error:&error];
+            if (midiData == nil) {
+                NSLog(@"phoneME media: unable to read MIDI file: %@",
+                      error.localizedDescription);
+                return nil;
+            }
+            PMMediaEntry *midiEntry = PMEntryWithData(midiData, @"audio/midi");
+            midiEntry.mediaTitle = entry.mediaTitle;
+            return midiEntry;
+#else
             entry.midiPlayer = [[AVMIDIPlayer alloc] initWithContentsOfURL:url
                                                              soundBankURL:nil
                                                                    error:&error];
-            if (entry.midiPlayer == nil) return nil;
+            if (entry.midiPlayer == nil) {
+                NSLog(@"phoneME media: unable to create MIDI player: %@",
+                      error.localizedDescription);
+                return nil;
+            }
+            [entry.midiPlayer prepareToPlay];
+#endif
         } else {
             entry.audioPlayer = [[AVAudioPlayer alloc] initWithContentsOfURL:url
                                                                        error:&error];
