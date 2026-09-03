@@ -1479,6 +1479,20 @@ Result<SuiteId> Runtime::install_jar(const std::string& jar_path) {
     return install_jar(jar_path, {});
 }
 
+Result<SuiteId> Runtime::install_jar_replacing(const std::string& jar_path) {
+    if (!is_regular_file(jar_path)) {
+        return fail(ErrorCode::invalid_argument,
+                    "JAR path is not an accessible regular file");
+    }
+
+    std::scoped_lock lock(mutex_);
+    if (!configured_) {
+        return fail(ErrorCode::not_configured,
+                    "runtime must be configured before installing a suite");
+    }
+    return suite_store_.install_replacing(jar_path);
+}
+
 Result<SuiteId> Runtime::install_jar(
     const std::string& jar_path,
     std::string_view identity_scope) {

@@ -3,6 +3,7 @@ import Foundation
 enum AppLanguage: String, CaseIterable, Identifiable {
     case vietnamese = "vi"
     case english = "en"
+    case chineseSimplified = "zh-Hans"
 
     static let preferenceKey = "appLanguage"
     static let defaultLanguage: AppLanguage = .vietnamese
@@ -19,6 +20,8 @@ enum AppLanguage: String, CaseIterable, Identifiable {
             return L10n.string("Vietnamese")
         case .english:
             return L10n.string("English")
+        case .chineseSimplified:
+            return L10n.string("Chinese (Simplified)")
         }
     }
 
@@ -26,6 +29,7 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         switch self {
         case .vietnamese: return "globe.asia.australia.fill"
         case .english: return "textformat.abc"
+        case .chineseSimplified: return "character.book.closed.fill"
         }
     }
 

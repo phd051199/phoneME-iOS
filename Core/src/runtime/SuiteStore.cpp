@@ -508,26 +508,31 @@ Status SuiteStore::configure(const SuiteStoreConfig& config) {
 }
 
 Result<SuiteId> SuiteStore::install(const std::string& jar_path) {
-    return install_impl(jar_path, std::nullopt, false, {});
+    return install_impl(jar_path, std::nullopt, false, {}, false);
+}
+
+Result<SuiteId> SuiteStore::install_replacing(const std::string& jar_path) {
+    return install_impl(jar_path, std::nullopt, false, {}, true);
 }
 
 Result<SuiteId> SuiteStore::install_scoped(
     const std::string& jar_path,
     std::string_view identity_scope) {
-    return install_impl(jar_path, std::nullopt, false, identity_scope);
+    return install_impl(jar_path, std::nullopt, false, identity_scope, true);
 }
 
 Result<SuiteId> SuiteStore::install(const std::string& jad_path,
                                     const std::string& jar_path,
                                     bool allow_downgrade) {
-    return install_impl(jar_path, jad_path, allow_downgrade, {});
+    return install_impl(jar_path, jad_path, allow_downgrade, {}, false);
 }
 
 Result<SuiteId> SuiteStore::install_impl(
     const std::string& jar_path,
     const std::optional<std::string>& jad_path,
     bool allow_downgrade,
-    std::string_view identity_scope) {
+    std::string_view identity_scope,
+    bool allow_same_version_replacement) {
     auto descriptor = SuiteInstaller::inspect(
         jar_path, jad_path, installer_limits_);
     if (!descriptor) {
@@ -563,12 +568,12 @@ Result<SuiteId> SuiteStore::install_impl(
                              existing->archive_sha256)) {
                 return id;
             }
-            if (identity_scope.empty()) {
+            if (!allow_same_version_replacement) {
                 return fail(
                     ErrorCode::invalid_state,
                     "same-version suite replacement has different JAR content");
             }
-            // A host-scoped identity represents one explicit application slot.
+            // An explicit host replacement represents one application slot.
             // Reimporting that slot with changed bytes is a legitimate update
             // even when the producer forgot to bump MIDlet-Version. Keep the
             // stable suite ID so RMS/files/permissions remain attached.

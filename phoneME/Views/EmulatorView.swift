@@ -117,6 +117,8 @@ struct EmulatorView: View {
                         translationEnabled: runtimeProfile.isAutoTranslationEnabled,
                         translationSourceLanguage:
                             runtimeProfile.effectiveAutoTranslationSourceLanguage,
+                        translationTargetLanguage:
+                            runtimeProfile.effectiveAutoTranslationTargetLanguage,
                         frameRateOverrideEnabled:
                             runtimeProfile.isFrameRateOverrideEnabled,
                         frameRateLimit: GameProfile.resolvedFrameRate(
@@ -374,13 +376,17 @@ struct EmulatorView: View {
 
     private func setAutoTranslationConfiguration(
         _ enabled: Bool,
-        _ sourceLanguage: TranslationSourceLanguage
+        _ sourceLanguage: TranslationSourceLanguage,
+        _ targetLanguage: TranslationTargetLanguage
     ) {
         let previousEnabled = runtimeProfile.isAutoTranslationEnabled
         let previousSourceLanguage =
             runtimeProfile.effectiveAutoTranslationSourceLanguage
+        let previousTargetLanguage =
+            runtimeProfile.effectiveAutoTranslationTargetLanguage
         guard previousEnabled != enabled ||
-                previousSourceLanguage != sourceLanguage else {
+                previousSourceLanguage != sourceLanguage ||
+                previousTargetLanguage != targetLanguage else {
             return
         }
 
@@ -388,17 +394,22 @@ struct EmulatorView: View {
         if enabled {
             runtimeProfile.effectiveAutoTranslationSourceLanguage =
                 sourceLanguage
+            runtimeProfile.effectiveAutoTranslationTargetLanguage =
+                targetLanguage
         }
         persistRuntimeProfile()
         session.setAutoTranslationConfiguration(
             enabled: enabled,
             sourceLanguage: sourceLanguage,
+            targetLanguage: targetLanguage,
             for: game
         ) { result in
             guard case let .failure(error) = result else { return }
             runtimeProfile.setAutoTranslationEnabled(previousEnabled)
             runtimeProfile.effectiveAutoTranslationSourceLanguage =
                 previousSourceLanguage
+            runtimeProfile.effectiveAutoTranslationTargetLanguage =
+                previousTargetLanguage
             persistRuntimeProfile()
             errorMessage = error.localizedDescription
             showError = true
@@ -939,6 +950,7 @@ private struct EmulatorToolbarAnchor: View, Equatable {
     let isRotationLocked: Bool
     let translationEnabled: Bool
     let translationSourceLanguage: TranslationSourceLanguage
+    let translationTargetLanguage: TranslationTargetLanguage
     let frameRateOverrideEnabled: Bool
     let frameRateLimit: Int
     let isAppBarVisible: Bool
@@ -947,7 +959,7 @@ private struct EmulatorToolbarAnchor: View, Equatable {
     let exitAction: () -> Void
     let toggleRotationLockAction: () -> Void
     let setTranslationConfigurationAction:
-        (Bool, TranslationSourceLanguage) -> Void
+        (Bool, TranslationSourceLanguage, TranslationTargetLanguage) -> Void
     let setFrameRateAction: (Int?) -> Void
     let toggleKeyboardAction: () -> Void
     let screenshotAction: () -> Void
@@ -965,6 +977,7 @@ private struct EmulatorToolbarAnchor: View, Equatable {
             && lhs.isRotationLocked == rhs.isRotationLocked
             && lhs.translationEnabled == rhs.translationEnabled
             && lhs.translationSourceLanguage == rhs.translationSourceLanguage
+            && lhs.translationTargetLanguage == rhs.translationTargetLanguage
             && lhs.frameRateOverrideEnabled == rhs.frameRateOverrideEnabled
             && lhs.frameRateLimit == rhs.frameRateLimit
             && lhs.isAppBarVisible == rhs.isAppBarVisible
@@ -1112,7 +1125,8 @@ private struct EmulatorToolbarAnchor: View, Equatable {
                             Button {
                                 setTranslationConfigurationAction(
                                     false,
-                                    translationSourceLanguage
+                                    translationSourceLanguage,
+                                    translationTargetLanguage
                                 )
                             } label: {
                                 Label(
@@ -1123,21 +1137,59 @@ private struct EmulatorToolbarAnchor: View, Equatable {
                                 )
                             }
                             Divider()
-                            ForEach(TranslationSourceLanguage.allCases) { language in
-                                Button {
-                                    setTranslationConfigurationAction(
-                                        true,
-                                        language
-                                    )
-                                } label: {
-                                    Label(
-                                        language.title,
-                                        systemImage: translationEnabled &&
-                                            translationSourceLanguage == language
-                                            ? "checkmark.circle.fill"
-                                            : language.systemImage
-                                    )
+                            Menu {
+                                ForEach(TranslationSourceLanguage.allCases) { language in
+                                    Button {
+                                        setTranslationConfigurationAction(
+                                            true,
+                                            language,
+                                            translationTargetLanguage
+                                        )
+                                    } label: {
+                                        Label(
+                                            language.title,
+                                            systemImage: translationEnabled &&
+                                                translationSourceLanguage == language
+                                                ? "checkmark.circle.fill"
+                                                : language.systemImage
+                                        )
+                                    }
                                 }
+                            } label: {
+                                Label(
+                                    L10n.format(
+                                        "Translate from: %@",
+                                        translationSourceLanguage.title
+                                    ),
+                                    systemImage: "arrow.right"
+                                )
+                            }
+                            Menu {
+                                ForEach(TranslationTargetLanguage.allCases) { language in
+                                    Button {
+                                        setTranslationConfigurationAction(
+                                            true,
+                                            translationSourceLanguage,
+                                            language
+                                        )
+                                    } label: {
+                                        Label(
+                                            language.title,
+                                            systemImage: translationEnabled &&
+                                                translationTargetLanguage == language
+                                                ? "checkmark.circle.fill"
+                                                : language.systemImage
+                                        )
+                                    }
+                                }
+                            } label: {
+                                Label(
+                                    L10n.format(
+                                        "Translate to: %@",
+                                        translationTargetLanguage.title
+                                    ),
+                                    systemImage: "arrow.left"
+                                )
                             }
                         } label: {
                             Label(

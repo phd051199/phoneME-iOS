@@ -53,6 +53,13 @@ constexpr u32 kOsrBackgroundPromotionPolls = 3U;
 constexpr u32 kDefaultStartupLoopBytecodeThreshold = 96U;
 constexpr u32 kMinimumStartupLoopBytecodeThreshold = 16U;
 constexpr u32 kMaximumStartupLoopBytecodeThreshold = 4'096U;
+// Conservative physical-iPhone JIT admission normally waits for many method
+// invocations to avoid compiling warm helpers.  Large methods with an actual
+// backedge are different: loaders/codecs frequently invoke them only once and
+// spend millions of bytecodes inside that single call.  Promote those methods
+// on their first nominal-temperature invocation so the interpreter does not
+// become the dominant package-power consumer during loading.
+constexpr usize kConservativeLargeLoopBytecodeThreshold = 256U;
 constexpr u32 kDefaultStartupCompileLimit = 3U;
 constexpr u32 kMaximumStartupCompileLimit = 256U;
 constexpr u64 kDefaultStartupCompileBudgetNanoseconds = 3'000'000U;
@@ -151,6 +158,14 @@ constexpr u64 kMaximumDeviceForegroundCompileIntervalMilliseconds = 10'000U;
 }
 
 [[nodiscard]] bool conservative_device_jit_mode() noexcept {
+    // Cross-platform override used by host regression/real-game benchmarks to
+    // exercise the same conservative admission policy as a physical iPhone.
+    // Leaving it unset preserves the platform default below.
+    if (const char* value = std::getenv("PHONEME_JIT_CONSERVATIVE");
+        value != nullptr && *value != '\0') {
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }
 #if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR && \
     defined(__aarch64__)
     static const bool conservative = []() noexcept {
@@ -193,6 +208,27 @@ constexpr u64 kMaximumDeviceForegroundCompileIntervalMilliseconds = 10'000U;
     if (!leaf_jit_reads_enabled()) return false;
     static const bool enabled = []() noexcept {
         const char* value = std::getenv("PHONEME_JIT_LEAF_ARRAY_LOAD");
+        if (value == nullptr || *value == '\0') return true;
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool leaf_jit_writes_enabled() noexcept {
+    static const bool enabled = []() noexcept {
+        const char* value = std::getenv("PHONEME_JIT_LEAF_WRITES");
+        if (value == nullptr || *value == '\0') return true;
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool leaf_jit_array_store_enabled() noexcept {
+    if (!leaf_jit_writes_enabled()) return false;
+    static const bool enabled = []() noexcept {
+        const char* value = std::getenv("PHONEME_JIT_LEAF_ARRAY_STORE");
         if (value == nullptr || *value == '\0') return true;
         const std::string_view mode(value);
         return mode != "0" && mode != "false" && mode != "off";
@@ -376,6 +412,8 @@ constexpr u32 kBudgetRemainingOffset =
 constexpr u32 kRuntimeResultOffset = 40U;
 constexpr u32 kLeafScratchOffset =
     static_cast<u32>(kJitRuntimeLeafScratchByteOffset);
+constexpr u32 kLeafScratchSecondOffset =
+    static_cast<u32>(kJitRuntimeLeafScratchSecondByteOffset);
 constexpr u32 kJitFrameHeaderBytes =
     static_cast<u32>(kJitRuntimeFrameHeaderBytes);
 
@@ -6118,7 +6156,8 @@ compute_constant_flow(
                                             u32 second_register,
                                             u32 third_register,
                                             u32 bytecode_pc,
-                                            bool preserve_second) -> bool {
+                                            bool preserve_second,
+                                            bool preserve_third) -> bool {
         for (const classfile::ExceptionHandler& handler :
              method.code->exception_table) {
             if (static_cast<usize>(bytecode_pc) >=
@@ -6131,6 +6170,11 @@ compute_constant_flow(
 
         if (preserve_second) {
             emitter.store_x(second_register, kStackPointer, kLeafScratchOffset);
+        }
+        if (preserve_third) {
+            emitter.store_x(third_register,
+                            kStackPointer,
+                            kLeafScratchSecondOffset);
         }
         // The leaf helper is still a real C++ ABI call. Persist the *current*
         // budget counters before entering it; otherwise the reload below would
@@ -6220,13 +6264,18 @@ compute_constant_flow(
                            kStackPointer,
                            kLeafScratchOffset);
         }
+        if (preserve_third) {
+            emitter.load_x(kScratchThird,
+                           kStackPointer,
+                           kLeafScratchSecondOffset);
+        }
         emit_runtime_call(operation,
                           operand,
                           operation == JitRuntimeOperation::get_static
                               ? 31U
                               : kScratchLeft,
                           preserve_second ? kScratchRight : 31U,
-                          31U,
+                          preserve_third ? kScratchThird : 31U,
                           bytecode_pc);
         const usize continue_position = emitter.position();
         if (!emitter.patch_conditional_branch(
@@ -7221,7 +7270,8 @@ compute_constant_flow(
                                         kScratchRight,
                                         31U,
                                         static_cast<u32>(instruction.pc),
-                                        true)) {
+                                        true,
+                                        false)) {
                 if (leaf_runtime_emit_failed) return {};
                 emit_runtime_call(JitRuntimeOperation::array_load,
                                   instruction.opcode,
@@ -7261,12 +7311,23 @@ compute_constant_flow(
                 return {};
             }
             requires_runtime_dispatch = true;
-            emit_runtime_call(JitRuntimeOperation::array_store,
-                              instruction.opcode,
-                              kScratchLeft,
-                              kScratchRight,
-                              kScratchThird,
-                              static_cast<u32>(instruction.pc));
+            if (!leaf_jit_array_store_enabled() ||
+                !emit_leaf_runtime_call(JitRuntimeOperation::array_store,
+                                        instruction.opcode,
+                                        kScratchLeft,
+                                        kScratchRight,
+                                        kScratchThird,
+                                        static_cast<u32>(instruction.pc),
+                                        true,
+                                        true)) {
+                if (leaf_runtime_emit_failed) return {};
+                emit_runtime_call(JitRuntimeOperation::array_store,
+                                  instruction.opcode,
+                                  kScratchLeft,
+                                  kScratchRight,
+                                  kScratchThird,
+                                  static_cast<u32>(instruction.pc));
+            }
             break;
         }
         case 0xB2U:
@@ -7278,6 +7339,7 @@ compute_constant_flow(
                                         31U,
                                         31U,
                                         static_cast<u32>(instruction.pc),
+                                        false,
                                         false)) {
                 if (leaf_runtime_emit_failed) return {};
                 emit_runtime_call(JitRuntimeOperation::get_static,
@@ -7319,6 +7381,7 @@ compute_constant_flow(
                                         31U,
                                         31U,
                                         static_cast<u32>(instruction.pc),
+                                        false,
                                         false)) {
                 if (leaf_runtime_emit_failed) return {};
                 emit_runtime_call(JitRuntimeOperation::get_field,
@@ -7344,12 +7407,23 @@ compute_constant_flow(
                 return {};
             }
             requires_runtime_dispatch = true;
-            emit_runtime_call(JitRuntimeOperation::put_field,
-                              instruction.local_index,
-                              kScratchLeft,
-                              kScratchRight,
-                              31U,
-                              static_cast<u32>(instruction.pc));
+            if (!leaf_jit_writes_enabled() ||
+                !emit_leaf_runtime_call(JitRuntimeOperation::put_field,
+                                        instruction.local_index,
+                                        kScratchLeft,
+                                        kScratchRight,
+                                        31U,
+                                        static_cast<u32>(instruction.pc),
+                                        true,
+                                        false)) {
+                if (leaf_runtime_emit_failed) return {};
+                emit_runtime_call(JitRuntimeOperation::put_field,
+                                  instruction.local_index,
+                                  kScratchLeft,
+                                  kScratchRight,
+                                  31U,
+                                  static_cast<u32>(instruction.pc));
+            }
             break;
         case 0xB6U:
         case 0xB7U:
@@ -7864,6 +7938,7 @@ compute_constant_flow(
                                         31U,
                                         31U,
                                         static_cast<u32>(instruction.pc),
+                                        false,
                                         false)) {
                 if (leaf_runtime_emit_failed) return {};
                 emit_runtime_call(JitRuntimeOperation::array_length,
@@ -9503,7 +9578,8 @@ public:
 #endif
     }
 
-    [[nodiscard]] bool reserve_foreground_compile_slot() noexcept {
+    [[nodiscard]] bool reserve_foreground_compile_slot(
+        bool large_loop_priority = false) noexcept {
         if (!conservative_device_jit_mode()) return true;
 
         const auto& coordinator = runtime::shared_work_coordinator();
@@ -9517,12 +9593,37 @@ public:
             return false;
         }
 
+        const runtime::FramePressure frame_pressure =
+            coordinator.frame_pressure();
+        // A large one-shot loop can consume millions of interpreted bytecodes
+        // while never being invoked again.  If its first call happens inside
+        // the normal 200 ms foreground compile cooldown, deferring compilation
+        // means permanently missing the only useful JIT opportunity.  At
+        // nominal temperature and without frame pressure, allow this narrow
+        // class of methods to bypass only the time cooldown.  Thermal/render
+        // guards above remain authoritative, and publishing this compile's
+        // normal cooldown still delays subsequent ordinary warm helpers.
+        if (large_loop_priority &&
+            thermal == runtime::ThermalPressure::nominal) {
+            const u64 now = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            const u64 interval = device_foreground_compile_interval_nanoseconds_;
+            const u64 deadline =
+                now > std::numeric_limits<u64>::max() - interval
+                    ? std::numeric_limits<u64>::max()
+                    : now + interval;
+            next_foreground_compile_nanoseconds_.store(
+                deadline, std::memory_order_release);
+            return true;
+        }
+
         u64 interval = device_foreground_compile_interval_nanoseconds_;
         if (interval == 0U) return true;
         if (thermal == runtime::ThermalPressure::fair) {
             interval = std::max<u64>(interval, 1'000'000'000U);
         } else {
-            switch (coordinator.frame_pressure()) {
+            switch (frame_pressure) {
             case runtime::FramePressure::high:
             case runtime::FramePressure::overloaded:
                 interval = std::max<u64>(interval, 500'000'000U);
@@ -9657,6 +9758,9 @@ public:
             const auto analyze_loop_candidate = [&]() {
                 if (entry.loop_analyzed) return;
                 entry.loop_analyzed = true;
+                const usize bytecode_size = method.code.has_value()
+                    ? method.code->bytecode.size()
+                    : 0U;
                 auto decoded = decode_method(owner, method);
                 if (!decoded.has_value()) return;
                 for (const auto& instruction : *decoded) {
@@ -9673,8 +9777,11 @@ public:
                     }
                     if (!backward) continue;
                     entry.loop_candidate = true;
+                    entry.large_loop_candidate =
+                        bytecode_size >=
+                        kConservativeLargeLoopBytecodeThreshold;
                     entry.compilation_threshold = conservative_device_jit_mode()
-                        ? hot_threshold_
+                        ? (entry.large_loop_candidate ? 1U : hot_threshold_)
                         : 1U;
                     ++stats_.hot_loop_candidates;
                     break;
@@ -9704,7 +9811,9 @@ public:
                 entry.startup_compile_deferred = false;
                 if (!entry.loop_analyzed) analyze_loop_candidate();
                 entry.compilation_threshold = entry.loop_candidate
-                    ? (conservative_device_jit_mode() ? hot_threshold_ : 1U)
+                    ? (conservative_device_jit_mode()
+                           ? (entry.large_loop_candidate ? 1U : hot_threshold_)
+                           : 1U)
                     : std::min(entry.compilation_threshold, hot_threshold_);
             }
 
@@ -9761,7 +9870,8 @@ public:
                 ++stats_.startup_compile_attempts;
             }
 
-            if (!reserve_foreground_compile_slot()) {
+            if (!reserve_foreground_compile_slot(
+                    entry.large_loop_candidate)) {
                 ++stats_.foreground_compile_deferred;
                 ++stats_.warmup_fallbacks;
                 return std::optional<JitExecutionResult>{};
@@ -10704,6 +10814,7 @@ private:
         u32 osr_pending_polls {0};
         bool rejected {false};
         bool loop_candidate {false};
+        bool large_loop_candidate {false};
         bool loop_analyzed {false};
         bool startup_loop_analysis_deferred {false};
         bool startup_compile_deferred {false};

@@ -3,7 +3,8 @@ export type ScaleType = "asIs" | "fit" | "fill";
 export type KeyLayout = "nokiaSE" | "siemens" | "motorola" | "custom";
 export type VirtualKeyboardType = "phone" | "phoneArrows" | "numbersArrows" | "arrowsNumbers" | "numbers" | "arrows";
 export type ButtonShape = "oval" | "rectangle" | "roundedRectangle";
-export type TranslationSourceLanguage = "auto" | "zh-CN" | "zh-TW" | "ja" | "ko" | "en" | "ru" | "th" | "id" | "es" | "pt" | "fr" | "de";
+export type TranslationLanguage = "vi" | "zh-CN" | "zh-TW" | "ja" | "ko" | "en" | "ru" | "th" | "id" | "es" | "pt" | "fr" | "de";
+export type TranslationSourceLanguage = "auto" | TranslationLanguage;
 export type KeyboardControlOffset = { x: number; y: number };
 export type KeyboardGroupScale = { width: number; height: number };
 
@@ -24,6 +25,7 @@ export type WebGameProfile = {
   rotationLocked: boolean;
   autoTranslateEnabled: boolean;
   translationSourceLanguage: TranslationSourceLanguage;
+  translationTargetLanguage: TranslationLanguage;
   heapSizeMegabytes: number;
   fontSmall: number;
   fontMedium: number;
@@ -60,6 +62,7 @@ export const DEFAULT_GAME_PROFILE: WebGameProfile = {
   rotationLocked: false,
   autoTranslateEnabled: false,
   translationSourceLanguage: "auto",
+  translationTargetLanguage: "vi",
   heapSizeMegabytes: 128,
   fontSmall: 18,
   fontMedium: 22,

@@ -276,6 +276,13 @@ int32_t phoneme_set_suite_trust(PhoneMERuntimeRef runtime,
 int32_t phoneme_install_jar(PhoneMERuntimeRef runtime,
                             const char* jar_path,
                             int32_t* suite_id_out);
+/* Explicit host replacement keeps the existing suite ID when the same MIDP
+ * vendor/name is reimported, including changed JAR bytes with an unchanged
+ * MIDlet-Version. Downgrades remain rejected. RMS/files/permissions stay
+ * attached to the stable suite ID. */
+int32_t phoneme_install_jar_replacing(PhoneMERuntimeRef runtime,
+                                      const char* jar_path,
+                                      int32_t* suite_id_out);
 /* Host-scoped installation keeps imports with identical MIDP manifest identity
  * separate. Reinstalling the same scope replaces changed same-version bytes
  * while preserving the stable suite ID and its RMS/files. */

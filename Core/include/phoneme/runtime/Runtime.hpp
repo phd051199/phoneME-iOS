@@ -135,6 +135,8 @@ public:
         SuiteId suite_id,
         security::SuiteTrust trust);
     [[nodiscard]] Result<SuiteId> install_jar(const std::string& jar_path);
+    [[nodiscard]] Result<SuiteId> install_jar_replacing(
+        const std::string& jar_path);
     [[nodiscard]] Result<SuiteId> install_jar(
         const std::string& jar_path,
         std::string_view identity_scope);

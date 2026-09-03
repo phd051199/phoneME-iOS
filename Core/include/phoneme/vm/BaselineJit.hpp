@@ -137,7 +137,8 @@ inline constexpr usize kJitRuntimeConsumedByteOffset = 48U;
 inline constexpr usize kJitRuntimeLocalSlotsByteOffset = 52U;
 inline constexpr usize kJitRuntimeStackDepthByteOffset = 56U;
 inline constexpr usize kJitRuntimeLeafScratchByteOffset = 64U;
-inline constexpr usize kJitRuntimeFrameHeaderBytes = 72U;
+inline constexpr usize kJitRuntimeLeafScratchSecondByteOffset = 72U;
+inline constexpr usize kJitRuntimeFrameHeaderBytes = 80U;
 
 using JitRuntimeDispatch = u32 (*)(void* context,
                                    JitRuntimeOperation operation,

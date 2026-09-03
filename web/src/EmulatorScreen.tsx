@@ -38,7 +38,7 @@ import { createFramePresenter, type FramePresenter } from "./framePresenter";
 import { applyLcduiEvents, EMPTY_LCDUI_STATE, LCDUICommandBar, NativeLcduiView, type LcduiState } from "./lcdui";
 import type { PhoneMEWebRuntime, RuntimeTick } from "./phoneMEClient";
 import type { GameEntry, RuntimeSnapshot } from "./types";
-import type { TranslationSourceLanguage, VirtualKeyboardType, WebGameProfile } from "./webProfile";
+import type { TranslationLanguage, TranslationSourceLanguage, VirtualKeyboardType, WebGameProfile } from "./webProfile";
 
 const WEB_MAX_FPS = 60;
 const HOST_FRAME_INTERVAL_MS = 1000 / WEB_MAX_FPS;
@@ -48,8 +48,8 @@ const POINTER_PRESSED = 1;
 const POINTER_RELEASED = 2;
 const POINTER_DRAGGED = 3;
 
-const TRANSLATION_LANGUAGES: Array<{ value: TranslationSourceLanguage; label: string }> = [
-  { value: "auto", label: "Tự động nhận diện" },
+const TRANSLATION_LANGUAGES: Array<{ value: TranslationLanguage; label: string }> = [
+  { value: "vi", label: "Tiếng Việt" },
   { value: "zh-CN", label: "Tiếng Trung (Giản thể)" },
   { value: "zh-TW", label: "Tiếng Trung (Phồn thể)" },
   { value: "ja", label: "Tiếng Nhật" },
@@ -63,6 +63,14 @@ const TRANSLATION_LANGUAGES: Array<{ value: TranslationSourceLanguage; label: st
   { value: "fr", label: "Tiếng Pháp" },
   { value: "de", label: "Tiếng Đức" }
 ];
+
+const TRANSLATION_SOURCE_LANGUAGES: Array<{ value: TranslationSourceLanguage; label: string }> = [
+  { value: "auto", label: "Tự động nhận diện" },
+  ...TRANSLATION_LANGUAGES
+];
+
+const translationLanguageLabel = (language: TranslationSourceLanguage | TranslationLanguage) =>
+  TRANSLATION_SOURCE_LANGUAGES.find((item) => item.value === language)?.label ?? language;
 
 const KEYBOARD_MAP: Record<string, number> = {
   ArrowUp: -1,
@@ -601,6 +609,8 @@ export function EmulatorScreen({ runtime, game, profile, translationProvider, on
   const [keyboardMenuAnchor, setKeyboardMenuAnchor] = useState<HTMLElement | null>(null);
   const [layoutMenuAnchor, setLayoutMenuAnchor] = useState<HTMLElement | null>(null);
   const [translationMenuAnchor, setTranslationMenuAnchor] = useState<HTMLElement | null>(null);
+  const [translationSourceMenuAnchor, setTranslationSourceMenuAnchor] = useState<HTMLElement | null>(null);
+  const [translationTargetMenuAnchor, setTranslationTargetMenuAnchor] = useState<HTMLElement | null>(null);
   const [keyboardEditMode, setKeyboardEditMode] = useState<KeyboardEditMode>("none");
   const [keyboardEditSnapshot, setKeyboardEditSnapshot] = useState<WebGameProfile | null>(null);
   const [showHiddenKeysEditor, setShowHiddenKeysEditor] = useState(false);
@@ -701,7 +711,8 @@ export function EmulatorScreen({ runtime, game, profile, translationProvider, on
       await runtime.configureTranslation(
         profile.autoTranslateEnabled,
         translationProvider,
-        profile.translationSourceLanguage
+        profile.translationSourceLanguage,
+        profile.translationTargetLanguage
       );
     })();
     void launchPromise.then(() => {
@@ -1078,6 +1089,8 @@ export function EmulatorScreen({ runtime, game, profile, translationProvider, on
     setKeyboardMenuAnchor(null);
     setLayoutMenuAnchor(null);
     setTranslationMenuAnchor(null);
+    setTranslationSourceMenuAnchor(null);
+    setTranslationTargetMenuAnchor(null);
     if (isAppBarTemporarilyVisible) {
       window.setTimeout(() => setIsAppBarTemporarilyVisible(false), 120);
     }
@@ -1106,9 +1119,18 @@ export function EmulatorScreen({ runtime, game, profile, translationProvider, on
     closePlayerMenus();
   };
 
-  const setTranslation = (enabled: boolean, source: TranslationSourceLanguage = profile.translationSourceLanguage) => {
-    onProfileChange({ ...profile, autoTranslateEnabled: enabled, translationSourceLanguage: source });
-    void runtime.configureTranslation(enabled, translationProvider, source).catch((error) => {
+  const setTranslation = (
+    enabled: boolean,
+    source: TranslationSourceLanguage = profile.translationSourceLanguage,
+    target: TranslationLanguage = profile.translationTargetLanguage
+  ) => {
+    onProfileChange({
+      ...profile,
+      autoTranslateEnabled: enabled,
+      translationSourceLanguage: source,
+      translationTargetLanguage: target
+    });
+    void runtime.configureTranslation(enabled, translationProvider, source, target).catch((error) => {
       setRuntimeError(error instanceof Error ? error.message : String(error));
     });
     closePlayerMenus();
@@ -1363,13 +1385,39 @@ export function EmulatorScreen({ runtime, game, profile, translationProvider, on
       </MenuItem>)}
     </Menu>
 
-    <Menu className="player-submenu" anchorEl={translationMenuAnchor} open={Boolean(translationMenuAnchor)} onClose={() => setTranslationMenuAnchor(null)} anchorOrigin={{ vertical: "top", horizontal: "right" }} transformOrigin={{ vertical: "top", horizontal: "left" }}>
+    <Menu className="player-submenu" anchorEl={translationMenuAnchor} open={Boolean(translationMenuAnchor)} onClose={() => { setTranslationMenuAnchor(null); setTranslationSourceMenuAnchor(null); setTranslationTargetMenuAnchor(null); }} anchorOrigin={{ vertical: "top", horizontal: "right" }} transformOrigin={{ vertical: "top", horizontal: "left" }}>
       <MenuItem onClick={() => setTranslation(false)}>
         {!profile.autoTranslateEnabled ? <CheckRounded fontSize="small" /> : <Box className="menu-icon-spacer" />}<span>Tắt</span>
       </MenuItem>
       <Divider />
-      {TRANSLATION_LANGUAGES.map((language) => <MenuItem key={language.value} onClick={() => setTranslation(true, language.value)}>
+      <MenuItem onClick={(event) => {
+        setTranslationTargetMenuAnchor(null);
+        setTranslationSourceMenuAnchor(event.currentTarget);
+      }}>
+        <TranslateRounded fontSize="small" />
+        <span>Từ: {translationLanguageLabel(profile.translationSourceLanguage)}</span>
+        <ArrowForwardIosRounded className="submenu-chevron" />
+      </MenuItem>
+      <MenuItem onClick={(event) => {
+        setTranslationSourceMenuAnchor(null);
+        setTranslationTargetMenuAnchor(event.currentTarget);
+      }}>
+        <TranslateRounded fontSize="small" />
+        <span>Sang: {translationLanguageLabel(profile.translationTargetLanguage)}</span>
+        <ArrowForwardIosRounded className="submenu-chevron" />
+      </MenuItem>
+    </Menu>
+
+    <Menu className="player-submenu" anchorEl={translationSourceMenuAnchor} open={Boolean(translationSourceMenuAnchor)} onClose={() => setTranslationSourceMenuAnchor(null)} anchorOrigin={{ vertical: "top", horizontal: "right" }} transformOrigin={{ vertical: "top", horizontal: "left" }}>
+      {TRANSLATION_SOURCE_LANGUAGES.map((language) => <MenuItem key={language.value} onClick={() => setTranslation(true, language.value, profile.translationTargetLanguage)}>
         {profile.autoTranslateEnabled && profile.translationSourceLanguage === language.value ? <CheckRounded fontSize="small" /> : <Box className="menu-icon-spacer" />}
+        <span>{language.label}</span>
+      </MenuItem>)}
+    </Menu>
+
+    <Menu className="player-submenu" anchorEl={translationTargetMenuAnchor} open={Boolean(translationTargetMenuAnchor)} onClose={() => setTranslationTargetMenuAnchor(null)} anchorOrigin={{ vertical: "top", horizontal: "right" }} transformOrigin={{ vertical: "top", horizontal: "left" }}>
+      {TRANSLATION_LANGUAGES.map((language) => <MenuItem key={language.value} onClick={() => setTranslation(true, profile.translationSourceLanguage, language.value)}>
+        {profile.autoTranslateEnabled && profile.translationTargetLanguage === language.value ? <CheckRounded fontSize="small" /> : <Box className="menu-icon-spacer" />}
         <span>{language.label}</span>
       </MenuItem>)}
     </Menu>

@@ -6,6 +6,9 @@ import process from "node:process";
 const root = path.resolve(import.meta.dirname, "..");
 const customJarPath = process.argv[2];
 const extraJarPaths = process.argv.slice(3).map((value) => path.resolve(value));
+const reinstallJarPath = process.env.PHONEME_SMOKE_REINSTALL_JAR?.trim()
+  ? path.resolve(process.env.PHONEME_SMOKE_REINSTALL_JAR.trim())
+  : "";
 const websocketProxyUrl = process.env.PHONEME_WEBSOCKET_PROXY_URL?.trim() || "";
 const holdMilliseconds = Math.max(0, Number.parseInt(process.env.PHONEME_SMOKE_HOLD_MS ?? "0", 10) || 0);
 const skipReload = process.env.PHONEME_SMOKE_SKIP_RELOAD === "1";
@@ -36,6 +39,7 @@ const baseUrl = externalBaseUrl || `http://127.0.0.1:${port}`;
 
 await access(jarPath);
 for (const extraJarPath of extraJarPaths) await access(extraJarPath);
+if (reinstallJarPath) await access(reinstallJarPath);
 await access(chromePath);
 
 const preview = externalBaseUrl ? null : spawn(
@@ -204,6 +208,33 @@ try {
     return titled?.getAttribute('title') || titled?.textContent?.trim() || '';
   })()`);
   if (!installedTitle) throw new Error("Installed MIDlet title not found");
+  if (reinstallJarPath) {
+    console.log("[smoke] reinstalling changed same-version JAR");
+    const beforeReplacement = await evaluate(`(() => {
+      const games = JSON.parse(localStorage.getItem('phoneme-web.games.v1') || '[]');
+      return games[0] || null;
+    })()`);
+    if (!beforeReplacement?.suiteId || !beforeReplacement?.id) {
+      throw new Error(`Installed game record missing before replacement: ${JSON.stringify(beforeReplacement)}`);
+    }
+    await sleep(10);
+    await command("DOM.setFileInputFiles", {
+      files: [reinstallJarPath],
+      nodeId: inputNode.nodeId
+    });
+    const beforeSuiteId = Number(beforeReplacement.suiteId);
+    const beforeInstalledAt = Number(beforeReplacement.installedAt || 0);
+    const beforeIdLiteral = JSON.stringify(String(beforeReplacement.id));
+    const replacement = await waitForExpression(`(() => {
+      const games = JSON.parse(localStorage.getItem('phoneme-web.games.v1') || '[]');
+      if (games.length !== 1) return null;
+      const game = games[0];
+      if (game.suiteId !== ${beforeSuiteId} || game.id !== ${beforeIdLiteral} ||
+          Number(game.installedAt || 0) <= ${beforeInstalledAt}) return null;
+      return game;
+    })()`, 60_000);
+    console.log("[smoke] replacement kept suite/UI identity", replacement.suiteId, replacement.id);
+  }
   if (overrideMainClass) {
     console.log("[smoke] overriding MIDlet main class", overrideMainClass);
     await evaluate(`(() => {

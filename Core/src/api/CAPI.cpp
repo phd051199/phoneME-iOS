@@ -461,6 +461,28 @@ int32_t phoneme_install_jar(PhoneMERuntimeRef runtime,
     return PHONEME_OK;
 }
 
+int32_t phoneme_install_jar_replacing(PhoneMERuntimeRef runtime,
+                                      const char* jar_path,
+                                      int32_t* suite_id_out) {
+    Runtime* instance = cast_runtime(runtime);
+    if (instance == nullptr || jar_path == nullptr || suite_id_out == nullptr) {
+        return PHONEME_ERROR_INVALID_ARGUMENT;
+    }
+
+    g_last_install_stage.store(1, std::memory_order_relaxed);
+    auto suite = instance->install_jar_replacing(jar_path);
+    if (!suite) {
+        g_last_install_stage.store(-1, std::memory_order_relaxed);
+        instance->record_error(suite.error());
+        return map_error(suite.error());
+    }
+    instance->clear_error();
+    *suite_id_out = suite->value;
+    g_last_suite_store_stage.store(1, std::memory_order_relaxed);
+    g_last_install_stage.store(2, std::memory_order_relaxed);
+    return PHONEME_OK;
+}
+
 int32_t phoneme_install_jar_scoped(PhoneMERuntimeRef runtime,
                                    const char* jar_path,
                                    const char* identity_scope,

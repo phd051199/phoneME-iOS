@@ -1,0 +1,4 @@
+"CFBundleDisplayName" = "phoneME";
+"NSPhotoLibraryAddUsageDescription" = "允许 phoneME 将游戏截图保存到您的照片图库。";
+"NSLocationWhenInUseUsageDescription" = "phoneME 仅使用低精度定位更新，以便应用在后台运行时维持正在运行的游戏及其网络连接。";
+"NSLocationAlwaysAndWhenInUseUsageDescription" = "允许后台定位访问，以便 phoneME 在应用未显示于屏幕上时仍能维持正在运行的游戏及其网络连接。";

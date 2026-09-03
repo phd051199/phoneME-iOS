@@ -84,6 +84,8 @@ public:
     }
 
     [[nodiscard]] Result<SuiteId> install(const std::string& jar_path);
+    [[nodiscard]] Result<SuiteId> install_replacing(
+        const std::string& jar_path);
     [[nodiscard]] Result<SuiteId> install_scoped(
         const std::string& jar_path,
         std::string_view identity_scope);
@@ -115,7 +117,8 @@ private:
         const std::string& jar_path,
         const std::optional<std::string>& jad_path,
         bool allow_downgrade,
-        std::string_view identity_scope);
+        std::string_view identity_scope,
+        bool allow_same_version_replacement);
     [[nodiscard]] Result<Suite> make_suite(
         SuiteId id,
         const SuiteDescriptor& descriptor,

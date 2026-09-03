@@ -259,6 +259,8 @@
 "Unlock screen rotation" = "Mở khóa xoay màn hình";
 "Lock screen rotation" = "Khóa xoay màn hình";
 "Auto translate" = "Tự động dịch";
+"Translate from: %@" = "Từ: %@";
+"Translate to: %@" = "Sang: %@";
 "Translation" = "Dịch thuật";
 "Translation service" = "Dịch vụ dịch thuật";
 "Automatic" = "Tự động";

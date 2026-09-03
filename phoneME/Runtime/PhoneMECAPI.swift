@@ -840,10 +840,11 @@ final class PhoneMECAPI: @unchecked Sendable {
         _ runtime: RuntimeHandle?,
         enabled: Bool,
         provider: TranslationProvider,
-        sourceLanguage: TranslationSourceLanguage
+        sourceLanguage: TranslationSourceLanguage,
+        targetLanguage: TranslationTargetLanguage
     ) -> Int32 {
         sourceLanguage.rawValue.withCString { sourceLanguage in
-            "vi".withCString { targetLanguage in
+            targetLanguage.rawValue.withCString { targetLanguage in
                 phoneme_configure_translation_v2(
                     runtime?.rawValue,
                     enabled ? 1 : 0,
@@ -860,10 +861,11 @@ final class PhoneMECAPI: @unchecked Sendable {
         appID: Int32,
         enabled: Bool,
         provider: TranslationProvider,
-        sourceLanguage: TranslationSourceLanguage
+        sourceLanguage: TranslationSourceLanguage,
+        targetLanguage: TranslationTargetLanguage
     ) -> Int32 {
         sourceLanguage.rawValue.withCString { sourceLanguage in
-            "vi".withCString { targetLanguage in
+            targetLanguage.rawValue.withCString { targetLanguage in
                 phoneme_configure_app_translation_v2(
                     runtime?.rawValue,
                     appID,

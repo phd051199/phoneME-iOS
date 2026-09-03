@@ -50,6 +50,7 @@ enum TranslationProvider: String, CaseIterable, Identifiable {
 
 enum TranslationSourceLanguage: String, Codable, CaseIterable, Identifiable {
     case auto
+    case vietnamese = "vi"
     case simplifiedChinese = "zh-CN"
     case traditionalChinese = "zh-TW"
     case japanese = "ja"
@@ -68,6 +69,7 @@ enum TranslationSourceLanguage: String, Codable, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .auto: return L10n.string("Auto detect")
+        case .vietnamese: return L10n.string("Vietnamese")
         case .simplifiedChinese: return L10n.string("Chinese (Simplified)")
         case .traditionalChinese: return L10n.string("Chinese (Traditional)")
         case .japanese: return L10n.string("Japanese")
@@ -88,7 +90,53 @@ enum TranslationSourceLanguage: String, Codable, CaseIterable, Identifiable {
         case .auto: return "wand.and.stars"
         case .simplifiedChinese, .traditionalChinese, .japanese, .korean:
             return "character"
-        case .english, .russian, .thai, .indonesian, .spanish,
+        case .vietnamese, .english, .russian, .thai, .indonesian, .spanish,
+             .portuguese, .french, .german:
+            return "textformat.abc"
+        }
+    }
+}
+
+enum TranslationTargetLanguage: String, Codable, CaseIterable, Identifiable {
+    case vietnamese = "vi"
+    case simplifiedChinese = "zh-CN"
+    case traditionalChinese = "zh-TW"
+    case japanese = "ja"
+    case korean = "ko"
+    case english = "en"
+    case russian = "ru"
+    case thai = "th"
+    case indonesian = "id"
+    case spanish = "es"
+    case portuguese = "pt"
+    case french = "fr"
+    case german = "de"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .vietnamese: return L10n.string("Vietnamese")
+        case .simplifiedChinese: return L10n.string("Chinese (Simplified)")
+        case .traditionalChinese: return L10n.string("Chinese (Traditional)")
+        case .japanese: return L10n.string("Japanese")
+        case .korean: return L10n.string("Korean")
+        case .english: return L10n.string("English")
+        case .russian: return L10n.string("Russian")
+        case .thai: return L10n.string("Thai")
+        case .indonesian: return L10n.string("Indonesian")
+        case .spanish: return L10n.string("Spanish")
+        case .portuguese: return L10n.string("Portuguese")
+        case .french: return L10n.string("French")
+        case .german: return L10n.string("German")
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .simplifiedChinese, .traditionalChinese, .japanese, .korean:
+            return "character"
+        case .vietnamese, .english, .russian, .thai, .indonesian, .spanish,
              .portuguese, .french, .german:
             return "textformat.abc"
         }
@@ -352,6 +400,8 @@ struct GameProfile: Codable, Equatable {
     var autoTranslateToVietnamese: Bool?
     // Missing/nil preserves the legacy automatic source-language behavior.
     var autoTranslationSourceLanguage: TranslationSourceLanguage?
+    // Missing/nil preserves the legacy behavior of translating into Vietnamese.
+    var autoTranslationTargetLanguage: TranslationTargetLanguage?
 
     var fontSmall = 18
     var fontMedium = 22
@@ -466,6 +516,13 @@ struct GameProfile: Codable, Equatable {
     var effectiveAutoTranslationSourceLanguage: TranslationSourceLanguage {
         get { autoTranslationSourceLanguage ?? .auto }
         set { autoTranslationSourceLanguage = newValue == .auto ? nil : newValue }
+    }
+
+    var effectiveAutoTranslationTargetLanguage: TranslationTargetLanguage {
+        get { autoTranslationTargetLanguage ?? .vietnamese }
+        set {
+            autoTranslationTargetLanguage = newValue == .vietnamese ? nil : newValue
+        }
     }
 
     mutating func normalize() {

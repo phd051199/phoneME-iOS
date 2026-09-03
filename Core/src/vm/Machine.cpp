@@ -8002,7 +8002,6 @@ namespace phoneme::vm
       u64 third,
       u64* result_bits) noexcept
   {
-    (void)third;
     auto* execution = static_cast<JitExecutionContext*>(context);
     if (execution == nullptr || execution->machine == nullptr ||
         execution->owner == nullptr || result_bits == nullptr)
@@ -8036,6 +8035,33 @@ namespace phoneme::vm
         return static_cast<u32>(JitRuntimeStatus::deoptimize);
       *result_bits = value->raw_bits_unchecked();
       return static_cast<u32>(JitRuntimeStatus::success);
+    }
+    case JitRuntimeOperation::put_field:
+    {
+      // Preserve the receiver so a cold binding/shape can retry through the
+      // full dispatcher without re-reading the already-popped operand stack.
+      *result_bits = first;
+      if (operand > static_cast<u32>(std::numeric_limits<u16>::max()))
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      const ObjectRef object{first};
+      if (object.is_null())
+        return static_cast<u32>(JitRuntimeStatus::null_pointer);
+      const auto bindings = machine.field_bindings_.find(execution->owner);
+      if (bindings == machine.field_bindings_.end() ||
+          operand >= bindings->second.size() ||
+          !bindings->second[operand].has_value())
+      {
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      }
+      const QuickFieldBinding& field = *bindings->second[operand];
+      if (field.is_static)
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      const Value value = Value::from_raw_unchecked(field.value_kind, second);
+      auto stored = machine.heap_.vm_set_field_typed(
+          object, field.index, field.value_kind, value);
+      return stored
+          ? static_cast<u32>(JitRuntimeStatus::success)
+          : static_cast<u32>(JitRuntimeStatus::deoptimize);
     }
     case JitRuntimeOperation::get_static:
     {
@@ -8122,6 +8148,77 @@ namespace phoneme::vm
       else
       {
         *result_bits = snapshot->raw;
+      }
+      return static_cast<u32>(JitRuntimeStatus::success);
+    }
+    case JitRuntimeOperation::array_store:
+    {
+      // Keep reference-array stores on the full path: JVM aastore requires a
+      // potentially cold class-assignability query, which is intentionally
+      // outside the non-allocating leaf-helper contract. Primitive arrays can
+      // be validated and written entirely through the VM-fast heap API.
+      *result_bits = first;
+      if (operand > static_cast<u32>(std::numeric_limits<u8>::max()))
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      const u8 opcode = static_cast<u8>(operand);
+      if (opcode == 0x53U)
+        return static_cast<u32>(JitRuntimeStatus::deoptimize);
+      const ObjectRef array{first};
+      const i32 index = static_cast<i32>(static_cast<u32>(second));
+      if (array.is_null())
+        return static_cast<u32>(JitRuntimeStatus::null_pointer);
+      if (index < 0)
+        return static_cast<u32>(
+            JitRuntimeStatus::array_index_out_of_bounds);
+
+      HeapArrayKind store_kind = HeapArrayKind::integer;
+      u64 store_raw = third;
+      if (opcode == 0x54U)
+      {
+        auto info = machine.heap_.vm_array_info(array);
+        if (!info)
+          return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        if (static_cast<usize>(index) >= info->length)
+          return static_cast<u32>(
+              JitRuntimeStatus::array_index_out_of_bounds);
+        if (info->kind != HeapArrayKind::boolean &&
+            info->kind != HeapArrayKind::byte)
+        {
+          return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        }
+        store_kind = info->kind;
+        const i32 integer = static_cast<i32>(static_cast<u32>(third));
+        store_raw = info->kind == HeapArrayKind::boolean
+            ? static_cast<u64>((integer & 1) == 0 ? 0U : 1U)
+            : static_cast<u64>(static_cast<u8>(static_cast<i8>(integer)));
+      }
+      else
+      {
+        const auto expected = array_store_heap_kind(opcode);
+        if (!expected.has_value())
+          return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        store_kind = *expected;
+        if (opcode == 0x55U)
+        {
+          store_raw = static_cast<u64>(static_cast<u16>(third));
+        }
+        else if (opcode == 0x56U)
+        {
+          store_raw = static_cast<u64>(static_cast<u16>(
+              static_cast<i16>(static_cast<u32>(third))));
+        }
+      }
+
+      auto stored = machine.heap_.vm_set_array_raw_element_checked(
+          array,
+          static_cast<usize>(index),
+          store_kind,
+          store_raw);
+      if (!stored)
+      {
+        return stored.error().code == ErrorCode::out_of_range
+            ? static_cast<u32>(JitRuntimeStatus::array_index_out_of_bounds)
+            : static_cast<u32>(JitRuntimeStatus::deoptimize);
       }
       return static_cast<u32>(JitRuntimeStatus::success);
     }
@@ -8567,7 +8664,27 @@ namespace phoneme::vm
 
     const auto bounded_cost = bounded_jit_invocation_cost(target, 0U);
     if (!bounded_cost.has_value() || *bounded_cost > native_limit)
-      return std::nullopt;
+    {
+      // Generated code has a precise budget_safepoint slow path that captures
+      // the complete JIT frame and resumes in the interpreter without replaying
+      // side effects.  Use a deliberately small native window for scheduler-
+      // owned Java threads whose VM budget is effectively unbounded.  The old
+      // policy rejected every method containing a backward branch here, which
+      // accidentally forced image/Deflate loaders and other finite worker
+      // loops through the interpreter forever even after they became hot.
+      //
+      // Five million bytecodes is large enough for normal decode/update loops
+      // to finish natively, but bounded enough that an actually infinite loop
+      // returns to the interpreter/scheduler promptly instead of monopolizing
+      // the execution gate for the JIT ABI's full 30-bit counter range.
+      constexpr u64 kUnboundedThreadJitWindow = 5'000'000U;
+      if (target.method == nullptr || !target.method->code.has_value() ||
+          target.runtime == nullptr || target.runtime->decoded == nullptr)
+      {
+        return std::nullopt;
+      }
+      return std::min(native_limit, kUnboundedThreadJitWindow);
+    }
     return native_limit;
   }
 

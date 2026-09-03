@@ -84,6 +84,8 @@
 		B00000000000000000000032 /* vi */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = vi; path = vi.lproj/Localizable.strings; sourceTree = "<group>"; };
 		B00000000000000000000034 /* en */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = en; path = en.lproj/InfoPlist.strings; sourceTree = "<group>"; };
 		B00000000000000000000035 /* vi */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = vi; path = vi.lproj/InfoPlist.strings; sourceTree = "<group>"; };
+		B0000000000000000000003C /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "zh-Hans.lproj/Localizable.strings"; sourceTree = "<group>"; };
+		B0000000000000000000003D /* zh-Hans */ = {isa = PBXFileReference; lastKnownFileType = text.plist.strings; name = "zh-Hans"; path = "zh-Hans.lproj/InfoPlist.strings"; sourceTree = "<group>"; };
 		B00000000000000000000037 /* EmulatorWorkspace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmulatorWorkspace.swift; sourceTree = "<group>"; };
 		B00000000000000000000038 /* WorkspaceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceStore.swift; sourceTree = "<group>"; };
 		B00000000000000000000039 /* WorkspacesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspacesView.swift; sourceTree = "<group>"; };
@@ -268,6 +270,7 @@
 			knownRegions = (
 				en,
 				vi,
+				"zh-Hans",
 				Base,
 			);
 			mainGroup = D00000000000000000000001;
@@ -371,6 +374,7 @@
 			children = (
 				B00000000000000000000031 /* en */,
 				B00000000000000000000032 /* vi */,
+				B0000000000000000000003C /* zh-Hans */,
 			);
 			name = Localizable.strings;
 			sourceTree = "<group>";
@@ -380,6 +384,7 @@
 			children = (
 				B00000000000000000000034 /* en */,
 				B00000000000000000000035 /* vi */,
+				B0000000000000000000003D /* zh-Hans */,
 			);
 			name = InfoPlist.strings;
 			sourceTree = "<group>";

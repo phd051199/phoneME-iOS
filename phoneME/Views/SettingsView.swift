@@ -203,6 +203,8 @@ struct SettingsView: View {
                         enabled: true,
                         sourceLanguage:
                             profile.effectiveAutoTranslationSourceLanguage,
+                        targetLanguage:
+                            profile.effectiveAutoTranslationTargetLanguage,
                         provider: provider,
                         for: application.game
                     ) { _ in }

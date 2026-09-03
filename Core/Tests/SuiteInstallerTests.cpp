@@ -206,6 +206,10 @@ void test_scoped_same_version_install(
     auto rejected = store.install(changed.string());
     check_error(rejected, ErrorCode::invalid_state,
                 "retain strict unscoped same-version replacement policy");
+    auto explicit_replacement = store.install_replacing(changed.string());
+    check(explicit_replacement.has_value() &&
+              *explicit_replacement == *unscoped,
+          "explicit host replacement accepts changed same-version JAR");
 
     auto first = store.install_scoped(baseline.string(), "game-a");
     auto second = store.install_scoped(changed.string(), "game-b");

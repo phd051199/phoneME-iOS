@@ -22,6 +22,8 @@ _Static_assert(sizeof(&phoneme_push_notify_connection_available_from_source) ==
                "source-aware push notification must remain exported");
 _Static_assert(sizeof(&phoneme_uninstall_suite) == sizeof(void*),
                "suite uninstall must remain exported");
+_Static_assert(sizeof(&phoneme_install_jar_replacing) == sizeof(void*),
+               "explicit suite replacement must remain exported");
 _Static_assert(sizeof(&phoneme_copy_last_error_message) == sizeof(void*),
                "runtime error message accessor must remain exported");
 _Static_assert(sizeof(&phoneme_copy_midlet_error_message) == sizeof(void*),

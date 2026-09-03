@@ -252,12 +252,12 @@ int main(int argc, char** argv) {
                 statistics.stack_cached_methods > 0U,
             "JIT benchmark exercises ARM64 register caches");
 
-    // An effectively unbounded scheduler budget must not directly admit a
-    // loop method into the ARM64 JIT.  The scheduler remains interpreted while
-    // finite helpers below it can still JIT.  This is the safety regression
-    // test for iOS game loops: the sumLoop body is already hot/compiled from the
-    // benchmark above, so an unbounded invocation must complete without
-    // executing or deoptimizing that compiled entry.
+    // Effectively-unbounded scheduler entries use a finite native JIT window.
+    // The generated budget safepoint can capture a precise frame and resume in
+    // the interpreter if that window is exhausted, so a normal finite loop no
+    // longer has to stay interpreted merely because its owning Java thread has
+    // an unbounded VM budget.  sumLoop is already hot/compiled above and this
+    // small invocation must finish inside the native window without deopting.
     {
         constexpr phoneme::i32 kGuardedLimit = 1'000;
         const phoneme::i32 kGuardedExpected =
@@ -277,10 +277,10 @@ int main(int argc, char** argv) {
                     guarded_result->return_value.has_value() &&
                     guarded_result->return_value->as_int().value_or(0) ==
                         kGuardedExpected,
-                "unbounded loop invocation completes in the interpreter");
-        require(after.executed_methods == before.executed_methods &&
+                "unbounded loop invocation completes normally");
+        require(after.executed_methods > before.executed_methods &&
                     after.deoptimized_executions == before.deoptimized_executions,
-                "unbounded loop invocation does not enter compiled code");
+                "unbounded loop invocation executes inside the finite JIT window");
     }
 
     const double speedup = jit_run.elapsed_nanoseconds == 0U

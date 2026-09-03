@@ -242,7 +242,8 @@ async function handleRequest(message: RequestMessage) {
     runtime.configureTranslation(
       Boolean(payload.enabled),
       payload.provider as "google" | "bing" | "automatic",
-      String(payload.sourceLanguage ?? "auto")
+      String(payload.sourceLanguage ?? "auto"),
+      String(payload.targetLanguage ?? "vi")
     );
     return undefined;
   case "pause":

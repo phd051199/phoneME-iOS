@@ -466,6 +466,8 @@ final class EmulatorSession: ObservableObject {
             translationProvider: TranslationProvider.selected,
             translationSourceLanguage:
                 profile.effectiveAutoTranslationSourceLanguage,
+            translationTargetLanguage:
+                profile.effectiveAutoTranslationTargetLanguage,
             keyUp: profile.keyCode(for: .up),
             keyDown: profile.keyCode(for: .down),
             keyLeft: profile.keyCode(for: .left),
@@ -499,6 +501,7 @@ final class EmulatorSession: ObservableObject {
     func setAutoTranslationConfiguration(
         enabled: Bool,
         sourceLanguage: TranslationSourceLanguage,
+        targetLanguage: TranslationTargetLanguage,
         provider: TranslationProvider = .selected,
         for game: Game,
         completion: @escaping (Result<Void, Error>) -> Void
@@ -508,6 +511,7 @@ final class EmulatorSession: ObservableObject {
             enabled: enabled,
             provider: provider,
             sourceLanguage: sourceLanguage,
+            targetLanguage: targetLanguage,
             completion: completion
         )
     }

@@ -259,6 +259,8 @@
 "Unlock screen rotation" = "Unlock screen rotation";
 "Lock screen rotation" = "Lock screen rotation";
 "Auto translate" = "Auto translate";
+"Translate from: %@" = "From: %@";
+"Translate to: %@" = "To: %@";
 "Translation" = "Translation";
 "Translation service" = "Translation service";
 "Automatic" = "Automatic";

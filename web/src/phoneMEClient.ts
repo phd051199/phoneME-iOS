@@ -117,6 +117,7 @@ export class PhoneMEWebRuntime {
   private workerTickRenderedFrames = 0;
   private workerTickError = "";
   private runtimeTickListeners = new Set<(tick: RuntimeTick) => void>();
+  private runtimeUseGeneration = 0;
 
   get ready() {
     return this.initialized && (this.worker !== null || this.directRuntime?.ready === true);
@@ -203,12 +204,27 @@ export class PhoneMEWebRuntime {
     if (this.activeGame) return;
     if (!this.worker && !this.directRuntime) return;
 
+    const useGeneration = this.runtimeUseGeneration;
+
     // Installing/parsing a JAR can permanently grow WebAssembly linear memory;
     // Wasm memory cannot shrink again inside the same instance. Persist first,
     // then discard the idle installer instance so the next MIDlet starts from
     // a clean runtime instead of inheriting installer memory/state.
+    //
+    // The library row becomes visible before this cleanup finishes. A fast tap
+    // can therefore begin configure/launch while syncfs is still completing.
+    // Never terminate a runtime that somebody started using after recycling
+    // began; that race made a freshly installed app fail until the page was
+    // reloaded.
     await this.flushStorage();
+    if (this.activeGame || this.runtimeUseGeneration !== useGeneration) return;
     this.invalidateRuntime(new Error("Khởi tạo lại phoneME sau khi cài ứng dụng"));
+
+    // Hydrate the freshly persisted suite database now, while installation is
+    // still considered in progress, instead of deferring the first IDBFS load
+    // to the user's first tap. This both validates persistence and makes a new
+    // app immediately launchable without an F5/cold document reload.
+    await this.initialize();
   }
 
   async uninstall(game: GameEntry, removeData: boolean) {
@@ -264,14 +280,19 @@ export class PhoneMEWebRuntime {
     await this.request("configureFrameRateOverride", { enabled, framesPerSecond });
   }
 
-  async configureTranslation(enabled: boolean, provider: "google" | "bing" | "automatic", sourceLanguage: string) {
+  async configureTranslation(
+    enabled: boolean,
+    provider: "google" | "bing" | "automatic",
+    sourceLanguage: string,
+    targetLanguage: string
+  ) {
     await this.ensureReady();
     if (this.directRuntime) {
-      this.directRuntime.configureTranslation(enabled, provider, sourceLanguage);
+      this.directRuntime.configureTranslation(enabled, provider, sourceLanguage, targetLanguage);
       return;
     }
     if (!this.currentGameValue) return;
-    await this.request("configureTranslation", { enabled, provider, sourceLanguage });
+    await this.request("configureTranslation", { enabled, provider, sourceLanguage, targetLanguage });
   }
 
   async pause() {
@@ -617,6 +638,7 @@ export class PhoneMEWebRuntime {
   }
 
   private async ensureReady() {
+    this.runtimeUseGeneration += 1;
     if (!this.ready) await this.initialize();
   }
 

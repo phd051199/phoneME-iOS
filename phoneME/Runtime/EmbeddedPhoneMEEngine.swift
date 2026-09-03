@@ -826,6 +826,7 @@ final class EmbeddedPhoneMEEngine: NSObject {
         autoTranslateToVietnamese: Bool,
         translationProvider: TranslationProvider,
         translationSourceLanguage: TranslationSourceLanguage,
+        translationTargetLanguage: TranslationTargetLanguage,
         keyUp: Int32,
         keyDown: Int32,
         keyLeft: Int32,
@@ -952,7 +953,8 @@ final class EmbeddedPhoneMEEngine: NSObject {
                     createdRuntime,
                     enabled: autoTranslateToVietnamese,
                     provider: translationProvider,
-                    sourceLanguage: translationSourceLanguage
+                    sourceLanguage: translationSourceLanguage,
+                    targetLanguage: translationTargetLanguage
                 )
                 guard translationResult == 0 else {
                     throw loadedAPI.failure(
@@ -1233,6 +1235,7 @@ final class EmbeddedPhoneMEEngine: NSObject {
         enabled: Bool,
         provider: TranslationProvider,
         sourceLanguage: TranslationSourceLanguage,
+        targetLanguage: TranslationTargetLanguage,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         let context = runtimeContext
@@ -1246,7 +1249,8 @@ final class EmbeddedPhoneMEEngine: NSObject {
                     appID: appID,
                     enabled: enabled,
                     provider: provider,
-                    sourceLanguage: sourceLanguage
+                    sourceLanguage: sourceLanguage,
+                    targetLanguage: targetLanguage
                 )
                 result = status == 0
                     ? .success(())
