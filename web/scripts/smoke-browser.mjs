@@ -338,6 +338,18 @@ try {
     if (/Tạm dừng|Khởi động lại|Toàn màn hình/.test(playerMenuText)) {
       throw new Error(`Player menu contains non-Swift actions: ${playerMenuText}`);
     }
+    await evaluate(`(() => {
+      const items = [...document.querySelectorAll('.player-menu .MuiMenuItem-root')];
+      const translation = items.find((item) => item.innerText?.includes('Tự động dịch'));
+      if (!translation) return false;
+      translation.click();
+      return true;
+    })()`);
+    await waitForExpression(`(() => {
+      const menus = [...document.querySelectorAll('.player-submenu .MuiMenu-list')];
+      const text = menus.map((menu) => menu.innerText || '').join(' ');
+      return text.includes('Từ:') && text.includes('Sang:');
+    })()`);
     await evaluate(`document.body.click()`);
   }
 
