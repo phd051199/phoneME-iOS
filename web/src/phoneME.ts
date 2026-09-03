@@ -345,19 +345,26 @@ export class PhoneMEWebRuntime {
   }
 
   configureFrameRate() {
+    this.configureFrameRateOverride(false, 60);
+  }
+
+  configureFrameRateOverride(enabled: boolean, framesPerSecond: number) {
+    const requested = Math.min(60, Math.max(1, Math.round(framesPerSecond || 30)));
+    // Native mode preserves a MIDlet's own Thread.sleep/repaint cadence and
+    // only backpressures sustained overproduction. The old web path used CAP
+    // at 30 FPS unconditionally, stacking an extra host delay on games that
+    // already paced themselves and making them visibly run in slow motion.
+    const effectiveRate = enabled ? requested : 60;
+    const pacingMode = enabled ? 2 : 0;
     this.assertOk(
       this.requireModule()._phoneme_configure_app_frame_pacing(
         this.runtime,
         APP_ID,
-        30,
-        1
+        effectiveRate,
+        pacingMode
       ),
       "Giới hạn FPS"
     );
-  }
-
-  configureFrameRateOverride(_enabled: boolean, _framesPerSecond: number) {
-    this.configureFrameRate();
   }
 
   configureTranslation(enabled: boolean, provider: "google" | "bing" | "automatic", sourceLanguage: string) {
@@ -414,6 +421,10 @@ export class PhoneMEWebRuntime {
   }
 
   memoryStats() {
+    // Storage generation checks used to run on every displayed frame. Keep
+    // persistence responsive without putting IDBFS bookkeeping in the 60 Hz
+    // presentation hot path; the UI already samples memory every two seconds.
+    this.maybeFlushStorage();
     const module = this.module;
     return {
       appEstimatedBytes: this.currentGame && this.ready ? this.usedMemory() : 0,
@@ -453,7 +464,6 @@ export class PhoneMEWebRuntime {
 
   acquireFrameView(previousGeneration: bigint): FrameView | null {
     const module = this.requireModule();
-    this.maybeFlushStorage();
     const widthPointer = this.metadataPointer;
     const heightPointer = this.metadataPointer + 4;
     const generationPointer = this.metadataPointer + 8;

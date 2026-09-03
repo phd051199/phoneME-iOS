@@ -471,6 +471,22 @@ namespace phoneme::vm
     return *static_fields_[slot];
   }
 
+  Result<Value> ClassStateRegistry::vm_static_field(FieldId field_id) const
+  {
+    if (!field_id.valid())
+    {
+      return fail(ErrorCode::invalid_argument,
+                  "static field has no runtime field ID");
+    }
+    const usize slot = static_cast<usize>(field_id.value);
+    if (slot >= static_fields_.size() || !static_fields_[slot].has_value())
+    {
+      return fail(ErrorCode::invalid_state,
+                  "quick static field was not prepared before access");
+    }
+    return *static_fields_[slot];
+  }
+
   Status ClassStateRegistry::set_static_field(const FieldLocation &field,
                                               Value value)
   {
@@ -516,6 +532,30 @@ namespace phoneme::vm
     const usize slot = static_cast<usize>(field_id.value);
     if (static_fields_.size() <= slot)
       static_fields_.resize(slot + 1U);
+    static_fields_[slot] = value;
+    return {};
+  }
+
+  Status ClassStateRegistry::vm_set_static_field(FieldId field_id,
+                                                 ValueKind expected_kind,
+                                                 Value value)
+  {
+    if (!field_id.valid())
+    {
+      return fail(ErrorCode::invalid_argument,
+                  "static field has no runtime field ID");
+    }
+    if (value.kind() != expected_kind)
+    {
+      return fail(ErrorCode::invalid_argument,
+                  "static field value does not match its descriptor");
+    }
+    const usize slot = static_cast<usize>(field_id.value);
+    if (slot >= static_fields_.size() || !static_fields_[slot].has_value())
+    {
+      return fail(ErrorCode::invalid_state,
+                  "quick static field was not prepared before store");
+    }
     static_fields_[slot] = value;
     return {};
   }

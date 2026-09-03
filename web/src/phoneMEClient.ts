@@ -252,16 +252,16 @@ export class PhoneMEWebRuntime {
   }
 
   async configureFrameRate() {
-    await this.ensureReady();
-    if (this.directRuntime) {
-      this.directRuntime.configureFrameRate();
-      return;
-    }
-    await this.request("configureFrameRate");
+    await this.configureFrameRateOverride(false, 60);
   }
 
-  async configureFrameRateOverride(_enabled: boolean, _framesPerSecond: number) {
-    await this.configureFrameRate();
+  async configureFrameRateOverride(enabled: boolean, framesPerSecond: number) {
+    await this.ensureReady();
+    if (this.directRuntime) {
+      this.directRuntime.configureFrameRateOverride(enabled, framesPerSecond);
+      return;
+    }
+    await this.request("configureFrameRateOverride", { enabled, framesPerSecond });
   }
 
   async configureTranslation(enabled: boolean, provider: "google" | "bing" | "automatic", sourceLanguage: string) {

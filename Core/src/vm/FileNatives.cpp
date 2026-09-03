@@ -782,6 +782,26 @@ void register_java_file_natives(NativeMethodRegistry& registry) {
         path_value);
     add(registry, "java/io/File", "toString", "()Ljava/lang/String;",
         path_value);
+    add(registry, "java/io/File", "getAbsolutePath", "()Ljava/lang/String;",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            auto path = normalized_java_file_path(machine, *object);
+            if (!path) return std::unexpected(path.error());
+
+            // java.io.File resolves relative paths against the process working
+            // directory. phoneME deliberately exposes a sandboxed virtual
+            // filesystem instead, whose root is the Java process root. Return
+            // a stable absolute-looking path rooted at that virtual root so
+            // equality/canonicalisation code written for Java SE behaves as
+            // expected without leaking the host filesystem path.
+            std::string absolute = "/";
+            absolute.append(*path);
+            auto string = create_string(machine, absolute);
+            if (!string) return std::unexpected(string.error());
+            return std::optional<Value>(Value::from_reference(*string));
+        });
 
     const auto path_component = [&registry](const char* name, bool parent) {
         add(registry, "java/io/File", name, "()Ljava/lang/String;",

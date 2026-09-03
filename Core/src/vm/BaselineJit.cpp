@@ -1,5 +1,6 @@
 #include "phoneme/vm/BaselineJit.hpp"
 #include "phoneme/vm/PerformanceCounters.hpp"
+#include "phoneme/vm/VmTrace.hpp"
 #include "phoneme/vm/Verifier.hpp"
 #include "phoneme/runtime/WorkCoordinator.hpp"
 
@@ -14,6 +15,7 @@
 #include <cstring>
 #include <deque>
 #include <condition_variable>
+#include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -165,6 +167,37 @@ constexpr u64 kMaximumDeviceForegroundCompileIntervalMilliseconds = 10'000U;
 #else
     return false;
 #endif
+}
+
+[[nodiscard]] bool live_jit_root_walker_enabled() noexcept {
+    static const bool enabled = []() noexcept {
+        const char* value = std::getenv("PHONEME_JIT_LIVE_ROOT_WALKER");
+        if (value == nullptr || *value == '\0') return true;
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool leaf_jit_reads_enabled() noexcept {
+    static const bool enabled = []() noexcept {
+        const char* value = std::getenv("PHONEME_JIT_LEAF_READS");
+        if (value == nullptr || *value == '\0') return true;
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }();
+    return enabled;
+}
+
+[[nodiscard]] bool leaf_jit_array_load_enabled() noexcept {
+    if (!leaf_jit_reads_enabled()) return false;
+    static const bool enabled = []() noexcept {
+        const char* value = std::getenv("PHONEME_JIT_LEAF_ARRAY_LOAD");
+        if (value == nullptr || *value == '\0') return true;
+        const std::string_view mode(value);
+        return mode != "0" && mode != "false" && mode != "off";
+    }();
+    return enabled;
 }
 
 [[nodiscard]] bool quick_compile_tier_enabled() noexcept {
@@ -341,6 +374,8 @@ constexpr u32 kBudgetInitialOffset =
 constexpr u32 kBudgetRemainingOffset =
     static_cast<u32>(kJitRuntimeBudgetRemainingByteOffset);
 constexpr u32 kRuntimeResultOffset = 40U;
+constexpr u32 kLeafScratchOffset =
+    static_cast<u32>(kJitRuntimeLeafScratchByteOffset);
 constexpr u32 kJitFrameHeaderBytes =
     static_cast<u32>(kJitRuntimeFrameHeaderBytes);
 
@@ -924,23 +959,39 @@ struct RuntimeDispatchContext final {
     const u32 encoded_operand = static_cast<u32>(packed_operand);
     const bool no_safepoint =
         (encoded_operand & kJitRuntimeNoSafepointOperandFlag) != 0U;
+    const bool leaf_runtime =
+        (encoded_operand & kJitRuntimeLeafOperandFlag) != 0U;
     const u32 operand =
-        encoded_operand & ~kJitRuntimeNoSafepointOperandFlag;
+        encoded_operand & ~(kJitRuntimeNoSafepointOperandFlag |
+                            kJitRuntimeLeafOperandFlag);
+    if (leaf_runtime) {
+        if (execution->hooks.leaf_dispatch == nullptr) {
+            return static_cast<u32>(JitRuntimeStatus::deoptimize);
+        }
+        return execution->hooks.leaf_dispatch(execution->hooks.context,
+                                              operation,
+                                              operand,
+                                              first,
+                                              second,
+                                              third,
+                                              result_bits);
+    }
     const u32 safepoint_id = static_cast<u32>(packed_operand >> 32U);
     PerformanceCounters::record_jit_runtime_operation(
         static_cast<u32>(operation),
         !no_safepoint && execution->hooks.publish_roots != nullptr);
     if (!no_safepoint && execution->hooks.publish_roots != nullptr) {
-        const bool defer_scheduler_publication =
-            !conservative_device_jit_mode() &&
-            (operation == JitRuntimeOperation::invoke_static ||
-             operation == JitRuntimeOperation::invoke_virtual);
         const JitReferenceMap* reference_map = nullptr;
         if (frame_base != nullptr && execution->reference_maps != nullptr &&
             safepoint_id < execution->reference_maps->size()) {
             reference_map = &(*execution->reference_maps)[safepoint_id];
         }
-        if (defer_scheduler_publication) {
+        if (live_jit_root_walker_enabled()) {
+            // The generated frame remains live for the complete runtime
+            // callback. Publish only its precise map here; Machine overlays a
+            // transient root walker and reads the frame iff GC actually asks.
+            // The overlay is removed before this trampoline returns, so no raw
+            // native-frame pointer can escape its valid lifetime.
             execution->hooks.publish_roots(
                 execution->hooks.context,
                 nullptr,
@@ -953,6 +1004,25 @@ struct RuntimeDispatchContext final {
                                          : 0U,
                 true);
         } else {
+            const bool defer_scheduler_publication =
+                !conservative_device_jit_mode() &&
+                (operation == JitRuntimeOperation::invoke_static ||
+                 operation == JitRuntimeOperation::invoke_virtual);
+            if (defer_scheduler_publication) {
+                execution->hooks.publish_roots(
+                    execution->hooks.context,
+                    nullptr,
+                    0U,
+                    frame_base,
+                    reference_map != nullptr &&
+                            !reference_map->frame_offsets.empty()
+                        ? reference_map->frame_offsets.data()
+                        : nullptr,
+                    reference_map != nullptr
+                        ? reference_map->frame_offsets.size()
+                        : 0U,
+                    true);
+            } else {
             usize root_count = 0U;
             if (reference_map != nullptr) {
                 for (const u32 byte_offset : reference_map->frame_offsets) {
@@ -971,6 +1041,7 @@ struct RuntimeDispatchContext final {
                                            nullptr,
                                            0U,
                                            false);
+            }
         }
     }
     const u64 dispatch_operand = static_cast<u64>(
@@ -6032,6 +6103,143 @@ compute_constant_flow(
                        kRuntimeResultOffset);
     };
 
+    // Hot read operations do not allocate, block or publish roots. Try them
+    // through the compact leaf hook without flattening cached locals/operand
+    // stack into the native frame. The leaf returns `deoptimize` when linkage
+    // or a rare shape check needs the full dispatcher; reads are idempotent so
+    // that slow path can safely re-execute the operation after spilling the
+    // exact frame. Direct Java exception statuses (null/bounds) exit the
+    // compiled method without a deopt frame because there is no local handler
+    // at leaf-eligible sites.
+    bool leaf_runtime_emit_failed = false;
+    const auto emit_leaf_runtime_call = [&](JitRuntimeOperation operation,
+                                            u32 operand,
+                                            u32 first_register,
+                                            u32 second_register,
+                                            u32 third_register,
+                                            u32 bytecode_pc,
+                                            bool preserve_second) -> bool {
+        for (const classfile::ExceptionHandler& handler :
+             method.code->exception_table) {
+            if (static_cast<usize>(bytecode_pc) >=
+                    static_cast<usize>(handler.start_pc) &&
+                static_cast<usize>(bytecode_pc) <
+                    static_cast<usize>(handler.end_pc)) {
+                return false;
+            }
+        }
+
+        if (preserve_second) {
+            emitter.store_x(second_register, kStackPointer, kLeafScratchOffset);
+        }
+        // The leaf helper is still a real C++ ABI call. Persist the *current*
+        // budget counters before entering it; otherwise the reload below would
+        // restore the older frame copy from method entry/last full runtime
+        // call and silently rewind or corrupt budget accounting.
+        emitter.store_w(kBudgetInitial,
+                        kStackPointer,
+                        kBudgetInitialOffset);
+        emitter.store_w(kBudgetRemaining,
+                        kStackPointer,
+                        kBudgetRemainingOffset);
+        // The generated function's runtime context is RuntimeDispatchContext.
+        // Leaf reads do not need root publication/deopt capture, so bypass
+        // dispatch_runtime_trampoline completely and call the Machine leaf
+        // hook directly. This removes an entire C++ frame, flag decoding and
+        // generic dispatch layer from every hot getfield/getstatic/array read.
+        constexpr u32 kHooksContextOffset = static_cast<u32>(
+            offsetof(RuntimeDispatchContext, hooks) +
+            offsetof(JitRuntimeHooks, context));
+        constexpr u32 kHooksLeafDispatchOffset = static_cast<u32>(
+            offsetof(RuntimeDispatchContext, hooks) +
+            offsetof(JitRuntimeHooks, leaf_dispatch));
+        emitter.load_x(17U, kStackPointer, kRuntimeContextOffset);
+        emitter.load_x(16U, 17U, kHooksLeafDispatchOffset);
+        emitter.compare_zero_x(16U);
+        const usize missing_leaf_branch =
+            emitter.emit_conditional_branch_placeholder(Arm64Condition::equal);
+        emitter.load_x(0U, 17U, kHooksContextOffset);
+        emitter.move_imm32(1U, static_cast<u32>(operation));
+        emitter.move_imm32(2U, operand);
+        emitter.move_x(3U, first_register);
+        emitter.move_x(4U, second_register);
+        emitter.move_x(5U, third_register);
+        emitter.add_imm_x(6U, kStackPointer, kRuntimeResultOffset);
+        emitter.branch_link_register(16U);
+
+        // x11/x12/x15 are caller-saved in the AArch64 ABI even though the
+        // generated method uses them as long-lived VM state. The full runtime
+        // path reloads these immediately after every C++ call; the leaf path
+        // must do the same or a perfectly successful helper can corrupt the
+        // instruction budget/result pointer before the next bytecode.
+        emitter.load_w(kBudgetInitial,
+                       kStackPointer,
+                       kBudgetInitialOffset);
+        emitter.load_w(kBudgetRemaining,
+                       kStackPointer,
+                       kBudgetRemainingOffset);
+        emitter.load_x(kResultPointer,
+                       kStackPointer,
+                       kResultPointerOffset);
+
+        // A leaf `deoptimize` status means "retry through the full helper".
+        // The callback leaves the original receiver/array in runtime_result;
+        // array_load keeps its index in the dedicated 8-byte leaf scratch.
+        emitter.compare_imm_w(
+            0U, static_cast<u32>(JitRuntimeStatus::deoptimize));
+        const usize slow_branch =
+            emitter.emit_conditional_branch_placeholder(Arm64Condition::equal);
+
+        // Any other non-zero leaf status is a direct Java exception. Encode
+        // status + bytecode PC exactly like emit_runtime_call() before routing
+        // to the normal compiled-method exception exit.
+        emitter.load_x(kResultPointer,
+                       kStackPointer,
+                       kResultPointerOffset);
+        emitter.store_w(0U, kResultPointer, 0U);
+        emitter.move_imm32(kScratchThird, bytecode_pc);
+        emitter.store_w(kScratchThird, kResultPointer, 4U);
+        emitter.compare_zero_w(0U);
+        runtime_failure_patches.push_back(
+            emitter.emit_conditional_branch_placeholder(
+                Arm64Condition::not_equal));
+
+        emitter.load_x(kScratchLeft,
+                       kStackPointer,
+                       kRuntimeResultOffset);
+        const usize continue_branch = emitter.emit_branch_placeholder();
+
+        const usize slow_position = emitter.position();
+        if (operation != JitRuntimeOperation::get_static) {
+            emitter.load_x(kScratchLeft,
+                           kStackPointer,
+                           kRuntimeResultOffset);
+        }
+        if (preserve_second) {
+            emitter.load_x(kScratchRight,
+                           kStackPointer,
+                           kLeafScratchOffset);
+        }
+        emit_runtime_call(operation,
+                          operand,
+                          operation == JitRuntimeOperation::get_static
+                              ? 31U
+                              : kScratchLeft,
+                          preserve_second ? kScratchRight : 31U,
+                          31U,
+                          bytecode_pc);
+        const usize continue_position = emitter.position();
+        if (!emitter.patch_conditional_branch(
+                missing_leaf_branch, slow_position, Arm64Condition::equal) ||
+            !emitter.patch_conditional_branch(
+                slow_branch, slow_position, Arm64Condition::equal) ||
+            !emitter.patch_branch(continue_branch, continue_position)) {
+            leaf_runtime_emit_failed = true;
+            return false;
+        }
+        return true;
+    };
+
     // Budget exhaustion routes through a runtime call so the dispatch
     // trampoline captures an exact deopt frame at this pc. The interpreter
     // then resumes the method at the boundary instead of unwinding, which is
@@ -7006,12 +7214,22 @@ compute_constant_flow(
                 return {};
             }
             requires_runtime_dispatch = true;
-            emit_runtime_call(JitRuntimeOperation::array_load,
-                              instruction.opcode,
-                              kScratchLeft,
-                              kScratchRight,
-                              31U,
-                              static_cast<u32>(instruction.pc));
+            if (!leaf_jit_array_load_enabled() ||
+                !emit_leaf_runtime_call(JitRuntimeOperation::array_load,
+                                        instruction.opcode,
+                                        kScratchLeft,
+                                        kScratchRight,
+                                        31U,
+                                        static_cast<u32>(instruction.pc),
+                                        true)) {
+                if (leaf_runtime_emit_failed) return {};
+                emit_runtime_call(JitRuntimeOperation::array_load,
+                                  instruction.opcode,
+                                  kScratchLeft,
+                                  kScratchRight,
+                                  31U,
+                                  static_cast<u32>(instruction.pc));
+            }
             if (instruction.opcode == 0x2FU ||
                 instruction.opcode == 0x31U) {
                 if (!push_long_register(kScratchLeft)) return {};
@@ -7053,12 +7271,22 @@ compute_constant_flow(
         }
         case 0xB2U:
             requires_runtime_dispatch = true;
-            emit_runtime_call(JitRuntimeOperation::get_static,
-                              instruction.local_index,
-                              31U,
-                              31U,
-                              31U,
-                              static_cast<u32>(instruction.pc));
+            if (!leaf_jit_reads_enabled() ||
+                !emit_leaf_runtime_call(JitRuntimeOperation::get_static,
+                                        instruction.local_index,
+                                        31U,
+                                        31U,
+                                        31U,
+                                        static_cast<u32>(instruction.pc),
+                                        false)) {
+                if (leaf_runtime_emit_failed) return {};
+                emit_runtime_call(JitRuntimeOperation::get_static,
+                                  instruction.local_index,
+                                  31U,
+                                  31U,
+                                  31U,
+                                  static_cast<u32>(instruction.pc));
+            }
             if (instruction.value_kind == JavaTypeKind::long_integer ||
                 instruction.value_kind == JavaTypeKind::float64) {
                 if (!push_long_register(kScratchLeft)) return {};
@@ -7084,12 +7312,22 @@ compute_constant_flow(
         case 0xB4U:
             if (!pop_reference_register(kScratchLeft)) return {};
             requires_runtime_dispatch = true;
-            emit_runtime_call(JitRuntimeOperation::get_field,
-                              instruction.local_index,
-                              kScratchLeft,
-                              31U,
-                              31U,
-                              static_cast<u32>(instruction.pc));
+            if (!leaf_jit_reads_enabled() ||
+                !emit_leaf_runtime_call(JitRuntimeOperation::get_field,
+                                        instruction.local_index,
+                                        kScratchLeft,
+                                        31U,
+                                        31U,
+                                        static_cast<u32>(instruction.pc),
+                                        false)) {
+                if (leaf_runtime_emit_failed) return {};
+                emit_runtime_call(JitRuntimeOperation::get_field,
+                                  instruction.local_index,
+                                  kScratchLeft,
+                                  31U,
+                                  31U,
+                                  static_cast<u32>(instruction.pc));
+            }
             if (instruction.value_kind == JavaTypeKind::long_integer ||
                 instruction.value_kind == JavaTypeKind::float64) {
                 if (!push_long_register(kScratchLeft)) return {};
@@ -7619,12 +7857,22 @@ compute_constant_flow(
         case 0xBEU:
             if (!pop_reference_register(kScratchLeft)) return {};
             requires_runtime_dispatch = true;
-            emit_runtime_call(JitRuntimeOperation::array_length,
-                              0U,
-                              kScratchLeft,
-                              31U,
-                              31U,
-                              static_cast<u32>(instruction.pc));
+            if (!leaf_jit_reads_enabled() ||
+                !emit_leaf_runtime_call(JitRuntimeOperation::array_length,
+                                        0U,
+                                        kScratchLeft,
+                                        31U,
+                                        31U,
+                                        static_cast<u32>(instruction.pc),
+                                        false)) {
+                if (leaf_runtime_emit_failed) return {};
+                emit_runtime_call(JitRuntimeOperation::array_length,
+                                  0U,
+                                  kScratchLeft,
+                                  31U,
+                                  31U,
+                                  static_cast<u32>(instruction.pc));
+            }
             if (!push_register(kScratchLeft)) return {};
             break;
         case 0xC2U:
@@ -9581,9 +9829,7 @@ public:
             if (entry.compiled->contains_loop) {
                 ++stats_.loop_optimized_methods;
             }
-            const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-            if (trace_value != nullptr && *trace_value != '\0' &&
-                std::string_view(trace_value) != "0") {
+            if (jit_trace_enabled()) {
                 std::fprintf(stderr,
                              "[phoneMEJIT] compile %s.%s%s optimized=%d loop=%d "
                              "code_bytes=%llu\n",
@@ -9655,8 +9901,10 @@ public:
             .reference_maps = &entry.compiled->reference_maps,
         };
         if (entry.compiled->requires_runtime_dispatch) {
+            if (!live_jit_root_walker_enabled()) {
             dispatch_context.prepare_roots(
                 entry.compiled->maximum_reference_roots);
+            }
             if (method.code.has_value()) {
                 dispatch_context.prepare_deopt(
                     static_cast<usize>(method.code->max_locals) +
@@ -9724,9 +9972,7 @@ public:
                 auto deopt_state = decode_deopt_state(
                     *entry.compiled, dispatch_context, exception_bci);
                 if (entry.retryable_call_count >= kRetryableCallRetireThreshold) {
-                    if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-                        trace_value != nullptr && *trace_value != '\0' &&
-                        std::string_view(trace_value) != "0") {
+                    if (jit_trace_enabled()) {
                         std::fprintf(stderr,
                                      "[phoneMEJIT] retire %s.%s%s after=%u retryable-calls\n",
                                      owner.name().c_str(),
@@ -9755,9 +10001,7 @@ public:
                 ++entry.deopt_count;
                 auto deopt_state = decode_deopt_state(
                     *entry.compiled, dispatch_context, exception_bci);
-                if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-                    trace_value != nullptr && *trace_value != '\0' &&
-                    std::string_view(trace_value) != "0") {
+                if (jit_trace_enabled()) {
                     std::fprintf(stderr,
                                  "[phoneMEJIT] deopt %s.%s%s status=%u "
                                  "bytecodes=%u count=%u\n",
@@ -9774,9 +10018,7 @@ public:
                 const bool retire_entry =
                     entry.deopt_count >= deopt_retire_threshold;
                 if (retire_entry) {
-                    const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-                    if (trace_value != nullptr && *trace_value != '\0' &&
-                        std::string_view(trace_value) != "0") {
+                    if (jit_trace_enabled()) {
                         std::fprintf(stderr,
                                      "[phoneMEJIT] retire %s.%s%s after=%u deopts\n",
                                      owner.name().c_str(),
@@ -9854,9 +10096,7 @@ public:
         entry.deopt_count = 0U;
         entry.retryable_call_count = 0U;
         ++stats_.executed_methods;
-        const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-        if (trace_value != nullptr && *trace_value != '\0' &&
-            std::string_view(trace_value) != "0") {
+        if (jit_trace_enabled()) {
             std::fprintf(stderr,
                          "[phoneMEJIT] execute %s.%s%s bytecodes=%u\n",
                          owner.name().c_str(),
@@ -10100,8 +10340,10 @@ public:
             .reference_maps = &entry.compiled->reference_maps,
         };
         if (entry.compiled->requires_runtime_dispatch) {
+            if (!live_jit_root_walker_enabled()) {
             dispatch_context.prepare_roots(
                 entry.compiled->maximum_reference_roots);
+            }
             if (method.code.has_value()) {
                 dispatch_context.prepare_deopt(
                     static_cast<usize>(method.code->max_locals) +
@@ -10163,9 +10405,7 @@ public:
                     ? entry.retryable_call_count >= kRetryableCallRetireThreshold
                     : (runtime_status == JitRuntimeStatus::unsupported_call ||
                        entry.deopt_count >= deopt_retire_threshold);
-                if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-                    trace_value != nullptr && *trace_value != '\0' &&
-                    std::string_view(trace_value) != "0") {
+                if (jit_trace_enabled()) {
                     std::fprintf(stderr,
                                  "[phoneMEJIT] osr-deopt %s.%s%s bci=%u "
                                  "status=%u bytecodes=%u count=%u\n",
@@ -10180,9 +10420,7 @@ public:
                                      : entry.deopt_count));
                 }
                 if (retire_entry) {
-                    if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-                        trace_value != nullptr && *trace_value != '\0' &&
-                        std::string_view(trace_value) != "0") {
+                    if (jit_trace_enabled()) {
                         std::fprintf(stderr,
                                      "[phoneMEJIT] osr-retire %s.%s%s after=%u deopts\n",
                                      owner.name().c_str(),
@@ -10280,9 +10518,7 @@ public:
         entry.retryable_call_count = 0U;
         ++stats_.executed_methods;
         ++stats_.osr_executions;
-        if (const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-            trace_value != nullptr && *trace_value != '\0' &&
-            std::string_view(trace_value) != "0") {
+        if (jit_trace_enabled()) {
             std::fprintf(stderr,
                          "[phoneMEJIT] osr %s.%s%s bci=%u bytecodes=%u\n",
                          owner.name().c_str(),
@@ -10420,9 +10656,7 @@ private:
         if (opcode.has_value()) {
             ++stats_.unsupported_opcodes[*opcode];
         }
-        const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-        if (trace_value != nullptr && *trace_value != '\0' &&
-            std::string_view(trace_value) != "0") {
+        if (jit_trace_enabled()) {
             if (opcode.has_value()) {
                 std::fprintf(stderr,
                              "[phoneMEJIT] reject %s.%s%s reason=%.*s "
@@ -10709,9 +10943,7 @@ private:
         }
         background_condition_.notify_one();
         ++stats_.background_compile_queued;
-        const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-        if (trace_value != nullptr && *trace_value != '\0' &&
-            std::string_view(trace_value) != "0") {
+        if (jit_trace_enabled()) {
             std::fprintf(stderr,
                          "[phoneMEJIT] queue %s.%s%s background=1\n",
                          owner.name().c_str(),
@@ -10848,9 +11080,7 @@ private:
                 entry.compiled->stack_cached_stores_elided;
             update_executable_arena_statistics();
 
-            const char* trace_value = std::getenv("PHONEME_JIT_TRACE");
-            if (trace_value != nullptr && *trace_value != '\0' &&
-                std::string_view(trace_value) != "0") {
+            if (jit_trace_enabled()) {
                 std::fprintf(stderr,
                              "[phoneMEJIT] bg-compile %s.%s%s code_bytes=%llu\n",
                              completed.owner->name().c_str(),

@@ -33,6 +33,10 @@ constexpr usize kReaderInputField = 1;
 constexpr usize kReaderCharsetField = 2;
 constexpr usize kReaderPendingField = 3;
 constexpr usize kReaderClosedField = 4;
+constexpr usize kStringReaderStringField = 1;
+constexpr usize kStringReaderNextField = 2;
+constexpr usize kStringReaderMarkField = 3;
+constexpr usize kStringReaderClosedField = 4;
 constexpr usize kWriterLockField = 0;
 constexpr usize kWriterOutputField = 1;
 constexpr usize kWriterCharsetField = 2;
@@ -2676,6 +2680,200 @@ void register_reader_writer(NativeMethodRegistry& registry) {
             auto stored = initialize_lock(machine, *object, *lock,
                                           kReaderLockField);
             if (!stored) return std::unexpected(stored.error());
+            return std::optional<Value> {};
+        });
+
+    add(registry, "java/io/StringReader", "<init>",
+        "(Ljava/lang/String;)V",
+        [initialize_lock](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            if (arguments.size() != 2U) {
+                return fail(ErrorCode::invalid_argument,
+                            "StringReader expects one string");
+            }
+            auto string = arguments[1].as_reference();
+            if (!string || string->is_null()) {
+                return fail_java("java/lang/NullPointerException",
+                                 "StringReader string is null");
+            }
+            auto locked = initialize_lock(machine, *object, {}, kReaderLockField);
+            if (!locked) return std::unexpected(locked.error());
+            auto stored = set_reference_field(
+                machine, *object, kStringReaderStringField, *string);
+            if (!stored) return std::unexpected(stored.error());
+            auto next = set_int_field(machine, *object, kStringReaderNextField, 0);
+            if (!next) return std::unexpected(next.error());
+            auto mark = set_int_field(machine, *object, kStringReaderMarkField, 0);
+            if (!mark) return std::unexpected(mark.error());
+            auto closed = set_int_field(machine, *object,
+                                        kStringReaderClosedField, 0);
+            if (!closed) return std::unexpected(closed.error());
+            return std::optional<Value> {};
+        });
+
+    const auto string_reader_state = [](Machine& machine, ObjectRef object)
+        -> Result<std::pair<std::u16string, i32>> {
+        auto closed = int_field(machine, object, kStringReaderClosedField);
+        if (!closed) return std::unexpected(closed.error());
+        if (*closed != 0) {
+            return fail_java("java/io/IOException", "StringReader is closed");
+        }
+        auto string = reference_field(machine, object, kStringReaderStringField);
+        auto next = int_field(machine, object, kStringReaderNextField);
+        if (!string || string->is_null() || !next) {
+            return fail(ErrorCode::invalid_state,
+                        "StringReader state is invalid");
+        }
+        auto text = machine.heap().string_value(*string);
+        if (!text) return std::unexpected(text.error());
+        return std::pair<std::u16string, i32> {*text, *next};
+    };
+
+    add(registry, "java/io/StringReader", "read", "()I",
+        [string_reader_state](Machine& machine,
+                              std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            auto state = string_reader_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (state->second >= static_cast<i32>(state->first.size())) {
+                return std::optional<Value>(Value::from_int(-1));
+            }
+            const auto character = state->first[static_cast<usize>(state->second)];
+            auto advanced = set_int_field(machine, *object,
+                                          kStringReaderNextField,
+                                          state->second + 1);
+            if (!advanced) return std::unexpected(advanced.error());
+            return std::optional<Value>(Value::from_int(
+                static_cast<i32>(character)));
+        });
+    add(registry, "java/io/StringReader", "read", "([CII)I",
+        [string_reader_state](Machine& machine,
+                              std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            if (arguments.size() != 4U) {
+                return fail(ErrorCode::invalid_argument,
+                            "StringReader.read expects buffer, offset and length");
+            }
+            auto buffer = arguments[1].as_reference();
+            auto offset = arguments[2].as_int();
+            auto length = arguments[3].as_int();
+            if (!buffer || buffer->is_null()) {
+                return fail_java("java/lang/NullPointerException",
+                                 "StringReader destination is null");
+            }
+            if (!offset || !length) {
+                return fail(ErrorCode::invalid_argument,
+                            "StringReader range is invalid");
+            }
+            auto capacity = machine.heap().array_length(*buffer);
+            if (!capacity) return std::unexpected(capacity.error());
+            if (*offset < 0 || *length < 0 ||
+                static_cast<usize>(*offset) > *capacity ||
+                static_cast<usize>(*length) > *capacity - static_cast<usize>(*offset)) {
+                return fail_java("java/lang/IndexOutOfBoundsException",
+                                 "StringReader destination range is invalid");
+            }
+            if (*length == 0) {
+                return std::optional<Value>(Value::from_int(0));
+            }
+            auto state = string_reader_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (state->second >= static_cast<i32>(state->first.size())) {
+                return std::optional<Value>(Value::from_int(-1));
+            }
+            const i32 available = static_cast<i32>(state->first.size()) - state->second;
+            const i32 count = std::min(*length, available);
+            for (i32 index = 0; index < count; ++index) {
+                auto stored = machine.heap().set_element(
+                    *buffer, static_cast<usize>(*offset + index),
+                    Value::from_int(static_cast<i32>(
+                        state->first[static_cast<usize>(state->second + index)])));
+                if (!stored) return std::unexpected(stored.error());
+            }
+            auto advanced = set_int_field(machine, *object,
+                                          kStringReaderNextField,
+                                          state->second + count);
+            if (!advanced) return std::unexpected(advanced.error());
+            return std::optional<Value>(Value::from_int(count));
+        });
+    add(registry, "java/io/StringReader", "skip", "(J)J",
+        [string_reader_state](Machine& machine,
+                              std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            auto amount = arguments[1].as_long();
+            if (!amount) return std::unexpected(amount.error());
+            auto state = string_reader_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            const i64 current = state->second;
+            const i64 end = static_cast<i64>(state->first.size());
+            const i64 target = std::clamp(current + *amount, 0LL, end);
+            auto updated = set_int_field(machine, *object,
+                                         kStringReaderNextField,
+                                         static_cast<i32>(target));
+            if (!updated) return std::unexpected(updated.error());
+            return std::optional<Value>(Value::from_long(target - current));
+        });
+    add(registry, "java/io/StringReader", "ready", "()Z",
+        [string_reader_state](Machine& machine,
+                              std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            auto state = string_reader_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            return std::optional<Value>(Value::from_int(1));
+        });
+    add(registry, "java/io/StringReader", "markSupported", "()Z",
+        [](Machine&, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            return std::optional<Value>(Value::from_int(1));
+        });
+    add(registry, "java/io/StringReader", "mark", "(I)V",
+        [string_reader_state](Machine& machine,
+                              std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            auto state = string_reader_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            auto stored = set_int_field(machine, *object,
+                                        kStringReaderMarkField, state->second);
+            if (!stored) return std::unexpected(stored.error());
+            return std::optional<Value> {};
+        });
+    add(registry, "java/io/StringReader", "reset", "()V",
+        [string_reader_state](Machine& machine,
+                              std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            auto state = string_reader_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            auto mark = int_field(machine, *object, kStringReaderMarkField);
+            if (!mark) return std::unexpected(mark.error());
+            auto stored = set_int_field(machine, *object,
+                                        kStringReaderNextField, *mark);
+            if (!stored) return std::unexpected(stored.error());
+            return std::optional<Value> {};
+        });
+    add(registry, "java/io/StringReader", "close", "()V",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            auto closed = set_int_field(machine, *object,
+                                        kStringReaderClosedField, 1);
+            if (!closed) return std::unexpected(closed.error());
             return std::optional<Value> {};
         });
     add(registry, "java/io/Writer", "<init>", "()V",

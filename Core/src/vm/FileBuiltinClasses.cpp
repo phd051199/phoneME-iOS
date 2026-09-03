@@ -21,6 +21,7 @@ using namespace builtin;
                               method(kPublic, "getParent", "()Ljava/lang/String;"),
                               method(kPublic, "getParentFile", "()Ljava/io/File;"),
                               method(kPublic, "getPath", "()Ljava/lang/String;"),
+                              method(kPublic, "getAbsolutePath", "()Ljava/lang/String;"),
                               method(kPublic, "isAbsolute", "()Z"),
                               method(kPublic, "exists", "()Z"),
                               method(kPublic, "isDirectory", "()Z"),

@@ -65,6 +65,17 @@ public:
     void clear() noexcept;
 
 private:
+    friend class Machine;
+
+    // Java execution is serialized by Machine::execution_mutex_. These hot
+    // accessors mirror Heap's vm_* API and avoid taking ClassStateRegistry's
+    // metadata mutex for already-linked static fields. They must never escape
+    // a Machine execution-gate region.
+    [[nodiscard]] Result<Value> vm_static_field(FieldId field_id) const;
+    [[nodiscard]] Status vm_set_static_field(FieldId field_id,
+                                              ValueKind expected_kind,
+                                              Value value);
+
     struct StringHash final {
         using is_transparent = void;
 

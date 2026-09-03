@@ -84,6 +84,10 @@ void main() {
 `;
 
 function resizeCanvas(canvas: PresentCanvas, width: number, height: number) {
+  // Only assigning when dimensions actually change avoids reallocating the
+  // drawing buffer while keeping it matched to the guest framebuffer. The CSS
+  // layer handles visual scaling; leaving an untouched canvas at its 300x150
+  // default causes an unnecessary extra resample and wrong aspect ratio.
   if (canvas.width !== width) canvas.width = width;
   if (canvas.height !== height) canvas.height = height;
 }
@@ -332,7 +336,7 @@ class WebGl2FramePresenter implements FramePresenter {
   present(frame: PresentableFrame) {
     const gl = this.gl;
     resizeCanvas(this.canvas, frame.width, frame.height);
-    gl.viewport(0, 0, frame.width, frame.height);
+    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
     gl.useProgram(this.program);
     gl.bindVertexArray(this.vao);
     gl.activeTexture(gl.TEXTURE0);

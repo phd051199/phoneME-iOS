@@ -1,6 +1,7 @@
 #include "phoneme/vm/ClassRepository.hpp"
 
 #include <algorithm>
+#include <array>
 #include <unordered_set>
 #include <utility>
 
@@ -25,6 +26,65 @@ namespace phoneme::vm
     {
       return (static_cast<u64>(entry.crc32) << 32U) |
              static_cast<u64>(entry.uncompressed_size);
+    }
+
+    // KnightOnline's bundled offline server publishes the character list and
+    // only then starts loading the embedded world. On slower runtimes the user
+    // can select a character while map.Map.entrys is still empty; Player.setup
+    // then dereferences Map.get_map_by_id(1)[0], the login exception is swallowed
+    // by the application, and the client remains on its spinner forever.
+    //
+    // This is intentionally an exact, signature-gated compatibility rewrite:
+    // move EmbeddedOfflineEngine.start() before send_char_part() without changing
+    // the method length, constant pool, branches, or stack-map layout. It only
+    // applies to the known offline io/Session class carrying the distinctive
+    // character-part marker and exact byte sequence below.
+    [[nodiscard]] bool patch_knight_offline_boot_order(
+        std::string_view internal_name,
+        std::vector<u8>& bytes) noexcept
+    {
+      if (internal_name != "io/Session") return false;
+
+      constexpr std::string_view marker =
+          "[OFFLINE] Immediate character-part sync (0 remote parts required)";
+      const auto marker_begin = std::search(
+          bytes.begin(), bytes.end(), marker.begin(), marker.end());
+      if (marker_begin == bytes.end()) return false;
+
+      // getclientin4 tail before the rewrite:
+      //   aload_0; invokevirtual send_char_part
+      //   aload_0; iconst_1; putfield get_in4
+      //   invokestatic EmbeddedOfflineEngine.getInstance
+      //   invokevirtual EmbeddedOfflineEngine.start; return
+      constexpr std::array<u8, 16> before {
+          0x2a, 0xb6, 0x01, 0x87,
+          0x2a, 0x04, 0xb5, 0x00, 0x53,
+          0xb8, 0x00, 0xd8,
+          0xb6, 0x01, 0x88,
+          0xb1,
+      };
+      // Same instructions and byte count, safe order:
+      //   EmbeddedOfflineEngine.getInstance().start();
+      //   send_char_part();
+      //   get_in4 = true;
+      constexpr std::array<u8, 16> after {
+          0xb8, 0x00, 0xd8,
+          0xb6, 0x01, 0x88,
+          0x2a, 0xb6, 0x01, 0x87,
+          0x2a, 0x04, 0xb5, 0x00, 0x53,
+          0xb1,
+      };
+
+      auto match = std::search(
+          bytes.begin(), bytes.end(), before.begin(), before.end());
+      if (match == bytes.end()) return false;
+      const auto second = std::search(
+          match + static_cast<std::ptrdiff_t>(before.size()), bytes.end(),
+          before.begin(), before.end());
+      if (second != bytes.end()) return false;
+
+      std::copy(after.begin(), after.end(), match);
+      return true;
     }
   } // namespace
 
@@ -699,6 +759,8 @@ namespace phoneme::vm
       {
         return std::unexpected(bytes.error());
       }
+      const bool compatibility_patched =
+          patch_knight_offline_boot_order(internal_name, *bytes);
       auto parsed = classfile::ClassFile::parse(*bytes);
       if (!parsed)
       {
@@ -717,7 +779,8 @@ namespace phoneme::vm
             std::string(internal_name));
         already_verified =
             cached != classpath_archive.verified_classes.end() &&
-            cached->second == verification_stamp;
+            cached->second == verification_stamp &&
+            !compatibility_patched;
       }
       if (!already_verified)
       {

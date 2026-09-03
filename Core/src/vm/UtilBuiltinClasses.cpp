@@ -43,6 +43,8 @@ using namespace builtin;
         }, {
             method(kPublic, "<init>", "()V"),
             method(kPublic, "<init>", "(J)V"),
+            method(kPublic | kStatic, "from",
+                   "(Ljava/time/Instant;)Ljava/util/Date;"),
             method(kPublic, "getTime", "()J"),
             method(kPublic, "setTime", "(J)V"),
             method(kPublic, "before", "(Ljava/util/Date;)Z"),
@@ -234,8 +236,10 @@ using namespace builtin;
         return make_class("java/util/Locale", "java/lang/Object",
                           kOrdinary | kFinal, {
             field(kPublic | kStatic | kFinal, "ROOT", "Ljava/util/Locale;"),
+            field(kPublic | kStatic | kFinal, "ENGLISH", "Ljava/util/Locale;"),
         }, {
             method(kPrivate, "<init>", "()V"),
+            method(kPublic, "<init>", "(Ljava/lang/String;)V"),
             method(kStatic, "<clinit>", "()V"),
         });
     }
@@ -369,6 +373,7 @@ using namespace builtin;
                           kOrdinary | kFinal, {
             field(kPrivate | kFinal, "epochMilli", "J"),
         }, {
+            method(kPublic | kStatic, "now", "()Ljava/time/Instant;"),
             method(kPublic | kStatic, "ofEpochMilli", "(J)Ljava/time/Instant;"),
             method(kPublic, "toEpochMilli", "()J"),
         }, {"java/time/temporal/TemporalAccessor"});
@@ -432,6 +437,14 @@ using namespace builtin;
             method(kPublic | kSynchronized, "isEmpty", "()Z"),
             method(kPublic | kSynchronized, "copyInto", "([Ljava/lang/Object;)V"),
             method(kPublic | kSynchronized, "contains", "(Ljava/lang/Object;)Z"),
+            method(kPublic | kSynchronized, "add", "(Ljava/lang/Object;)Z"),
+            method(kPublic | kSynchronized, "add", "(ILjava/lang/Object;)V"),
+            method(kPublic | kSynchronized, "remove", "(Ljava/lang/Object;)Z"),
+            method(kPublic | kSynchronized, "remove", "(I)Ljava/lang/Object;"),
+            method(kPublic | kSynchronized, "get", "(I)Ljava/lang/Object;"),
+            method(kPublic | kSynchronized, "set",
+                   "(ILjava/lang/Object;)Ljava/lang/Object;"),
+            method(kPublic | kSynchronized, "clear", "()V"),
             method(kPublic | kSynchronized, "indexOf", "(Ljava/lang/Object;)I"),
             method(kPublic | kSynchronized, "indexOf", "(Ljava/lang/Object;I)I"),
             method(kPublic | kSynchronized, "lastIndexOf", "(Ljava/lang/Object;)I"),
@@ -447,7 +460,7 @@ using namespace builtin;
             method(kPublic | kSynchronized, "removeAllElements", "()V"),
             method(kPublic | kSynchronized, "elements", "()Ljava/util/Enumeration;"),
             method(kPublic | kSynchronized, "toString", "()Ljava/lang/String;"),
-        });
+        }, {"java/util/List"});
     }
     if (name == "java/util/Stack") {
         return make_class("java/util/Stack", "java/util/Vector", kOrdinary, {}, {

@@ -157,11 +157,25 @@ template <ImageAlphaKind AlphaKind>
                 (destination_y + row) * target_stride + destination_x;
             const usize source_offset =
                 (source_y + row) * source_stride + source_x;
-            for (usize column = 0; column < width; ++column) {
-                local_changed = composite_classified_device_pixel<AlphaKind>(
-                    source_pixels[source_offset + column],
-                    target_pixels[destination_offset + column]) ||
-                    local_changed;
+            if constexpr (AlphaKind == ImageAlphaKind::opaque) {
+                // Immutable opaque images already carry device-format pixels.
+                // Compare/copy whole rows so libc/NEON can process a sprite in
+                // wide chunks instead of doing a branch + store per pixel.
+                const Pixel* source_row = source_pixels.data() + source_offset;
+                Pixel* destination_row = target_pixels.data() + destination_offset;
+                const usize row_bytes = width * sizeof(Pixel);
+                if (std::memcmp(
+                        source_row, destination_row, row_bytes) != 0) {
+                    std::memcpy(destination_row, source_row, row_bytes);
+                    local_changed = true;
+                }
+            } else {
+                for (usize column = 0; column < width; ++column) {
+                    local_changed = composite_classified_device_pixel<AlphaKind>(
+                        source_pixels[source_offset + column],
+                        target_pixels[destination_offset + column]) ||
+                        local_changed;
+                }
             }
         }
         if (local_changed) changed.store(true, std::memory_order_relaxed);
@@ -1263,6 +1277,57 @@ Status draw_region(Image& target,
     const auto strided_source = alpha_kind == ImageAlphaKind::translucent
         ? source_pixels
         : source_device_pixels;
+
+    // drawRegion is the dominant sprite primitive in many MIDP games, but
+    // most calls request TRANS_NONE. Keep those calls on the contiguous-row
+    // blitter instead of paying signed affine-index arithmetic per pixel.
+    if (!needs_snapshot && transform_value == Transform::none) {
+        const usize visible_source_x = static_cast<usize>(source_x) +
+            static_cast<usize>(static_cast<i64>(visible.x) - placement.x);
+        const usize visible_source_y = static_cast<usize>(source_y) +
+            static_cast<usize>(static_cast<i64>(visible.y) - placement.y);
+        const bool changed = [&]() noexcept {
+            switch (alpha_kind) {
+            case ImageAlphaKind::opaque:
+                return blit_linear_pixels<ImageAlphaKind::opaque>(
+                    target_pixels, target_stride,
+                    source_device_pixels,
+                    static_cast<usize>(source.width()),
+                    static_cast<usize>(visible.x),
+                    static_cast<usize>(visible.y),
+                    visible_source_x, visible_source_y,
+                    static_cast<usize>(visible.width),
+                    static_cast<usize>(visible.height));
+            case ImageAlphaKind::binary:
+                return blit_linear_pixels<ImageAlphaKind::binary>(
+                    target_pixels, target_stride,
+                    source_device_pixels,
+                    static_cast<usize>(source.width()),
+                    static_cast<usize>(visible.x),
+                    static_cast<usize>(visible.y),
+                    visible_source_x, visible_source_y,
+                    static_cast<usize>(visible.width),
+                    static_cast<usize>(visible.height));
+            case ImageAlphaKind::translucent:
+                return blit_linear_pixels<ImageAlphaKind::translucent>(
+                    target_pixels, target_stride,
+                    source_pixels,
+                    static_cast<usize>(source.width()),
+                    static_cast<usize>(visible.x),
+                    static_cast<usize>(visible.y),
+                    visible_source_x, visible_source_y,
+                    static_cast<usize>(visible.width),
+                    static_cast<usize>(visible.height));
+            }
+            return false;
+        }();
+        if (changed) {
+            target.mark_dirty_region(
+                visible.x, visible.y, visible.width, visible.height);
+        }
+        return {};
+    }
+
     const Pixel* source_base = needs_snapshot
         ? snapshot.data()
         : strided_source.data() +

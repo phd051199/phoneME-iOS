@@ -2235,6 +2235,30 @@ void Scheduler::set_current_root_walker(
     }
 }
 
+void Scheduler::set_current_transient_root_walker(
+    u32 invocation_depth,
+    void* context,
+    ExecutionContext::RootWalker walker,
+    bool clear_published_roots) {
+    auto current = current_thread_record();
+    if (current) {
+        current->context_->set_transient_root_walker(invocation_depth,
+                                                     context,
+                                                     walker,
+                                                     clear_published_roots);
+    }
+}
+
+void Scheduler::clear_current_transient_root_walker(
+    u32 invocation_depth,
+    void* context) noexcept {
+    auto current = current_thread_record();
+    if (current) {
+        current->context_->clear_transient_root_walker(invocation_depth,
+                                                       context);
+    }
+}
+
 void Scheduler::clear_current_published_roots(u32 invocation_depth) noexcept {
     auto current = current_thread_record();
     if (current) {

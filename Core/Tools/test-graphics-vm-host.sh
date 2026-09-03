@@ -71,6 +71,7 @@ SOURCES=(
   "$CORE_ROOT/src/vm/IONatives.cpp"
   "$CORE_ROOT/src/vm/ImageNatives.cpp"
   "$CORE_ROOT/src/vm/Interpreter.cpp"
+  "$CORE_ROOT/src/vm/JavaFiber.cpp"
   "$CORE_ROOT/src/vm/JavaThread.cpp"
   "$CORE_ROOT/src/vm/Jdk8CompatBuiltinClasses.cpp"
   "$CORE_ROOT/src/vm/LangBuiltinClasses.cpp"

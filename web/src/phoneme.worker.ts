@@ -8,7 +8,11 @@ import { installWorkerMediaBridge, type MediaStatusMessage } from "./workerMedia
 const scope = self as unknown as DedicatedWorkerGlobalScope;
 const mediaBridge = installWorkerMediaBridge(scope);
 const runtime = new PhoneMEWebRuntime();
-const WORKER_MAX_FPS = 30;
+// The browser presentation path is already throttled by the GPU/browser when
+// needed. 30 FPS here made fast games feel like they were running in slow
+// motion even when the VM had enough headroom. Keep the old power saving path
+// only for background mode.
+const WORKER_MAX_FPS = 60;
 const WORKER_FRAME_INTERVAL_MS = 1000 / WORKER_MAX_FPS;
 const BACKGROUND_PUMP_INTERVAL_MS = 250;
 let recyclableFramePixels: Uint8ClampedArray<ArrayBuffer> | null = null;
@@ -229,7 +233,10 @@ async function handleRequest(message: RequestMessage) {
     runtime.configureFrameRate();
     return undefined;
   case "configureFrameRateOverride":
-    runtime.configureFrameRate();
+    runtime.configureFrameRateOverride(
+      Boolean(payload.enabled),
+      Number(payload.framesPerSecond)
+    );
     return undefined;
   case "configureTranslation":
     runtime.configureTranslation(

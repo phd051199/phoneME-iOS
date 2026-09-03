@@ -874,6 +874,57 @@ void register_array_deque_natives(NativeMethodRegistry& registry) {
             return std::optional<Value>(Value::from_reference(*clone));
         });
 
+    constexpr std::string_view kBlockingOwner =
+        "java/util/concurrent/LinkedBlockingDeque";
+    add(registry, std::string(kBlockingOwner), "<init>", "()V",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            auto initialized = initialize_deque(
+                machine, *object, static_cast<i32>(kDefaultCapacity));
+            if (!initialized) return std::unexpected(initialized.error());
+            return std::optional<Value> {};
+        });
+    add(registry, std::string(kBlockingOwner), "put",
+        "(Ljava/lang/Object;)V",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            auto value = reference_argument(arguments, 1U);
+            if (!object) return std::unexpected(object.error());
+            if (!value) return std::unexpected(value.error());
+            auto stored = append(machine, *object, *value);
+            if (!stored) return std::unexpected(stored.error());
+            return std::optional<Value> {};
+        });
+    add(registry, std::string(kBlockingOwner), "take",
+        "()Ljava/lang/Object;",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            for (;;) {
+                auto size = deque_size(machine, *object);
+                if (!size) return std::unexpected(size.error());
+                if (*size != 0) {
+                    return return_reference(remove_at(machine, *object, 0));
+                }
+                auto slept = machine.sleep_current_thread(10);
+                if (!slept) return std::unexpected(slept.error());
+                if (*slept == SchedulerWaitResult::interrupted) {
+                    return fail_java("java/lang/InterruptedException",
+                                     "BlockingQueue.take was interrupted");
+                }
+            }
+        });
+    add(registry, std::string(kBlockingOwner), "remainingCapacity", "()I",
+        [](Machine&, std::span<const Value>)
+            -> Result<std::optional<Value>> {
+            return std::optional<Value>(
+                Value::from_int(std::numeric_limits<i32>::max()));
+        }, NativeJitPolicy::synchronous_bounded);
+
     register_iterator_natives(registry);
 }
 

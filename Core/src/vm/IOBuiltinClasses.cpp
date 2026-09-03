@@ -94,6 +94,25 @@ using namespace builtin;
             method(kPublic, "close", "()V"),
         });
     }
+    if (name == "java/io/StringReader") {
+        return make_class("java/io/StringReader", "java/io/Reader",
+                          kOrdinary, {
+            field(kPrivate, "str", "Ljava/lang/String;"),
+            field(kPrivate, "next", "I"),
+            field(kPrivate, "mark", "I"),
+            field(kPrivate, "closed", "Z"),
+        }, {
+            method(kPublic, "<init>", "(Ljava/lang/String;)V"),
+            method(kPublic, "read", "()I"),
+            method(kPublic, "read", "([CII)I"),
+            method(kPublic, "skip", "(J)J"),
+            method(kPublic, "ready", "()Z"),
+            method(kPublic, "markSupported", "()Z"),
+            method(kPublic, "mark", "(I)V"),
+            method(kPublic, "reset", "()V"),
+            method(kPublic, "close", "()V"),
+        });
+    }
     if (name == "java/io/OutputStreamWriter") {
         return make_class("java/io/OutputStreamWriter", "java/io/Writer",
                           kOrdinary, {

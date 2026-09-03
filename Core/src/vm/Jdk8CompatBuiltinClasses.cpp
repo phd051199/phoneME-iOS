@@ -310,10 +310,27 @@ using namespace builtin;
             method(kPublic, "add", "(ILjava/lang/Object;)V"),
             method(kPublic, "addFirst", "(Ljava/lang/Object;)V"),
             method(kPublic, "addLast", "(Ljava/lang/Object;)V"),
+            method(kPublic, "offerFirst", "(Ljava/lang/Object;)Z"),
+            method(kPublic, "offerLast", "(Ljava/lang/Object;)Z"),
             method(kPublic, "remove", "(I)Ljava/lang/Object;"),
             method(kPublic, "remove", "(Ljava/lang/Object;)Z"),
             method(kPublic, "removeFirst", "()Ljava/lang/Object;"),
             method(kPublic, "removeLast", "()Ljava/lang/Object;"),
+            method(kPublic, "pollFirst", "()Ljava/lang/Object;"),
+            method(kPublic, "pollLast", "()Ljava/lang/Object;"),
+            method(kPublic, "getFirst", "()Ljava/lang/Object;"),
+            method(kPublic, "getLast", "()Ljava/lang/Object;"),
+            method(kPublic, "peekFirst", "()Ljava/lang/Object;"),
+            method(kPublic, "peekLast", "()Ljava/lang/Object;"),
+            method(kPublic, "removeFirstOccurrence", "(Ljava/lang/Object;)Z"),
+            method(kPublic, "removeLastOccurrence", "(Ljava/lang/Object;)Z"),
+            method(kPublic, "offer", "(Ljava/lang/Object;)Z"),
+            method(kPublic, "remove", "()Ljava/lang/Object;"),
+            method(kPublic, "poll", "()Ljava/lang/Object;"),
+            method(kPublic, "element", "()Ljava/lang/Object;"),
+            method(kPublic, "peek", "()Ljava/lang/Object;"),
+            method(kPublic, "push", "(Ljava/lang/Object;)V"),
+            method(kPublic, "pop", "()Ljava/lang/Object;"),
             method(kPublic, "clear", "()V"),
             method(kPublic, "indexOf", "(Ljava/lang/Object;)I"),
             method(kPublic, "lastIndexOf", "(Ljava/lang/Object;)I"),
@@ -833,6 +850,74 @@ using namespace builtin;
             method(kPublic, "getMappedValue", "()Ljava/lang/Object;"),
         }, {"java/io/Serializable"});
     }
+    if (name == "java/util/concurrent/CopyOnWriteArrayList") {
+        // Reuse Core's compact ArrayList storage layout. This class exists to
+        // run desktop-server code embedded in offline MIDlets without pulling
+        // in the full java.util.concurrent implementation.
+        return make_class("java/util/concurrent/CopyOnWriteArrayList",
+                          "java/lang/Object", kOrdinary, {
+            field(kPrivate, "elementData", "[Ljava/lang/Object;"),
+            field(kPrivate, "size", "I"),
+            field(kPrivate, "capacityIncrement", "I"),
+            field(kPrivate, "mutationMode", "I"),
+        }, {
+            method(kPublic, "<init>", "()V"),
+            method(kPublic, "<init>", "(Ljava/util/Collection;)V"),
+            method(kPublic, "size", "()I"),
+            method(kPublic, "isEmpty", "()Z"),
+            method(kPublic, "contains", "(Ljava/lang/Object;)Z"),
+            method(kPublic, "get", "(I)Ljava/lang/Object;"),
+            method(kPublic, "set", "(ILjava/lang/Object;)Ljava/lang/Object;"),
+            method(kPublic, "add", "(Ljava/lang/Object;)Z"),
+            method(kPublic, "add", "(ILjava/lang/Object;)V"),
+            method(kPublic, "remove", "(I)Ljava/lang/Object;"),
+            method(kPublic, "remove", "(Ljava/lang/Object;)Z"),
+            method(kPublic, "clear", "()V"),
+            method(kPublic, "indexOf", "(Ljava/lang/Object;)I"),
+            method(kPublic, "lastIndexOf", "(Ljava/lang/Object;)I"),
+            method(kPublic, "iterator", "()Ljava/util/Iterator;"),
+            method(kPublic, "toArray", "()[Ljava/lang/Object;"),
+            method(kPublic, "toArray",
+                   "([Ljava/lang/Object;)[Ljava/lang/Object;"),
+            method(kPublic, "addAll", "(Ljava/util/Collection;)Z"),
+            method(kPublic, "equals", "(Ljava/lang/Object;)Z"),
+            method(kPublic, "toString", "()Ljava/lang/String;"),
+        }, {"java/util/List", "java/io/Serializable"});
+    }
+    if (name == "java/util/concurrent/BlockingQueue") {
+        return make_class("java/util/concurrent/BlockingQueue",
+                          "java/lang/Object",
+                          kPublic | kInterface | kAbstract, {}, {
+            method(kPublic | kAbstract, "add", "(Ljava/lang/Object;)Z"),
+            method(kPublic | kAbstract, "offer", "(Ljava/lang/Object;)Z"),
+            method(kPublic | kAbstract, "remove", "()Ljava/lang/Object;"),
+            method(kPublic | kAbstract, "poll", "()Ljava/lang/Object;"),
+            method(kPublic | kAbstract, "element", "()Ljava/lang/Object;"),
+            method(kPublic | kAbstract, "peek", "()Ljava/lang/Object;"),
+            method(kPublic | kAbstract, "put", "(Ljava/lang/Object;)V"),
+            method(kPublic | kAbstract, "offer",
+                   "(Ljava/lang/Object;JLjava/util/concurrent/TimeUnit;)Z"),
+            method(kPublic | kAbstract, "take", "()Ljava/lang/Object;"),
+            method(kPublic | kAbstract, "poll",
+                   "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;"),
+            method(kPublic | kAbstract, "remainingCapacity", "()I"),
+            method(kPublic | kAbstract, "drainTo", "(Ljava/util/Collection;)I"),
+            method(kPublic | kAbstract, "drainTo", "(Ljava/util/Collection;I)I"),
+        }, {"java/util/Queue"});
+    }
+    if (name == "java/util/concurrent/LinkedBlockingDeque") {
+        // A compact unbounded implementation is enough for desktop-server
+        // code embedded in offline MIDlets. Reuse ArrayDeque's storage and
+        // supply BlockingQueue.take() in the native layer.
+        return make_class("java/util/concurrent/LinkedBlockingDeque",
+                          "java/util/ArrayDeque", kOrdinary, {}, {
+            method(kPublic, "<init>", "()V"),
+            method(kPublic, "put", "(Ljava/lang/Object;)V"),
+            method(kPublic, "take", "()Ljava/lang/Object;"),
+            method(kPublic, "remainingCapacity", "()I"),
+        }, {"java/util/concurrent/BlockingQueue",
+             "java/io/Serializable"});
+    }
     if (name == "java/util/concurrent/Callable") {
         return make_class("java/util/concurrent/Callable", "java/lang/Object",
                           kPublic | kInterface | kAbstract, {}, {
@@ -1243,8 +1328,19 @@ using namespace builtin;
             field(kPrivate | kFinal, "pattern", "Ljava/lang/String;"),
         }, {
             method(kPublic, "<init>", "(Ljava/lang/String;)V"),
+            method(kPublic, "<init>",
+                   "(Ljava/lang/String;Ljava/util/Locale;)V"),
             method(kPublic, "format",
                    "(Ljava/util/Date;)Ljava/lang/String;"),
+        });
+    }
+    if (name == "java/text/NumberFormat") {
+        return make_class("java/text/NumberFormat", "java/lang/Object",
+                          kOrdinary, {}, {
+            method(kPublic, "<init>", "()V"),
+            method(kPublic | kStatic, "getInstance",
+                   "(Ljava/util/Locale;)Ljava/text/NumberFormat;"),
+            method(kPublic | kFinal, "format", "(J)Ljava/lang/String;"),
         });
     }
 

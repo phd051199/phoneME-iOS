@@ -144,6 +144,11 @@ std::atomic<u64> thread_name_sequence {0};
         "java/lang/Thread", "name", "Ljava/lang/String;", false);
 }
 
+[[nodiscard]] Result<FieldLocation> thread_daemon_field(Machine& machine) {
+    return machine.class_states().resolve_field(
+        "java/lang/Thread", "daemon", "Z", false);
+}
+
 [[nodiscard]] Result<ObjectRef> make_default_thread_name(Machine& machine) {
     const u64 sequence =
         thread_name_sequence.fetch_add(1U, std::memory_order_relaxed) + 1U;
@@ -193,6 +198,34 @@ std::atomic<u64> thread_name_sequence {0};
         return std::unexpected(stored.error());
     }
     return *generated;
+}
+
+[[nodiscard]] Status set_thread_daemon(Machine& machine,
+                                       ObjectRef thread,
+                                       bool daemon) {
+    auto field = thread_daemon_field(machine);
+    if (!field) {
+        return std::unexpected(field.error());
+    }
+    return machine.heap().set_field(
+        thread, field->index, Value::from_int(daemon ? 1 : 0));
+}
+
+[[nodiscard]] Result<bool> get_thread_daemon(Machine& machine,
+                                             ObjectRef thread) {
+    auto field = thread_daemon_field(machine);
+    if (!field) {
+        return std::unexpected(field.error());
+    }
+    auto value = machine.heap().field(thread, field->index);
+    if (!value) {
+        return std::unexpected(value.error());
+    }
+    auto daemon = value->as_int();
+    if (!daemon) {
+        return std::unexpected(daemon.error());
+    }
+    return *daemon != 0;
 }
 
 [[nodiscard]] Result<std::string> array_component_name(
@@ -3641,6 +3674,54 @@ void register_core_natives(NativeMethodRegistry& registry) {
             }
             return std::optional<Value>(Value::from_int(
                 *interrupted ? 1 : 0));
+        });
+
+    add(registry,
+        "java/lang/Thread",
+        "setDaemon",
+        "(Z)V",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            if (arguments.size() != 2U) {
+                return fail(ErrorCode::invalid_argument,
+                            "Thread.setDaemon expects one value");
+            }
+            auto receiver = require_receiver(arguments);
+            auto daemon = arguments[1].as_int();
+            if (!receiver || !daemon) {
+                return fail(ErrorCode::invalid_argument,
+                            "Thread.setDaemon arguments are invalid");
+            }
+            auto alive = machine.scheduler().is_alive(*receiver);
+            if (!alive) {
+                return std::unexpected(alive.error());
+            }
+            if (*alive) {
+                return fail_java("java/lang/IllegalThreadStateException",
+                                 "cannot change daemon status after thread start");
+            }
+            auto updated = set_thread_daemon(machine, *receiver, *daemon != 0);
+            if (!updated) {
+                return std::unexpected(updated.error());
+            }
+            return std::optional<Value> {};
+        });
+
+    add(registry,
+        "java/lang/Thread",
+        "isDaemon",
+        "()Z",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto receiver = require_receiver(arguments);
+            if (!receiver) {
+                return std::unexpected(receiver.error());
+            }
+            auto daemon = get_thread_daemon(machine, *receiver);
+            if (!daemon) {
+                return std::unexpected(daemon.error());
+            }
+            return std::optional<Value>(Value::from_int(*daemon ? 1 : 0));
         });
 
     add(registry,

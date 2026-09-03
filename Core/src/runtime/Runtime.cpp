@@ -642,6 +642,52 @@ void convert_image_region_to_frame_pixels(
         return;
     }
 
+    // Java Canvas pixels are stored numerically as 0xAARRGGBB. On every
+    // little-endian Wasm/native host the RGBA byte stream can therefore be
+    // produced by swapping only the red/blue byte lanes and issuing one
+    // 32-bit store. This is substantially cheaper than four byte stores plus
+    // channel helper calls per pixel and is friendly to LLVM's Wasm SIMD
+    // vectorizer. Use memcpy for the potentially unaligned byte destination;
+    // optimized builds lower the fixed four-byte copy to an unaligned store.
+    if (format == FramePixelFormat::rgba8 &&
+        std::endian::native == std::endian::little) {
+        const auto convert_rgba_rows = [&](usize row_begin, usize row_end) {
+            for (usize row = row_begin; row < row_end; ++row) {
+                usize source =
+                    (static_cast<usize>(region.y) + row) * source_stride +
+                    static_cast<usize>(region.x);
+                usize output = row * region_width * sizeof(graphics::Pixel);
+                for (usize column = 0U; column < region_width; ++column) {
+                    const graphics::Pixel pixel = source_pixels[source++];
+                    const graphics::Pixel rgba_word =
+                        (pixel & 0xFF00FF00U) |
+                        ((pixel & 0x00FF0000U) >> 16U) |
+                        ((pixel & 0x000000FFU) << 16U);
+                    std::memcpy(destination.data() + output,
+                                &rgba_word,
+                                sizeof(rgba_word));
+                    output += sizeof(rgba_word);
+                }
+            }
+        };
+
+        if (pixel_count < kParallelFrameConversionPixels || region_height < 4U) {
+            convert_rgba_rows(0U, region_height);
+            return;
+        }
+
+        const usize rows_per_chunk = std::max<usize>(
+            1U, 4U * 1024U / std::max<usize>(region_width, 1U));
+        shared_compute_executor().parallel_for(
+            WorkClass::frame_critical,
+            pixel_count,
+            region_height,
+            4U,
+            rows_per_chunk,
+            convert_rgba_rows);
+        return;
+    }
+
     const auto convert_rows = [&](usize row_begin, usize row_end) {
         for (usize row = row_begin; row < row_end; ++row) {
             usize source =

@@ -182,6 +182,13 @@ namespace phoneme::vm
     // generic InputStream path; Java EOF/invalid-state errors are preserved.
     [[nodiscard]] Result<std::optional<u64>>
     try_read_byte_array_input_bits(ObjectRef input, usize byte_count);
+    // Hot DataOutputStream primitive writes backed by ByteArrayOutputStream.
+    // Returns true when the exact in-memory stream shape was handled; false
+    // asks the caller to preserve the generic File/Network/custom stream path.
+    [[nodiscard]] Result<bool> try_write_byte_array_output_bits(
+        ObjectRef output,
+        u64 bits,
+        usize byte_count);
     [[nodiscard]] Result<std::optional<i32>> try_byte_array_input_read(
         ObjectRef input,
         ObjectRef destination,
@@ -324,10 +331,13 @@ namespace phoneme::vm
         std::string_view resource_name);
     [[nodiscard]] std::optional<std::string> cached_resource_path(
         ObjectRef mirror,
-        std::string_view resource_name) const;
+        ObjectRef resource_name) const;
     void cache_resource_path(ObjectRef mirror,
-                             std::string resource_name,
+                             ObjectRef resource_name,
                              std::string path);
+    [[nodiscard]] Result<ObjectRef> open_class_resource_stream(
+        ObjectRef mirror,
+        ObjectRef resource_name);
     void append_console(std::u16string_view text);
     [[nodiscard]] const std::u16string& console_output() const noexcept {
       return console_output_;
@@ -470,6 +480,27 @@ namespace phoneme::vm
       [[nodiscard]] bool operator()(std::string_view left,
                                     std::string_view right) const noexcept {
         return left == right;
+      }
+    };
+
+    struct ResourcePathKey final
+    {
+      u64 mirror_bits {0U};
+      u64 resource_bits {0U};
+
+      [[nodiscard]] bool operator==(const ResourcePathKey&) const noexcept =
+          default;
+    };
+
+    struct ResourcePathKeyHash final
+    {
+      [[nodiscard]] usize operator()(ResourcePathKey key) const noexcept
+      {
+        usize result = std::hash<u64>{}(key.mirror_bits);
+        const usize resource_hash = std::hash<u64>{}(key.resource_bits);
+        result ^= resource_hash + static_cast<usize>(0x9E3779B9U) +
+                  (result << 6U) + (result >> 2U);
+        return result;
       }
     };
 
@@ -647,6 +678,7 @@ namespace phoneme::vm
       usize index{0U};
       ValueKind value_kind{ValueKind::int32};
       bool is_static{false};
+      bool declaring_class_initialized{false};
       std::optional<u16> string_constant_value_index;
     };
 
@@ -667,6 +699,13 @@ namespace phoneme::vm
       std::vector<ObjectRef> published_roots;
       std::span<const ObjectRef> published_root_view;
       std::span<const u64> frame_root_bits;
+      // Valid only while jit_runtime_dispatch_callback() is on the native
+      // stack. The transient ExecutionContext walker is removed on every
+      // callback exit, so these pointers cannot outlive the generated frame.
+      const u64* live_frame_base{nullptr};
+      const u32* live_root_offsets{nullptr};
+      usize live_root_offset_count{0U};
+      bool live_root_walker_installed{false};
       // Deferred JIT publication must never retain a raw pointer into a
       // generated native frame. Fast JIT-to-JIT calls can nest runtime
       // dispatch deeply enough that a later commit observes a stale frame
@@ -775,6 +814,14 @@ namespace phoneme::vm
         u64 third,
         const u64* frame_base,
         u64* result_bits) noexcept;
+    [[nodiscard]] static u32 jit_leaf_runtime_dispatch_callback(
+        void* context,
+        JitRuntimeOperation operation,
+        u32 operand,
+        u64 first,
+        u64 second,
+        u64 third,
+        u64* result_bits) noexcept;
     static void jit_publish_roots_callback(void* context,
                                            const u64* roots,
                                            usize root_count,
@@ -785,6 +832,11 @@ namespace phoneme::vm
     static void append_jit_context_roots(
         const JitExecutionContext* execution,
         std::vector<ObjectRef>& roots) noexcept;
+    static void append_live_jit_context_roots(
+        void* context,
+        std::vector<ObjectRef>& roots) noexcept;
+    void install_live_jit_root_walker(JitExecutionContext* execution) noexcept;
+    void uninstall_live_jit_root_walker(JitExecutionContext* execution) noexcept;
     void commit_staged_jit_roots(JitExecutionContext* execution) noexcept;
     [[nodiscard]] u32 dispatch_jit_runtime(
         JitExecutionContext* parent_context,
@@ -836,6 +888,14 @@ namespace phoneme::vm
         void* context,
         ExecutionContext::RootWalker walker,
         bool clear_published_roots = false);
+    void set_execution_transient_root_walker(
+        u32 invocation_depth,
+        void* context,
+        ExecutionContext::RootWalker walker,
+        bool clear_published_roots = false);
+    void clear_execution_transient_root_walker(
+        u32 invocation_depth,
+        void* context) noexcept;
     void clear_execution_published_roots(u32 invocation_depth) noexcept;
     void clear_execution_roots(u32 invocation_depth) noexcept;
     [[nodiscard]] Result<LambdaBinding> resolve_lambda_binding(
@@ -901,10 +961,13 @@ namespace phoneme::vm
                        ObjectRef,
                        TransparentStringHash,
                        TransparentStringEqual> resource_array_cache_;
-    std::unordered_map<std::string,
+    // ObjectRef carries a slot generation, so a collected/reused String does
+    // not alias an old cache entry. Keying by the immutable Java String object
+    // lets repeated Class.getResourceAsStream calls hit before UTF-16 -> UTF-8
+    // conversion/path normalization.
+    std::unordered_map<ResourcePathKey,
                        std::string,
-                       TransparentStringHash,
-                       TransparentStringEqual> resource_path_cache_;
+                       ResourcePathKeyHash> resource_path_cache_;
     std::deque<std::string> resource_array_cache_order_;
     u64 resource_array_cache_payload_bytes_ {0};
     std::unordered_map<std::string,

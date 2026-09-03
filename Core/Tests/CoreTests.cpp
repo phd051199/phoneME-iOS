@@ -734,6 +734,31 @@ void test_execution_context_root_exchange() {
     require(walker_state.calls == 2 && published.size() == 2U,
             "clearing published roots preserves an installed live root walker");
 
+    WalkerState transient_state {
+        .roots = {
+            ObjectRef::make(17U, 18U),
+            ObjectRef::make(19U, 20U),
+        },
+    };
+    context.set_transient_root_walker(
+        3U, &transient_state, walker, false);
+    published.clear();
+    context.append_reference_roots(published);
+    require(walker_state.calls == 3 && transient_state.calls == 1 &&
+                published.size() == 4U &&
+                published[0] == walker_state.roots[0] &&
+                published[1] == walker_state.roots[1] &&
+                published[2] == transient_state.roots[0] &&
+                published[3] == transient_state.roots[1],
+            "transient JIT walker overlays rather than replacing the interpreter walker");
+
+    context.clear_transient_root_walker(3U, &transient_state);
+    published.clear();
+    context.append_reference_roots(published);
+    require(walker_state.calls == 4 && transient_state.calls == 1 &&
+                published.size() == 2U,
+            "clearing transient JIT roots preserves the primary interpreter walker");
+
     context.clear_roots(3U);
     published.clear();
     context.append_reference_roots(published);

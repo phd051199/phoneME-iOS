@@ -40,7 +40,7 @@ import type { PhoneMEWebRuntime, RuntimeTick } from "./phoneMEClient";
 import type { GameEntry, RuntimeSnapshot } from "./types";
 import type { TranslationSourceLanguage, VirtualKeyboardType, WebGameProfile } from "./webProfile";
 
-const WEB_MAX_FPS = 30;
+const WEB_MAX_FPS = 60;
 const HOST_FRAME_INTERVAL_MS = 1000 / WEB_MAX_FPS;
 const BACKGROUND_HOST_POLL_INTERVAL_MS = 250;
 const POINTER_MOVE_INTERVAL_MS = 1000 / 60;
@@ -687,10 +687,16 @@ export function EmulatorScreen({ runtime, game, profile, translationProvider, on
     const launchPromise = (async () => {
       if (!alreadyRunning) {
         await runtime.configureHeap(profile.heapSizeMegabytes);
-        await runtime.configureFrameRate();
+        await runtime.configureFrameRateOverride(
+          profile.frameRateOverride,
+          profile.frameRateLimit
+        );
         await runtime.launch(game, profile.screenWidth, profile.screenHeight);
       } else {
-        await runtime.configureFrameRate();
+        await runtime.configureFrameRateOverride(
+          profile.frameRateOverride,
+          profile.frameRateLimit
+        );
       }
       await runtime.configureTranslation(
         profile.autoTranslateEnabled,

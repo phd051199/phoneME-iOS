@@ -129,13 +129,15 @@ enum class JitExceptionKind : u8 {
 };
 
 inline constexpr u32 kJitRuntimeNoSafepointOperandFlag = 0x8000'0000U;
+inline constexpr u32 kJitRuntimeLeafOperandFlag = 0x4000'0000U;
 
 inline constexpr usize kJitRuntimeBudgetInitialByteOffset = 32U;
 inline constexpr usize kJitRuntimeBudgetRemainingByteOffset = 36U;
 inline constexpr usize kJitRuntimeConsumedByteOffset = 48U;
 inline constexpr usize kJitRuntimeLocalSlotsByteOffset = 52U;
 inline constexpr usize kJitRuntimeStackDepthByteOffset = 56U;
-inline constexpr usize kJitRuntimeFrameHeaderBytes = 64U;
+inline constexpr usize kJitRuntimeLeafScratchByteOffset = 64U;
+inline constexpr usize kJitRuntimeFrameHeaderBytes = 72U;
 
 using JitRuntimeDispatch = u32 (*)(void* context,
                                    JitRuntimeOperation operation,
@@ -145,6 +147,17 @@ using JitRuntimeDispatch = u32 (*)(void* context,
                                    u64 third,
                                    const u64* frame_base,
                                    u64* result_bits);
+// Fast, non-safepoint runtime helpers used by generated ARM64 for hot reads.
+// These helpers may return success, a direct Java exception status, or
+// deoptimize to request the full runtime dispatcher slow path. They must not
+// allocate, block, trigger GC, or retain any argument pointer.
+using JitLeafRuntimeDispatch = u32 (*)(void* context,
+                                       JitRuntimeOperation operation,
+                                       u32 operand,
+                                       u64 first,
+                                       u64 second,
+                                       u64 third,
+                                       u64* result_bits);
 using JitRootPublisher = void (*)(void* context,
                                   const u64* roots,
                                   usize root_count,
@@ -156,6 +169,7 @@ using JitRootPublisher = void (*)(void* context,
 struct JitRuntimeHooks final {
     void* context {nullptr};
     JitRuntimeDispatch dispatch {nullptr};
+    JitLeafRuntimeDispatch leaf_dispatch {nullptr};
     JitRootPublisher publish_roots {nullptr};
 };
 

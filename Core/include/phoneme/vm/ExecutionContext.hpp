@@ -31,6 +31,12 @@ public:
                          void* context,
                          RootWalker walker,
                          bool clear_published_roots = false);
+    void set_transient_root_walker(u32 invocation_depth,
+                                   void* context,
+                                   RootWalker walker,
+                                   bool clear_published_roots = false);
+    void clear_transient_root_walker(u32 invocation_depth,
+                                     void* context) noexcept;
     void clear_published_roots(u32 invocation_depth) noexcept;
     void clear_roots(u32 invocation_depth) noexcept;
     void append_reference_roots(std::vector<ObjectRef>& roots) const;
@@ -46,6 +52,12 @@ private:
         std::vector<ObjectRef> published;
         void* walker_context {nullptr};
         RootWalker walker {nullptr};
+        // JIT runtime dispatch temporarily overlays a precise native-frame
+        // walker while the generated frame is guaranteed to be live. Keep it
+        // separate from the interpreter's long-lived walker so nested JIT
+        // calls do not replace or flatten interpreter roots.
+        void* transient_walker_context {nullptr};
+        RootWalker transient_walker {nullptr};
     };
 
     [[nodiscard]] DepthRoots& depth_roots(u32 invocation_depth);

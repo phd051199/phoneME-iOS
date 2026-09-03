@@ -40,6 +40,38 @@ void ExecutionContext::set_root_walker(u32 invocation_depth,
     }
 }
 
+void ExecutionContext::set_transient_root_walker(
+    u32 invocation_depth,
+    void* context,
+    RootWalker walker,
+    bool clear_published_roots) {
+    std::scoped_lock lock(mutex_);
+    DepthRoots& roots = depth_roots(invocation_depth);
+    roots.transient_walker_context = context;
+    roots.transient_walker = walker;
+    if (clear_published_roots) {
+        roots.published.clear();
+    }
+}
+
+void ExecutionContext::clear_transient_root_walker(
+    u32 invocation_depth,
+    void* context) noexcept {
+    std::scoped_lock lock(mutex_);
+    if (invocation_depth >= roots_by_depth_.size()) {
+        return;
+    }
+    DepthRoots& roots = roots_by_depth_[invocation_depth];
+    // A nested dispatch at the same logical depth should never occur, but
+    // matching the owner makes cleanup robust against an older scope trying
+    // to clear a newer overlay.
+    if (roots.transient_walker_context != context) {
+        return;
+    }
+    roots.transient_walker_context = nullptr;
+    roots.transient_walker = nullptr;
+}
+
 void ExecutionContext::clear_published_roots(u32 invocation_depth) noexcept {
     std::scoped_lock lock(mutex_);
     if (invocation_depth >= roots_by_depth_.size()) {
@@ -57,12 +89,15 @@ void ExecutionContext::clear_roots(u32 invocation_depth) noexcept {
     roots.published.clear();
     roots.walker_context = nullptr;
     roots.walker = nullptr;
+    roots.transient_walker_context = nullptr;
+    roots.transient_walker = nullptr;
     // Trim only trailing empty depths. This preserves allocations for the
     // common recursive call depth while keeping completed deep recursion from
     // pinning a large outer vector forever.
     while (!roots_by_depth_.empty()) {
         const DepthRoots& tail = roots_by_depth_.back();
-        if (!tail.published.empty() || tail.walker != nullptr) {
+        if (!tail.published.empty() || tail.walker != nullptr ||
+            tail.transient_walker != nullptr) {
             break;
         }
         roots_by_depth_.pop_back();
@@ -75,6 +110,10 @@ void ExecutionContext::append_reference_roots(
     for (const DepthRoots& depth : roots_by_depth_) {
         if (depth.walker != nullptr && depth.walker_context != nullptr) {
             depth.walker(depth.walker_context, roots);
+        }
+        if (depth.transient_walker != nullptr &&
+            depth.transient_walker_context != nullptr) {
+            depth.transient_walker(depth.transient_walker_context, roots);
         }
         for (const ObjectRef reference : depth.published) {
             if (!reference.is_null()) {

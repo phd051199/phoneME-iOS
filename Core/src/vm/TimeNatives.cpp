@@ -654,6 +654,22 @@ void append_integer(std::string& output, i32 value) {
 } // namespace
 
 void register_time_natives(NativeMethodRegistry& registry) {
+    add(registry, "java/time/Instant", "now", "()Ljava/time/Instant;",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            if (!arguments.empty()) {
+                return fail(ErrorCode::invalid_argument,
+                            "Instant.now expects no arguments");
+            }
+            auto instant = machine.class_states().allocate_instance(
+                machine.heap(), "java/time/Instant");
+            if (!instant) return std::unexpected(instant.error());
+            auto stored = set_long_field(machine, *instant,
+                                         kInstantEpochMilliField,
+                                         current_millis());
+            if (!stored) return std::unexpected(stored.error());
+            return std::optional<Value>(Value::from_reference(*instant));
+        });
     add(registry, "java/time/Instant", "ofEpochMilli",
         "(J)Ljava/time/Instant;",
         [](Machine& machine, std::span<const Value> arguments)
@@ -993,6 +1009,76 @@ void register_time_natives(NativeMethodRegistry& registry) {
             if (!stored) return std::unexpected(stored.error());
             return std::optional<Value> {};
         });
+    add(registry, "java/text/SimpleDateFormat", "<init>",
+        "(Ljava/lang/String;Ljava/util/Locale;)V",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto formatter = receiver(arguments);
+            if (!formatter) return std::unexpected(formatter.error());
+            if (arguments.size() < 3U) {
+                return fail(ErrorCode::invalid_argument,
+                            "SimpleDateFormat pattern/locale is missing");
+            }
+            auto pattern = arguments[1].as_reference();
+            auto locale = arguments[2].as_reference();
+            if (!pattern || pattern->is_null() || !locale || locale->is_null()) {
+                return fail_java("java/lang/NullPointerException",
+                                 "SimpleDateFormat pattern/locale is null");
+            }
+            auto stored = set_reference_field(
+                machine, *formatter, kSimpleDateFormatPatternField, *pattern);
+            if (!stored) return std::unexpected(stored.error());
+            return std::optional<Value> {};
+        });
+    add(registry, "java/text/NumberFormat", "<init>", "()V",
+        [](Machine&, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            return std::optional<Value> {};
+        });
+    add(registry, "java/text/NumberFormat", "getInstance",
+        "(Ljava/util/Locale;)Ljava/text/NumberFormat;",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            if (arguments.size() != 1U) {
+                return fail(ErrorCode::invalid_argument,
+                            "NumberFormat.getInstance expects one locale");
+            }
+            auto locale = arguments[0].as_reference();
+            if (!locale || locale->is_null()) {
+                return fail_java("java/lang/NullPointerException",
+                                 "NumberFormat locale is null");
+            }
+            auto formatter = machine.class_states().allocate_instance(
+                machine.heap(), "java/text/NumberFormat");
+            if (!formatter) return std::unexpected(formatter.error());
+            return std::optional<Value>(Value::from_reference(*formatter));
+        });
+    add(registry, "java/text/NumberFormat", "format", "(J)Ljava/lang/String;",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            if (arguments.size() != 2U) {
+                return fail(ErrorCode::invalid_argument,
+                            "NumberFormat.format expects one long");
+            }
+            auto value = arguments[1].as_long();
+            if (!value) return std::unexpected(value.error());
+            std::array<char, 32> buffer {};
+            auto [end, error] = std::to_chars(
+                buffer.data(), buffer.data() + buffer.size(), *value);
+            if (error != std::errc {}) {
+                return fail(ErrorCode::invalid_state,
+                            "NumberFormat failed to format long");
+            }
+            auto text = create_string(
+                machine, ascii_text(std::string_view(buffer.data(),
+                                                     static_cast<usize>(end - buffer.data()))));
+            if (!text) return std::unexpected(text.error());
+            return std::optional<Value>(Value::from_reference(*text));
+        });
     add(registry, "java/text/SimpleDateFormat", "format",
         "(Ljava/util/Date;)Ljava/lang/String;",
         [](Machine& machine, std::span<const Value> arguments)
@@ -1048,6 +1134,36 @@ void register_time_natives(NativeMethodRegistry& registry) {
             auto stored = set_long_field(machine, *object, kDateTimeField, *value);
             if (!stored) return std::unexpected(stored.error());
             return std::optional<Value> {};
+        });
+    add(registry, "java/util/Date", "from",
+        "(Ljava/time/Instant;)Ljava/util/Date;",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            if (arguments.empty()) {
+                return fail(ErrorCode::invalid_argument,
+                            "Date.from argument is missing");
+            }
+            auto instant = arguments[0].as_reference();
+            if (!instant || instant->is_null()) {
+                return fail_java("java/lang/NullPointerException",
+                                 "Date.from instant is null");
+            }
+            auto compatible = is_instance_of(machine, *instant,
+                                             "java/time/Instant");
+            if (!compatible) return std::unexpected(compatible.error());
+            if (!*compatible) {
+                return fail_java("java/lang/IllegalArgumentException",
+                                 "Date.from requires an Instant");
+            }
+            auto millis = long_field(machine, *instant,
+                                     kInstantEpochMilliField);
+            if (!millis) return std::unexpected(millis.error());
+            auto date = machine.class_states().allocate_instance(
+                machine.heap(), "java/util/Date");
+            if (!date) return std::unexpected(date.error());
+            auto stored = set_long_field(machine, *date, kDateTimeField, *millis);
+            if (!stored) return std::unexpected(stored.error());
+            return std::optional<Value>(Value::from_reference(*date));
         });
     add(registry, "java/util/Date", "getTime", "()J",
         [](Machine& machine, std::span<const Value> arguments)

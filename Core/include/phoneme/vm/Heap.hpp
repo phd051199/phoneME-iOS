@@ -347,8 +347,8 @@ private:
         } storage_;
         usize encoded_size_ {0U};
     };
-    static_assert(sizeof(ArrayPayload) == 24U,
-                  "array payload must not grow the heap object header");
+    static_assert(sizeof(ArrayPayload) == 16U + sizeof(usize),
+                  "array payload must stay at one inline block plus size word");
 
     struct Object final {
         // Class descriptors are immutable VM metadata. Storing a full

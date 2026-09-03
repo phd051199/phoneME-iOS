@@ -653,6 +653,23 @@ void register_long_wrapper(NativeMethodRegistry& registry) {
             if (!object) return std::unexpected(object.error());
             return std::optional<Value>(Value::from_reference(*object));
         });
+    add(registry, std::string(class_name), "valueOf",
+        "(Ljava/lang/String;)Ljava/lang/Long;",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto string = arguments[0].as_reference();
+            if (!string) return std::unexpected(string.error());
+            auto text = string_ascii(machine, *string);
+            if (!text) return std::unexpected(text.error());
+            auto value = parse_signed(*text, 10,
+                                      std::numeric_limits<i64>::min(),
+                                      std::numeric_limits<i64>::max());
+            if (!value) return std::unexpected(value.error());
+            auto object = allocate_box(machine, "java/lang/Long",
+                                       Value::from_long(*value));
+            if (!object) return std::unexpected(object.error());
+            return std::optional<Value>(Value::from_reference(*object));
+        });
     const auto conversion = [&registry](const char* name,
                                         const char* descriptor,
                                         auto convert) {

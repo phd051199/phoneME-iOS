@@ -101,6 +101,26 @@ ProcessNativeCoverage& process_native_coverage() {
     return *coverage;
 }
 
+[[nodiscard]] bool native_invocation_counting_enabled() noexcept {
+    // Per-native invocation counters are diagnostics, not execution state.
+    // Keeping an atomic fetch_add in every HLE call is surprisingly visible in
+    // sprite-heavy MIDP games where Graphics natives run tens of thousands of
+    // times per second. Profiling/coverage builds still get exact counts, while
+    // the shipping runtime avoids the atomic RMW unless explicitly requested.
+    static const bool enabled = [] {
+        if constexpr (PerformanceCounters::enabled()) return true;
+
+        const char* coverage = std::getenv("PHONEME_NATIVE_COVERAGE");
+        if (coverage != nullptr && *coverage != '\0') return true;
+
+        const char* requested = std::getenv("PHONEME_NATIVE_COUNTS");
+        if (requested == nullptr || *requested == '\0') return false;
+        const std::string_view value(requested);
+        return value != "0" && value != "false" && value != "off";
+    }();
+    return enabled;
+}
+
 } // namespace
 
 NativeMethodRegistry::NativeMethodRegistry() {
@@ -364,7 +384,9 @@ Result<std::optional<Value>> NativeMethodRegistry::invoke_compact(
                     "native method has no compact implementation");
     }
     const std::shared_ptr<Entry>& entry = (*table)[index];
-    entry->invocation_count.fetch_add(1U, std::memory_order_relaxed);
+    if (native_invocation_counting_enabled()) {
+        entry->invocation_count.fetch_add(1U, std::memory_order_relaxed);
+    }
     PerformanceCounters::record_native_invocation();
     auto result = entry->compact_implementation(machine, arguments);
     if (!result) {
@@ -397,7 +419,9 @@ Result<std::optional<Value>> NativeMethodRegistry::invoke(
                     "native method ID is stale or invalid");
     }
     const std::shared_ptr<Entry>& entry = (*table)[index];
-    entry->invocation_count.fetch_add(1U, std::memory_order_relaxed);
+    if (native_invocation_counting_enabled()) {
+        entry->invocation_count.fetch_add(1U, std::memory_order_relaxed);
+    }
     PerformanceCounters::record_native_invocation();
     auto result = entry->implementation(machine, arguments);
     if (!result) {

@@ -1708,6 +1708,170 @@ void register_vector(NativeMethodRegistry& registry) {
             return std::optional<Value>(Value::from_int(*index >= 0 ? 1 : 0));
         });
 
+    // java.util.Vector implements List in Java SE. A number of desktop-built
+    // offline MIDlets keep a Vector behind a List reference and therefore use
+    // invokeinterface for these operations rather than the legacy Vector API.
+    // Keep the aliases native so both call styles share exactly the same
+    // backing storage and synchronization semantics.
+    add(registry, "java/util/Vector", "add",
+        "(Ljava/lang/Object;)Z",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            auto value = reference_argument(arguments, 1U, true);
+            if (!object) return std::unexpected(object.error());
+            if (!value) return std::unexpected(value.error());
+            auto state = vector_capacity_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            auto data = ensure_vector_capacity_from_state(
+                machine, *object, *state, state->count + 1);
+            if (!data) return std::unexpected(data.error());
+            auto stored = machine.heap().set_element(
+                *data, static_cast<usize>(state->count),
+                Value::from_reference(*value));
+            if (!stored) return std::unexpected(stored.error());
+            auto updated = set_int_field(machine, *object,
+                                         kVectorCountField, state->count + 1);
+            if (!updated) return std::unexpected(updated.error());
+            return std::optional<Value>(Value::from_int(1));
+        });
+    add(registry, "java/util/Vector", "remove",
+        "(Ljava/lang/Object;)Z",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            auto target = reference_argument(arguments, 1U, true);
+            if (!object) return std::unexpected(object.error());
+            if (!target) return std::unexpected(target.error());
+            auto index = vector_index_of(machine, *object, *target, 0, false);
+            if (!index) return std::unexpected(index.error());
+            if (*index < 0) {
+                return std::optional<Value>(Value::from_int(0));
+            }
+            auto removed = remove_vector_index(machine, *object, *index);
+            if (!removed) return std::unexpected(removed.error());
+            return std::optional<Value>(Value::from_int(1));
+        });
+
+    add(registry, "java/util/Vector", "get", "(I)Ljava/lang/Object;",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            auto index = int_argument(arguments, 1U);
+            if (!object) return std::unexpected(object.error());
+            if (!index) return std::unexpected(index.error());
+            auto state = vector_storage_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (*index < 0 || *index >= state->count) {
+                return fail_java("java/lang/ArrayIndexOutOfBoundsException",
+                                 "Vector index is out of range");
+            }
+            auto value = machine.heap().element(
+                state->data, static_cast<usize>(*index));
+            if (!value) return std::unexpected(value.error());
+            return std::optional<Value>(*value);
+        }, NativeJitPolicy::synchronous_bounded);
+    add(registry, "java/util/Vector", "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            auto index = int_argument(arguments, 1U);
+            auto value = reference_argument(arguments, 2U, true);
+            if (!object) return std::unexpected(object.error());
+            if (!index) return std::unexpected(index.error());
+            if (!value) return std::unexpected(value.error());
+            auto state = vector_storage_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (*index < 0 || *index >= state->count) {
+                return fail_java("java/lang/ArrayIndexOutOfBoundsException",
+                                 "Vector index is out of range");
+            }
+            auto previous = machine.heap().element(
+                state->data, static_cast<usize>(*index));
+            if (!previous) return std::unexpected(previous.error());
+            auto stored = machine.heap().set_element(
+                state->data, static_cast<usize>(*index),
+                Value::from_reference(*value));
+            if (!stored) return std::unexpected(stored.error());
+            return std::optional<Value>(*previous);
+        });
+    add(registry, "java/util/Vector", "add",
+        "(ILjava/lang/Object;)V",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            auto index = int_argument(arguments, 1U);
+            auto value = reference_argument(arguments, 2U, true);
+            if (!object) return std::unexpected(object.error());
+            if (!index) return std::unexpected(index.error());
+            if (!value) return std::unexpected(value.error());
+            auto state = vector_capacity_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (*index < 0 || *index > state->count) {
+                return fail_java("java/lang/ArrayIndexOutOfBoundsException",
+                                 "Vector insertion index is out of range");
+            }
+            auto data = ensure_vector_capacity_from_state(
+                machine, *object, *state, state->count + 1);
+            if (!data) return std::unexpected(data.error());
+            const usize shifted = static_cast<usize>(state->count - *index);
+            if (shifted != 0U) {
+                auto copied = machine.heap().copy_array_range(
+                    *data, static_cast<usize>(*index),
+                    *data, static_cast<usize>(*index + 1), shifted);
+                if (!copied) return std::unexpected(copied.error());
+            }
+            auto stored = machine.heap().set_element(
+                *data, static_cast<usize>(*index),
+                Value::from_reference(*value));
+            if (!stored) return std::unexpected(stored.error());
+            auto updated = set_int_field(machine, *object,
+                                         kVectorCountField, state->count + 1);
+            if (!updated) return std::unexpected(updated.error());
+            return std::optional<Value> {};
+        });
+    add(registry, "java/util/Vector", "remove",
+        "(I)Ljava/lang/Object;",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            auto index = int_argument(arguments, 1U);
+            if (!object) return std::unexpected(object.error());
+            if (!index) return std::unexpected(index.error());
+            auto state = vector_storage_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (*index < 0 || *index >= state->count) {
+                return fail_java("java/lang/ArrayIndexOutOfBoundsException",
+                                 "Vector index is out of range");
+            }
+            auto previous = machine.heap().element(
+                state->data, static_cast<usize>(*index));
+            if (!previous) return std::unexpected(previous.error());
+            auto removed = remove_vector_index_from_state(
+                machine, *object, *state, *index);
+            if (!removed) return std::unexpected(removed.error());
+            return std::optional<Value>(*previous);
+        });
+    add(registry, "java/util/Vector", "clear", "()V",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            auto state = vector_storage_state(machine, *object);
+            if (!state) return std::unexpected(state.error());
+            if (state->count != 0) {
+                auto cleared = machine.heap().fill_array_range(
+                    state->data, 0U, static_cast<usize>(state->count),
+                    Value::from_reference({}));
+                if (!cleared) return std::unexpected(cleared.error());
+            }
+            auto updated = set_int_field(machine, *object,
+                                         kVectorCountField, 0);
+            if (!updated) return std::unexpected(updated.error());
+            return std::optional<Value> {};
+        });
+
     add(registry, "java/util/Vector", "elementAt",
         "(I)Ljava/lang/Object;",
         [](Machine& machine, std::span<const Value> arguments)
@@ -3551,6 +3715,16 @@ void register_thread_local_random(NativeMethodRegistry& registry) {
 }
 
 void register_locale(NativeMethodRegistry& registry) {
+    add(registry, "java/util/Locale", "<init>",
+        "(Ljava/lang/String;)V",
+        [](Machine&, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto object = receiver(arguments);
+            if (!object) return std::unexpected(object.error());
+            auto language = reference_argument(arguments, 1U, false);
+            if (!language) return std::unexpected(language.error());
+            return std::optional<Value> {};
+        });
     add(registry, "java/util/Locale", "<clinit>", "()V",
         [](Machine& machine, std::span<const Value> arguments)
             -> Result<std::optional<Value>> {
@@ -3567,6 +3741,15 @@ void register_locale(NativeMethodRegistry& registry) {
             auto stored = machine.class_states().set_static_field(
                 *field, Value::from_reference(*root));
             if (!stored) return std::unexpected(stored.error());
+            auto english = machine.class_states().allocate_instance(
+                machine.heap(), "java/util/Locale");
+            if (!english) return std::unexpected(english.error());
+            auto english_field = machine.class_states().resolve_field(
+                "java/util/Locale", "ENGLISH", "Ljava/util/Locale;", true);
+            if (!english_field) return std::unexpected(english_field.error());
+            auto english_stored = machine.class_states().set_static_field(
+                *english_field, Value::from_reference(*english));
+            if (!english_stored) return std::unexpected(english_stored.error());
             return std::optional<Value> {};
         });
 }

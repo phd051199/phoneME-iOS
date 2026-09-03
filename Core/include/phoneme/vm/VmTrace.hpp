@@ -19,6 +19,15 @@ inline bool vm_trace_enabled() noexcept {
     return enabled;
 }
 
+inline bool jit_trace_enabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("PHONEME_JIT_TRACE");
+        return value != nullptr && value[0] != '\0' &&
+               std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
 inline unsigned long long vm_trace_elapsed_microseconds() noexcept {
     static const auto origin = std::chrono::steady_clock::now();
     const auto elapsed = std::chrono::steady_clock::now() - origin;

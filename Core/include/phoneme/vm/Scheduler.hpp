@@ -113,6 +113,14 @@ public:
         void* context,
         ExecutionContext::RootWalker walker,
         bool clear_published_roots = false);
+    void set_current_transient_root_walker(
+        u32 invocation_depth,
+        void* context,
+        ExecutionContext::RootWalker walker,
+        bool clear_published_roots = false);
+    void clear_current_transient_root_walker(
+        u32 invocation_depth,
+        void* context) noexcept;
     void clear_current_published_roots(u32 invocation_depth) noexcept;
     void clear_current_roots(u32 invocation_depth) noexcept;
     void set_current_pending_exception(

@@ -1182,7 +1182,17 @@ Result<bool> CanvasRuntime::invoke_paint(
         message += " from " + result->exception_context;
     }
     append_canvas_diagnostic(machine_, message);
-    return fail_java(*throwable, std::move(message));
+
+    // paint() is a framework callback, not a Java call made directly by the
+    // MIDlet.  Propagating an application exception out through
+    // serviceRepaints() kills the caller's game loop, while real MIDP
+    // implementations isolate callback failures and continue dispatching
+    // subsequent UI/network events.  Treat the frame as incomplete, keep the
+    // diagnostic, and let the next repaint recover.  This is especially
+    // important for legacy clients whose transient loading state can be
+    // internally inconsistent for one frame while protocol messages are being
+    // delivered.
+    return false;
 }
 
 Status CanvasRuntime::invoke_void(

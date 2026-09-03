@@ -149,6 +149,152 @@ void register_linked_list(NativeMethodRegistry& registry) {
     };
     remove_end("removeFirst", true);
     remove_end("removeLast", false);
+
+    const auto read_end = [&registry](const char* name, bool first,
+                                      bool remove, bool throw_if_empty) {
+        add(registry, "java/util/LinkedList", name,
+            "()Ljava/lang/Object;",
+            [first, remove, throw_if_empty](
+                Machine& machine, std::span<const Value> arguments)
+                -> Result<std::optional<Value>> {
+                auto list = receiver(arguments);
+                if (!list) return std::unexpected(list.error());
+                const Value receiver_value = Value::from_reference(*list);
+                auto size_value = invoke_native(
+                    machine, "java/util/ArrayList", "size", "()I",
+                    std::span<const Value>(&receiver_value, 1U));
+                if (!size_value) return std::unexpected(size_value.error());
+                if (!size_value->has_value()) {
+                    return fail(ErrorCode::internal_error,
+                                "LinkedList size returned no value");
+                }
+                auto size = size_value->value().as_int();
+                if (!size) return std::unexpected(size.error());
+                if (*size == 0) {
+                    if (throw_if_empty) {
+                        return fail_java("java/util/NoSuchElementException",
+                                         "LinkedList is empty");
+                    }
+                    return std::optional<Value>(Value::from_reference({}));
+                }
+                const std::array<Value, 2> forwarded {
+                    Value::from_reference(*list),
+                    Value::from_int(first ? 0 : *size - 1),
+                };
+                return invoke_native(
+                    machine, "java/util/ArrayList",
+                    remove ? "remove" : "get",
+                    "(I)Ljava/lang/Object;", forwarded);
+            });
+    };
+    read_end("getFirst", true, false, true);
+    read_end("getLast", false, false, true);
+    read_end("peekFirst", true, false, false);
+    read_end("peekLast", false, false, false);
+    read_end("pollFirst", true, true, false);
+    read_end("pollLast", false, true, false);
+
+    const auto offer_end = [&registry](const char* name, bool first) {
+        add(registry, "java/util/LinkedList", name,
+            "(Ljava/lang/Object;)Z",
+            [first](Machine& machine, std::span<const Value> arguments)
+                -> Result<std::optional<Value>> {
+                auto list = receiver(arguments);
+                auto value = reference_argument(arguments, 1U, true);
+                if (!list) return std::unexpected(list.error());
+                if (!value) return std::unexpected(value.error());
+                if (first) {
+                    const std::array<Value, 3> forwarded {
+                        Value::from_reference(*list), Value::from_int(0),
+                        Value::from_reference(*value),
+                    };
+                    auto result = invoke_native(
+                        machine, "java/util/ArrayList", "add",
+                        "(ILjava/lang/Object;)V", forwarded);
+                    if (!result) return std::unexpected(result.error());
+                } else {
+                    const std::array<Value, 2> forwarded {
+                        Value::from_reference(*list),
+                        Value::from_reference(*value),
+                    };
+                    auto result = invoke_native(
+                        machine, "java/util/ArrayList", "add",
+                        "(Ljava/lang/Object;)Z", forwarded);
+                    if (!result) return std::unexpected(result.error());
+                }
+                return std::optional<Value>(Value::from_int(1));
+            });
+    };
+    offer_end("offerFirst", true);
+    offer_end("offerLast", false);
+    offer_end("offer", false);
+
+    add(registry, "java/util/LinkedList", "removeFirstOccurrence",
+        "(Ljava/lang/Object;)Z",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            return invoke_native(machine, "java/util/ArrayList", "remove",
+                                 "(Ljava/lang/Object;)Z", arguments);
+        });
+    add(registry, "java/util/LinkedList", "removeLastOccurrence",
+        "(Ljava/lang/Object;)Z",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto list = receiver(arguments);
+            auto value = reference_argument(arguments, 1U, true);
+            if (!list) return std::unexpected(list.error());
+            if (!value) return std::unexpected(value.error());
+            const std::array<Value, 2> search_arguments {
+                Value::from_reference(*list), Value::from_reference(*value),
+            };
+            auto index_value = invoke_native(
+                machine, "java/util/ArrayList", "lastIndexOf",
+                "(Ljava/lang/Object;)I", search_arguments);
+            if (!index_value) return std::unexpected(index_value.error());
+            if (!index_value->has_value()) {
+                return fail(ErrorCode::internal_error,
+                            "LinkedList lastIndexOf returned no value");
+            }
+            auto index = index_value->value().as_int();
+            if (!index) return std::unexpected(index.error());
+            if (*index < 0) {
+                return std::optional<Value>(Value::from_int(0));
+            }
+            const std::array<Value, 2> remove_arguments {
+                Value::from_reference(*list), Value::from_int(*index),
+            };
+            auto removed = invoke_native(
+                machine, "java/util/ArrayList", "remove",
+                "(I)Ljava/lang/Object;", remove_arguments);
+            if (!removed) return std::unexpected(removed.error());
+            return std::optional<Value>(Value::from_int(1));
+        });
+
+    const auto alias_noarg = [&registry](const char* target,
+                                         const char* source) {
+        add(registry, "java/util/LinkedList", target,
+            "()Ljava/lang/Object;",
+            [source](Machine& machine, std::span<const Value> arguments)
+                -> Result<std::optional<Value>> {
+                return invoke_native(machine, "java/util/LinkedList", source,
+                                     "()Ljava/lang/Object;", arguments);
+            });
+    };
+    alias_noarg("remove", "removeFirst");
+    alias_noarg("poll", "pollFirst");
+    alias_noarg("element", "getFirst");
+    alias_noarg("peek", "peekFirst");
+    alias_noarg("pop", "removeFirst");
+    add(registry, "java/util/LinkedList", "push",
+        "(Ljava/lang/Object;)V",
+        [](Machine& machine, std::span<const Value> arguments)
+            -> Result<std::optional<Value>> {
+            auto result = invoke_native(machine, "java/util/LinkedList",
+                                        "addFirst", "(Ljava/lang/Object;)V",
+                                        arguments);
+            if (!result) return std::unexpected(result.error());
+            return std::optional<Value> {};
+        });
 }
 
 void register_enum_set(NativeMethodRegistry& registry) {
@@ -625,6 +771,7 @@ void register_remove_if(NativeMethodRegistry& registry) {
 void register_jdk8_set_list_natives(NativeMethodRegistry& registry) {
     alias_hash_set(registry, "java/util/LinkedHashSet", true, true);
     register_linked_list(registry);
+    alias_array_list(registry, "java/util/concurrent/CopyOnWriteArrayList");
     register_enum_set(registry);
     register_tree_set(registry);
     register_remove_if(registry);

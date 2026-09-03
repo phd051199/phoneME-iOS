@@ -32,7 +32,13 @@ thread_local ParallelExecutor* g_active_executor = nullptr;
     if (hardware_threads <= 2U) return 0U;
 
 #if defined(PHONEME_WEB)
-    return hardware_threads > 2U ? 1U : 0U;
+    // Synchronous helper dispatch is a net loss in browser Wasm for the frame
+    // sized jobs this executor handles most often (240x320 conversion, fills,
+    // blits). Waking an Emscripten pthread and then blocking the submitting VM
+    // worker costs more than the scalar/SIMD loop and adds frame-time jitter.
+    // Guest Java/lifecycle threads still use the Emscripten pthread pool; this
+    // only keeps shared native compute jobs on their submitting worker.
+    return 0U;
 #else
     // Keep the persistent native compute pool deliberately small. The caller
     // participates, so two helpers already allow a frame job to use three CPU

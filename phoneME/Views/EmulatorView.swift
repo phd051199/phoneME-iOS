@@ -1798,8 +1798,6 @@ private final class PhoneMEHardwareKeyboardHostView: UIView {
 }
 
 private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
-    private static let idleDrawablePixelsPerPoint: CGFloat = 1.0
-
     private static let shaderSource = """
     #include <metal_stdlib>
     using namespace metal;
@@ -1859,7 +1857,6 @@ private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
     private var linearSampler: MTLSamplerState?
     private var frameTexture: MTLTexture?
     private var currentFrame: PhoneMEFrame?
-    private var sourceFrameSize: CGSize?
     private var usesLinearFiltering = false
 
     override init(frame: CGRect, device: MTLDevice?) {
@@ -1878,26 +1875,9 @@ private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
     override func layoutSubviews() {
         super.layoutSubviews()
         fallbackLayer.frame = bounds
-        updateLowPowerDrawableSize()
-    }
-
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        guard window != nil else { return }
-        // UIKit may refresh a view's backing scale when it moves between
-        // windows/screens. Reassert the intentionally low-resolution Metal
-        // presentation surface instead of silently returning to Retina-sized
-        // drawables.
-        contentScaleFactor = Self.idleDrawablePixelsPerPoint
-        updateLowPowerDrawableSize()
     }
 
     func update(frame: PhoneMEFrame, filtering: Bool) {
-        let nextSourceSize = CGSize(width: frame.width, height: frame.height)
-        if sourceFrameSize != nextSourceSize {
-            sourceFrameSize = nextSourceSize
-            updateLowPowerDrawableSize()
-        }
         usesLinearFiltering = filtering
         layer.magnificationFilter = filtering ? .linear : .nearest
         layer.minificationFilter = filtering ? .linear : .nearest
@@ -1932,7 +1912,6 @@ private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
     func clearFrame() {
         currentFrame = nil
         frameTexture = nil
-        sourceFrameSize = nil
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         fallbackLayer.contents = nil
@@ -1977,20 +1956,15 @@ private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
         isOpaque = true
         isUserInteractionEnabled = false
         backgroundColor = .black
-        // The guest framebuffer is usually 240x320-640x360. Rendering the
-        // fullscreen presentation pass at 2x/3x Retina density only shades the
-        // same low-resolution texels several times and raises GPU/package
-        // power. Once a guest frame is known, updateLowPowerDrawableSize()
-        // limits the drawable to the smaller of the source framebuffer and the
-        // physical pixels the view can actually show. Core Animation performs
-        // any remaining display-density scaling.
-        contentScaleFactor = Self.idleDrawablePixelsPerPoint
+        // Keep the Metal drawable at the view's native backing resolution.
+        // Rendering a 240x320-style guest framebuffer into a low-resolution
+        // drawable and letting Core Animation magnify the CAMetalLayer makes
+        // the final image visibly soft on Retina displays, even when the guest
+        // texture itself uses nearest-neighbour sampling. Let Metal perform the
+        // only upscale so filtering=false stays genuinely pixel-sharp.
         colorPixelFormat = .bgra8Unorm
         framebufferOnly = true
-        // MTKView's automatic path derives drawableSize from the native screen
-        // pixel density. Manage it ourselves so the low-power scale remains
-        // deterministic across layout/window changes.
-        autoResizeDrawable = false
+        autoResizeDrawable = true
         enableSetNeedsDisplay = true
         isPaused = true
         preferredFramesPerSecond = 60
@@ -2003,37 +1977,6 @@ private final class PhoneMEFrameLayerHostView: MTKView, MTKViewDelegate {
         layer.addSublayer(fallbackLayer)
 
         installRendererResourcesIfAvailable()
-    }
-
-    private func updateLowPowerDrawableSize() {
-        guard bounds.width > 0, bounds.height > 0 else { return }
-        let physicalScale = max(window?.screen.scale ?? 1, 1)
-        var targetWidth = bounds.width * Self.idleDrawablePixelsPerPoint
-        var targetHeight = bounds.height * Self.idleDrawablePixelsPerPoint
-        if let sourceFrameSize,
-           sourceFrameSize.width > 0,
-           sourceFrameSize.height > 0 {
-            // Preserve source detail when a higher-resolution J2ME framebuffer
-            // is displayed in a small view, but never render samples that the
-            // physical screen cannot show. Low-resolution games therefore draw
-            // at their native 240x320-style size instead of a Retina fullscreen
-            // target, while 640x360-class games do not get needlessly blurred.
-            targetWidth = min(
-                sourceFrameSize.width,
-                bounds.width * physicalScale
-            )
-            targetHeight = min(
-                sourceFrameSize.height,
-                bounds.height * physicalScale
-            )
-        }
-        let target = CGSize(
-            width: max(floor(targetWidth), 1),
-            height: max(floor(targetHeight), 1)
-        )
-        if drawableSize != target {
-            drawableSize = target
-        }
     }
 
     private func installRendererResourcesIfAvailable() {
