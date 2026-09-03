@@ -616,17 +616,12 @@ final class PhoneMECAPI: @unchecked Sendable {
             as? Bool ?? false
     }
 
-    static var trollStoreJITURL: URL? {
-        guard let bundleIdentifier = Bundle.main.bundleIdentifier else {
-            return nil
-        }
-        var components = URLComponents()
-        components.scheme = "apple-magnifier"
-        components.host = "enable-jit"
-        components.queryItems = [
-            URLQueryItem(name: "bundle-id", value: bundleIdentifier)
-        ]
-        return components.url
+    static var jitRequiredByBuild: Bool {
+#if PHONEME_INTERPRETER_ONLY
+        false
+#else
+        isTrollStoreJITBuild
+#endif
     }
 
     enum PushBackgroundPolicy: Int32, Sendable {
@@ -693,6 +688,13 @@ final class PhoneMECAPI: @unchecked Sendable {
         metalFrameTexturePool?.invalidateContents()
         metalDamageHistory.reset()
 #endif
+        if Self.jitRequiredByBuild, Self.jitStatus != .ready {
+            NSLog(
+                "[phoneMECore] refusing to create runtime: this build requires JIT but platform JIT is not ready"
+            )
+            return nil
+        }
+
         guard let rawRuntime = phoneme_create() else {
             NSLog("[phoneMECore] phoneme_create failed home=%@", layout.homeURL.path)
             return nil
@@ -826,7 +828,11 @@ final class PhoneMECAPI: @unchecked Sendable {
         _ runtime: RuntimeHandle?,
         enabled: Bool
     ) -> Int32 {
-        phoneme_configure_jit(runtime?.rawValue, enabled ? 1 : 0)
+        let effectiveEnabled = Self.jitRequiredByBuild ? true : enabled
+        return phoneme_configure_jit(
+            runtime?.rawValue,
+            effectiveEnabled ? 1 : 0
+        )
     }
 
     func setThermalPressure(

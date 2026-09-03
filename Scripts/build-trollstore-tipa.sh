@@ -134,8 +134,10 @@ fi
 
 run_device_build() {
   local swift_conditions='$(inherited)'
+  local gcc_definitions='$(inherited) PHONEME_TROLLSTORE_BUILD=1'
   if [[ "$INTERPRETER_ONLY" == true ]]; then
     swift_conditions='$(inherited) PHONEME_INTERPRETER_ONLY'
+    gcc_definitions='$(inherited) PHONEME_TROLLSTORE_BUILD=1 PHONEME_INTERPRETER_ONLY=1'
   fi
   set +e
   set -o pipefail
@@ -150,7 +152,7 @@ run_device_build() {
     CODE_SIGN_IDENTITY='' \
     TARGETED_DEVICE_FAMILY=1 \
     "SWIFT_ACTIVE_COMPILATION_CONDITIONS=$swift_conditions" \
-    'GCC_PREPROCESSOR_DEFINITIONS=$(inherited) PHONEME_TROLLSTORE_BUILD=1' \
+    "GCC_PREPROCESSOR_DEFINITIONS=$gcc_definitions" \
     build \
     2>&1 | tee "$BUILD_LOG"
   local status=${PIPESTATUS[0]}
@@ -217,6 +219,7 @@ else
   echo "== Packaging TrollStore JIT-enabled TIPA =="
 fi
 PHONEME_BASE_ENTITLEMENTS="$REPO_ROOT/phoneME/Support/phoneME.entitlements" \
+PHONEME_INTERPRETER_ONLY_PACKAGE="$INTERPRETER_ONLY" \
   bash "$SCRIPT_DIR/package-trollstore-ipa.sh" "$UNSIGNED_IPA" "$OUTPUT_TIPA"
 
 cat <<RESULT

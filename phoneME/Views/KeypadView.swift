@@ -581,9 +581,6 @@ struct KeypadView: View {
             let hidden = customization.hiddenControlIDs
             let visibleFrames = frames.filter { !hidden.contains($0.key) }
             let visibleControls = definition.controls.filter { !hidden.contains($0.id) }
-            let controlsByID = Dictionary(
-                uniqueKeysWithValues: visibleControls.map { ($0.id, $0) }
-            )
             let obscuresDisplay = visibleFrames.values.contains { $0.intersects(displayRect) }
 
             ZStack(alignment: .topLeading) {
@@ -630,25 +627,29 @@ struct KeypadView: View {
 
 #if canImport(UIKit)
                 if editMode == .none {
-                    VirtualKeyboardTouchRouterView(
-                        targets: visibleControls.compactMap { control in
-                            guard let frame = frames[control.id] else { return nil }
-                            return VirtualKeyboardTouchTarget(
-                                controlID: control.id,
-                                frame: frame
+                    // Keep native touch capture scoped to each visible key.
+                    // A previous full-surface UIView router made key taps very
+                    // reliable, but its UIKit host sat above FrameSurface and
+                    // could consume hit testing for the J2ME canvas. Per-key
+                    // capture preserves the stable UIKit touch lifecycle while
+                    // leaving every gap between controls transparent to game
+                    // pointerPressed/pointerDragged/pointerReleased events.
+                    ForEach(visibleControls) { control in
+                        if let frame = frames[control.id] {
+                            VirtualKeyTouchCaptureView(
+                                resetGeneration: inputResetGeneration,
+                                onPressedChanged: { pressed in
+                                    if pressed {
+                                        pressVirtualControl(control)
+                                    } else {
+                                        releaseVirtualControl(control)
+                                    }
+                                }
                             )
-                        },
-                        resetGeneration: inputResetGeneration,
-                        onControlPressed: { controlID in
-                            guard let control = controlsByID[controlID] else { return }
-                            pressVirtualControl(control)
-                        },
-                        onControlReleased: { controlID in
-                            guard let control = controlsByID[controlID] else { return }
-                            releaseVirtualControl(control)
+                            .frame(width: frame.width, height: frame.height)
+                            .position(x: frame.midX, y: frame.midY)
                         }
-                    )
-                    .frame(width: geometry.size.width, height: geometry.size.height)
+                    }
                 }
 #endif
             }
@@ -912,111 +913,60 @@ struct KeypadView: View {
 }
 
 #if canImport(UIKit)
-private struct VirtualKeyboardTouchTarget: Equatable {
-    let controlID: String
-    let frame: CGRect
-}
-
-private struct VirtualKeyboardTouchRouterView: UIViewRepresentable {
-    let targets: [VirtualKeyboardTouchTarget]
+private struct VirtualKeyTouchCaptureView: UIViewRepresentable {
     let resetGeneration: UInt
-    let onControlPressed: (String) -> Void
-    let onControlReleased: (String) -> Void
+    let onPressedChanged: (Bool) -> Void
 
-    func makeUIView(context: Context) -> TouchRouterView {
-        let view = TouchRouterView(frame: .zero)
+    func makeUIView(context: Context) -> TouchCaptureView {
+        let view = TouchCaptureView(frame: .zero)
         view.backgroundColor = .clear
         view.isOpaque = false
         view.isAccessibilityElement = false
         view.isMultipleTouchEnabled = true
         view.isExclusiveTouch = false
-        view.targets = targets
-        view.onControlPressed = onControlPressed
-        view.onControlReleased = onControlReleased
+        view.onPressedChanged = onPressedChanged
         view.applyResetGeneration(resetGeneration)
         return view
     }
 
-    func updateUIView(_ uiView: TouchRouterView, context: Context) {
-        uiView.targets = targets
-        uiView.onControlPressed = onControlPressed
-        uiView.onControlReleased = onControlReleased
+    func updateUIView(_ uiView: TouchCaptureView, context: Context) {
+        uiView.onPressedChanged = onPressedChanged
         uiView.applyResetGeneration(resetGeneration)
     }
 
-    final class TouchRouterView: UIView {
-        var targets: [VirtualKeyboardTouchTarget] = []
-        var onControlPressed: ((String) -> Void)?
-        var onControlReleased: ((String) -> Void)?
+    final class TouchCaptureView: UIView {
+        var onPressedChanged: ((Bool) -> Void)?
 
-        private var touchAssignments: [ObjectIdentifier: String] = [:]
-        private var controlTouchCounts: [String: Int] = [:]
-        private var controlPressStartedAt: [String: TimeInterval] = [:]
-        private var pendingReleases: [String: DispatchWorkItem] = [:]
+        private var activeTouchIDs = Set<ObjectIdentifier>()
+        private var pressStartedAt: TimeInterval?
+        private var pendingRelease: DispatchWorkItem?
         private var resetGeneration: UInt?
-
-        // Keep the visible layout untouched while making edge taps much more
-        // forgiving. Candidate overlap is resolved by geometric distance, so
-        // enlarging the interactive area does not create random key selection.
-        private let minimumHitSlop: CGFloat = 4
-        private let maximumHitSlop: CGFloat = 10
-        private let moveHysteresis: CGFloat = 6
         private let minimumPressDuration: TimeInterval = 0.035
 
         func applyResetGeneration(_ generation: UInt) {
             guard resetGeneration != generation else { return }
             resetGeneration = generation
-            for workItem in pendingReleases.values {
-                workItem.cancel()
-            }
-            touchAssignments.removeAll(keepingCapacity: true)
-            controlTouchCounts.removeAll(keepingCapacity: true)
-            controlPressStartedAt.removeAll(keepingCapacity: true)
-            pendingReleases.removeAll(keepingCapacity: true)
-        }
-
-        override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
-            target(at: point) != nil
+            pendingRelease?.cancel()
+            pendingRelease = nil
+            activeTouchIDs.removeAll(keepingCapacity: true)
+            pressStartedAt = nil
         }
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-            for touch in touches {
-                let identifier = ObjectIdentifier(touch)
-                guard touchAssignments[identifier] == nil,
-                      let target = target(at: touch.location(in: self)) else {
-                    continue
-                }
-                assign(identifier, to: target.controlID)
+            if let pendingRelease {
+                pendingRelease.cancel()
+                self.pendingRelease = nil
+                pressStartedAt = nil
+                onPressedChanged?(false)
             }
-        }
 
-        override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+            let wasPressed = !activeTouchIDs.isEmpty
             for touch in touches {
-                let identifier = ObjectIdentifier(touch)
-                let location = touch.location(in: self)
-                let currentControlID = touchAssignments[identifier]
-
-                if let currentControlID,
-                   let currentTarget = targets.first(where: {
-                       $0.controlID == currentControlID
-                   }),
-                   interactiveFrame(for: currentTarget)
-                       .insetBy(dx: -moveHysteresis, dy: -moveHysteresis)
-                       .contains(location) {
-                    continue
-                }
-
-                let nextControlID = target(at: location)?.controlID
-                guard nextControlID != currentControlID else { continue }
-                if currentControlID != nil {
-                    // Switching to another key should be immediate. The short
-                    // minimum-hold latch is only for tap-up, otherwise two
-                    // directional keys can overlap briefly while sliding.
-                    unassign(identifier, enforceMinimumDuration: false)
-                }
-                if let nextControlID {
-                    assign(identifier, to: nextControlID)
-                }
+                activeTouchIDs.insert(ObjectIdentifier(touch))
+            }
+            if !wasPressed, !activeTouchIDs.isEmpty {
+                pressStartedAt = ProcessInfo.processInfo.systemUptime
+                onPressedChanged?(true)
             }
         }
 
@@ -1031,155 +981,51 @@ private struct VirtualKeyboardTouchRouterView: UIViewRepresentable {
         override func didMoveToWindow() {
             super.didMoveToWindow()
             if window == nil {
-                releaseEverythingImmediately()
+                releaseImmediately()
             }
         }
 
         private func finish(_ touches: Set<UITouch>) {
             for touch in touches {
-                unassign(ObjectIdentifier(touch))
+                activeTouchIDs.remove(ObjectIdentifier(touch))
             }
+            guard activeTouchIDs.isEmpty else { return }
+            scheduleRelease()
         }
 
-        private func assign(_ touchID: ObjectIdentifier, to controlID: String) {
-            touchAssignments[touchID] = controlID
-            let count = controlTouchCounts[controlID, default: 0]
-            controlTouchCounts[controlID] = count + 1
-            if count == 0 {
-                if let pendingRelease = pendingReleases.removeValue(forKey: controlID) {
-                    pendingRelease.cancel()
-                    controlPressStartedAt.removeValue(forKey: controlID)
-                    onControlReleased?(controlID)
-                }
-                controlPressStartedAt[controlID] = ProcessInfo.processInfo.systemUptime
-                onControlPressed?(controlID)
-            }
-        }
-
-        private func unassign(
-            _ touchID: ObjectIdentifier,
-            enforceMinimumDuration: Bool = true
-        ) {
-            guard let controlID = touchAssignments.removeValue(forKey: touchID),
-                  let count = controlTouchCounts[controlID] else {
-                return
-            }
-            if count <= 1 {
-                controlTouchCounts.removeValue(forKey: controlID)
-                if enforceMinimumDuration {
-                    scheduleRelease(for: controlID)
-                } else {
-                    releaseControlImmediately(controlID)
-                }
-            } else {
-                controlTouchCounts[controlID] = count - 1
-            }
-        }
-
-        private func scheduleRelease(for controlID: String) {
-            let startedAt = controlPressStartedAt[controlID]
+        private func scheduleRelease() {
+            let startedAt = pressStartedAt
                 ?? ProcessInfo.processInfo.systemUptime
             let elapsed = ProcessInfo.processInfo.systemUptime - startedAt
             let remaining = minimumPressDuration - elapsed
             guard remaining > 0 else {
-                releaseControlImmediately(controlID)
+                releaseImmediately()
                 return
             }
 
-            pendingReleases[controlID]?.cancel()
+            pendingRelease?.cancel()
             let workItem = DispatchWorkItem { [weak self] in
-                guard let self,
-                      self.controlTouchCounts[controlID] == nil else {
-                    return
-                }
-                self.pendingReleases.removeValue(forKey: controlID)
-                self.releaseControlImmediately(controlID)
+                guard let self, self.activeTouchIDs.isEmpty else { return }
+                self.pendingRelease = nil
+                self.releaseImmediately()
             }
-            pendingReleases[controlID] = workItem
+            pendingRelease = workItem
             DispatchQueue.main.asyncAfter(
                 deadline: .now() + remaining,
                 execute: workItem
             )
         }
 
-        private func releaseControlImmediately(_ controlID: String) {
-            pendingReleases.removeValue(forKey: controlID)?.cancel()
-            controlPressStartedAt.removeValue(forKey: controlID)
-            onControlReleased?(controlID)
-        }
-
-        private func releaseEverythingImmediately() {
-            let heldControlIDs = Set(controlTouchCounts.keys)
-                .union(pendingReleases.keys)
-            guard !heldControlIDs.isEmpty else { return }
-
-            for workItem in pendingReleases.values {
-                workItem.cancel()
-            }
-            touchAssignments.removeAll(keepingCapacity: true)
-            controlTouchCounts.removeAll(keepingCapacity: true)
-            controlPressStartedAt.removeAll(keepingCapacity: true)
-            pendingReleases.removeAll(keepingCapacity: true)
-            for controlID in heldControlIDs {
-                onControlReleased?(controlID)
+        private func releaseImmediately() {
+            let wasPressed = pressStartedAt != nil || !activeTouchIDs.isEmpty
+            pendingRelease?.cancel()
+            pendingRelease = nil
+            activeTouchIDs.removeAll(keepingCapacity: true)
+            pressStartedAt = nil
+            if wasPressed {
+                onPressedChanged?(false)
             }
         }
-
-        private func target(at point: CGPoint) -> VirtualKeyboardTouchTarget? {
-            let exactTargets = targets.filter { $0.frame.contains(point) }
-            if !exactTargets.isEmpty {
-                return exactTargets.min {
-                    squaredDistance(from: point, to: $0.frame.center)
-                        < squaredDistance(from: point, to: $1.frame.center)
-                }
-            }
-
-            return targets
-                .filter { interactiveFrame(for: $0).contains(point) }
-                .min {
-                    let lhsDistance = squaredDistance(from: point, to: $0.frame)
-                    let rhsDistance = squaredDistance(from: point, to: $1.frame)
-                    if lhsDistance == rhsDistance {
-                        return squaredDistance(from: point, to: $0.frame.center)
-                            < squaredDistance(from: point, to: $1.frame.center)
-                    }
-                    return lhsDistance < rhsDistance
-                }
-        }
-
-        private func interactiveFrame(
-            for target: VirtualKeyboardTouchTarget
-        ) -> CGRect {
-            let horizontalSlop = hitSlop(for: target.frame.width)
-            let verticalSlop = hitSlop(for: target.frame.height)
-            return target.frame.insetBy(dx: -horizontalSlop, dy: -verticalSlop)
-        }
-
-        private func hitSlop(for dimension: CGFloat) -> CGFloat {
-            let minimumTouchDimension: CGFloat = 44
-            let sizeBasedSlop = max(0, (minimumTouchDimension - dimension) / 2)
-            return min(max(sizeBasedSlop, minimumHitSlop), maximumHitSlop)
-        }
-
-        private func squaredDistance(from point: CGPoint, to center: CGPoint) -> CGFloat {
-            let dx = point.x - center.x
-            let dy = point.y - center.y
-            return dx * dx + dy * dy
-        }
-
-        private func squaredDistance(from point: CGPoint, to rect: CGRect) -> CGFloat {
-            let nearestX = min(max(point.x, rect.minX), rect.maxX)
-            let nearestY = min(max(point.y, rect.minY), rect.maxY)
-            let dx = point.x - nearestX
-            let dy = point.y - nearestY
-            return dx * dx + dy * dy
-        }
-    }
-}
-
-private extension CGRect {
-    var center: CGPoint {
-        CGPoint(x: midX, y: midY)
     }
 }
 
