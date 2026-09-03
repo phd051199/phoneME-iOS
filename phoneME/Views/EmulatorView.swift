@@ -1333,6 +1333,30 @@ struct FrameSurface: View {
                         .offset(x: rect.minX, y: rect.minY)
 
 #if canImport(UIKit)
+                    if profile.touchInput, rect.width > 0, rect.height > 0 {
+                        PhoneMECanvasTouchView(
+                            frameSize: frameSize,
+                            onPointer: { x, y, action in
+                                session.sendPointer(x: x, y: y, action: action)
+                            }
+                        )
+                        .frame(width: rect.width, height: rect.height)
+                        .offset(x: rect.minX, y: rect.minY)
+                    }
+#else
+                    Color.clear
+                        .frame(
+                            width: geometry.size.width,
+                            height: geometry.size.height
+                        )
+                        .contentShape(Rectangle())
+                        .gesture(pointerGesture(
+                            frameSize: frameSize,
+                            availableSize: geometry.size
+                        ))
+#endif
+
+#if canImport(UIKit)
                     if capturesHardwareKeyboard {
                         PhoneMEHardwareKeyboardView { key, pressed in
                             session.send(key, pressed: pressed)
@@ -1350,11 +1374,6 @@ struct FrameSurface: View {
                     alignment: .topLeading
                 )
                 .clipped()
-                .contentShape(Rectangle())
-                .gesture(pointerGesture(
-                    frameSize: frameSize,
-                    availableSize: geometry.size
-                ))
             }
         }
         .accessibilityLabel("J2ME display")
@@ -1691,6 +1710,117 @@ private struct PhoneMEFrameLayerView: UIViewRepresentable {
                 view.clearFrame()
             }
         }
+    }
+}
+
+private struct PhoneMECanvasTouchView: UIViewRepresentable {
+    let frameSize: CGSize
+    let onPointer: (Int32, Int32, Int32) -> Void
+
+    func makeUIView(context: Context) -> PhoneMECanvasTouchHostView {
+        let view = PhoneMECanvasTouchHostView()
+        view.frameSize = frameSize
+        view.onPointer = onPointer
+        return view
+    }
+
+    func updateUIView(
+        _ uiView: PhoneMECanvasTouchHostView,
+        context: Context
+    ) {
+        uiView.frameSize = frameSize
+        uiView.onPointer = onPointer
+    }
+
+    static func dismantleUIView(
+        _ uiView: PhoneMECanvasTouchHostView,
+        coordinator: Void
+    ) {
+        uiView.releaseActiveTouch()
+        uiView.onPointer = nil
+    }
+}
+
+private final class PhoneMECanvasTouchHostView: UIView {
+    var frameSize = CGSize(width: 1, height: 1)
+    var onPointer: ((Int32, Int32, Int32) -> Void)?
+
+    private var activeTouchID: ObjectIdentifier?
+    private var lastPoint = CGPoint.zero
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        configure()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configure()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window == nil {
+            releaseActiveTouch()
+        }
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard activeTouchID == nil, let touch = touches.first else { return }
+        activeTouchID = ObjectIdentifier(touch)
+        send(touch.location(in: self), action: 1)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = activeTouch(in: touches) else { return }
+        send(touch.location(in: self), action: 3)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = activeTouch(in: touches) else { return }
+        send(touch.location(in: self), action: 2)
+        activeTouchID = nil
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if let touch = activeTouch(in: touches) {
+            send(touch.location(in: self), action: 2)
+            activeTouchID = nil
+        } else {
+            releaseActiveTouch()
+        }
+    }
+
+    func releaseActiveTouch() {
+        guard activeTouchID != nil else { return }
+        send(lastPoint, action: 2)
+        activeTouchID = nil
+    }
+
+    private func configure() {
+        backgroundColor = .clear
+        isOpaque = false
+        isMultipleTouchEnabled = false
+        isExclusiveTouch = false
+        isAccessibilityElement = false
+    }
+
+    private func activeTouch(in touches: Set<UITouch>) -> UITouch? {
+        guard let activeTouchID else { return nil }
+        return touches.first { ObjectIdentifier($0) == activeTouchID }
+    }
+
+    private func send(_ point: CGPoint, action: Int32) {
+        lastPoint = point
+        let width = max(bounds.width, 1)
+        let height = max(bounds.height, 1)
+        let normalizedX = min(max(point.x / width, 0), 1)
+        let normalizedY = min(max(point.y / height, 0), 1)
+        let pixelWidth = max(Int(frameSize.width.rounded()), 1)
+        let pixelHeight = max(Int(frameSize.height.rounded()), 1)
+        let x = min(max(Int(normalizedX * CGFloat(pixelWidth)), 0), pixelWidth - 1)
+        let y = min(max(Int(normalizedY * CGFloat(pixelHeight)), 0), pixelHeight - 1)
+        onPointer?(Int32(x), Int32(y), action)
     }
 }
 

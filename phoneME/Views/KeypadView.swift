@@ -1175,8 +1175,8 @@ private struct VirtualKeyButton: View {
     private var keyboardInteractionLayer: some View {
         if editMode == .none {
 #if canImport(UIKit)
-            // iOS uses one stable full-keyboard touch router above the keys.
-            // Keeping the capture layer outside each animated key prevents a
+            // iOS uses a stable native capture view above each visible key.
+            // Keeping capture outside the animated key content prevents a
             // press animation/layout update from disturbing the active touch.
             Color.clear
                 .allowsHitTesting(false)
