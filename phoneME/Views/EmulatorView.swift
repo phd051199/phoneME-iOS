@@ -1333,7 +1333,26 @@ struct FrameSurface: View {
                         .offset(x: rect.minX, y: rect.minY)
 
 #if canImport(UIKit)
+                    if capturesHardwareKeyboard {
+                        // UIPress delivery only needs this view in the responder
+                        // chain. Keep its SwiftUI wrapper out of touch hit testing;
+                        // otherwise the full-surface representable can sit above
+                        // the canvas receiver and swallow every screen tap.
+                        PhoneMEHardwareKeyboardView { key, pressed in
+                            session.send(key, pressed: pressed)
+                        }
+                        .frame(
+                            width: geometry.size.width,
+                            height: geometry.size.height
+                        )
+                        .allowsHitTesting(false)
+                    }
+
                     if profile.touchInput, rect.width > 0, rect.height > 0 {
+                        // Keep the interactive canvas last in this local stack.
+                        // UIViewRepresentable adds a platform wrapper whose hit
+                        // testing is not governed solely by point(inside:) on the
+                        // represented child view.
                         PhoneMECanvasTouchView(
                             frameSize: frameSize,
                             onPointer: { x, y, action in
@@ -1354,18 +1373,6 @@ struct FrameSurface: View {
                             frameSize: frameSize,
                             availableSize: geometry.size
                         ))
-#endif
-
-#if canImport(UIKit)
-                    if capturesHardwareKeyboard {
-                        PhoneMEHardwareKeyboardView { key, pressed in
-                            session.send(key, pressed: pressed)
-                        }
-                        .frame(
-                            width: geometry.size.width,
-                            height: geometry.size.height
-                        )
-                    }
 #endif
                 }
                 .frame(
