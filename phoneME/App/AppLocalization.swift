@@ -14,14 +14,17 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         Locale(identifier: rawValue)
     }
 
-    var title: String {
+    /// Human-readable language name written in that language itself.
+    /// Keep these values independent from the currently selected app locale so
+    /// users can always recognize the language they want to switch to.
+    var nativeTitle: String {
         switch self {
         case .vietnamese:
-            return L10n.string("Vietnamese")
+            return "Tiếng Việt"
         case .english:
-            return L10n.string("English")
+            return "English"
         case .chineseSimplified:
-            return L10n.string("Chinese (Simplified)")
+            return "简体中文"
         }
     }
 

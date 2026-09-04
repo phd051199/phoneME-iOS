@@ -56,7 +56,7 @@ struct SettingsView: View {
             Section {
                 Picker("Language", selection: $appLanguage) {
                     ForEach(AppLanguage.allCases) { language in
-                        Text(language.title)
+                        Text(verbatim: language.nativeTitle)
                             .tag(language.rawValue)
                     }
                 }
